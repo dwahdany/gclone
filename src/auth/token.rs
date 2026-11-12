@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use super::AuthEndpoints;
+use super::{AuthClient, AuthEndpoints};
 use crate::consts::ACCESS_TOKEN_SKEW_MS;
 use crate::error::AuthError;
 use crate::util;
@@ -30,11 +30,13 @@ impl Cached {
     }
 }
 
-/// http, endpoints, refresh token, cache path, `Mutex<cached>`, single-flight.
+/// http, endpoints, refresh token and the client it belongs to, cache path, `Mutex<cached>`,
+/// single-flight.
 pub struct TokenProvider {
     http: reqwest::Client,
     ep: AuthEndpoints,
     refresh_token: String,
+    client: AuthClient,
     cache_file: Option<PathBuf>,
     cached: Mutex<Option<Cached>>,
     /// Held across a `/refresh` round trip: concurrent callers wait and reuse its result.
@@ -49,6 +51,7 @@ impl TokenProvider {
         http: reqwest::Client,
         ep: AuthEndpoints,
         refresh_token: String,
+        client: AuthClient,
         cache_file: Option<std::path::PathBuf>,
     ) -> Self {
         let cached = cache_file.as_deref().and_then(load_cache);
@@ -56,6 +59,7 @@ impl TokenProvider {
             http,
             ep,
             refresh_token,
+            client,
             cache_file,
             cached: Mutex::new(cached),
             flight: tokio::sync::Mutex::new(()),
@@ -118,7 +122,7 @@ impl TokenProvider {
 
     /// A real `/refresh`; the caller holds `flight`.
     async fn refresh_now(&self) -> Result<String, AuthError> {
-        let grant = super::refresh(&self.http, &self.ep, &self.refresh_token).await?;
+        let grant = super::refresh(&self.http, &self.ep, &self.refresh_token, self.client).await?;
         let fresh = Cached {
             access_token: grant.access_token,
             expires_at_ms: grant.expires_at_ms,

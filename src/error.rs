@@ -116,9 +116,8 @@ pub enum AuthError {
     Denied(String),
     #[error("the login does not include Google Drive file access")]
     ScopeMissing,
-    #[error("the sign-in answer does not belong to this login (state mismatch)")]
-    StateMismatch,
-    #[error("timed out waiting for the browser sign-in")]
+    /// The device code ran out before anyone entered it at Google.
+    #[error("the sign-in code expired before it was entered at Google")]
     Timeout,
     #[error("sign-in failed: {0}")]
     LoginFailed(String),
@@ -633,7 +632,6 @@ mod tests {
         assert_eq!(code(AuthError::NotAllowed("m".into())), 4);
         assert_eq!(code(AuthError::Denied("m".into())), 4);
         assert_eq!(code(AuthError::ScopeMissing), 4);
-        assert_eq!(code(AuthError::StateMismatch), 4);
         assert_eq!(code(AuthError::Timeout), 4);
         assert_eq!(code(AuthError::LoginFailed("m".into())), 4);
         assert_eq!(code(AuthError::BadAuthUrl("m".into())), 4);

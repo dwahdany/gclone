@@ -62,8 +62,8 @@ pub fn unb64url(s: &str) -> Option<Vec<u8>> {
 /// The Crockford base32 alphabet (no I, L, O, U).
 pub const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// 5 bits per character, MSB first. `len(b) * 8` must be a multiple of 5 (the login check code
-/// encodes 5 bytes into 8 symbols, §2.4); a trailing partial group — a caller bug, caught by a
+/// 5 bits per character, MSB first. `len(b) * 8` must be a multiple of 5 (the head fingerprint
+/// encodes 5 bytes into 8 symbols); a trailing partial group — a caller bug, caught by a
 /// debug assertion — is padded with zero bits.
 pub fn crockford_encode(b: &[u8]) -> String {
     debug_assert!(
@@ -574,7 +574,7 @@ mod tests {
             assert!(!s.contains('='));
             assert_eq!(unb64url(&s), Some(v));
         }
-        // 32 bytes → 43 characters (PKCE verifier / challenge, keys in JSON)
+        // 32 bytes → 43 characters (keys in JSON)
         assert_eq!(b64url(&[7u8; 32]).len(), 43);
     }
 
@@ -597,20 +597,6 @@ mod tests {
         for c in b"ILOU" {
             assert!(!CROCKFORD.contains(c));
         }
-    }
-
-    /// §2.4 test vector: verifier → challenge → check code `D2KC-JCJY` (also proves sha2 0.11).
-    #[test]
-    fn login_check_code_vector() {
-        use sha2::{Digest, Sha256};
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
-        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
-        let mut h = Sha256::new();
-        h.update(b"gclone-auth/v1/check");
-        h.update(challenge.as_bytes());
-        let code = crockford_encode(&h.finalize()[..5]);
-        assert_eq!(format!("{}-{}", &code[..4], &code[4..]), "D2KC-JCJY");
     }
 
     #[test]
@@ -1441,8 +1427,13 @@ mod tests {
             shared: Arc<crate::auth::TokenProvider>,
         ) {
             fut(crate::auth::login_interactive(http, ep, opts));
-            fut(crate::auth::redeem(http, ep, "grant", "verifier"));
-            fut(crate::auth::refresh(http, ep, "rt"));
+            fut(crate::auth::device_start(http, ep));
+            fut(crate::auth::refresh(
+                http,
+                ep,
+                "rt",
+                crate::auth::AuthClient::Device,
+            ));
             fut(crate::auth::revoke(http, ep, "rt"));
             fut(tokens.access_token());
             fut(tokens.force_refresh());

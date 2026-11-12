@@ -1,6 +1,7 @@
-//! WP3 acceptance (SPEC §12.1), auth side: the device's part of the login (§2.4), token
-//! handling, and the contract fixture `worker/test/contract.json` (§16.5) — all against the
-//! fake auth Worker of `FakeDrive`. No network beyond 127.0.0.1.
+//! WP3 acceptance (SPEC §12.1), auth side: the device's part of the login (§2.4 — Google's
+//! device authorization grant through the auth Worker), token handling, and the contract
+//! fixture `worker/test/contract.json` (§16.5) — all against the fake auth Worker of
+//! `FakeDrive`. No network beyond 127.0.0.1.
 
 #[path = "support/fake_drive.rs"]
 mod fake_drive;
@@ -8,26 +9,23 @@ mod fake_drive;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use fake_drive::{FakeDrive, Route, page_links};
+use fake_drive::{FakeDrive, Route, VERIFICATION_URL};
 use gclone::auth::{
-    self, AccessGrant, AuthEndpoints, InteractiveOpts, LoginGrant, PASTE_PREFIX, Pkce,
-    SCOPE_DRIVE_FILE, TokenProvider,
+    self, AccessGrant, AuthClient, AuthEndpoints, DeviceCode, InteractiveOpts, LoginGrant,
+    NOT_GOOGLE_NOTE, SCOPE_DRIVE_FILE, TokenProvider,
 };
 use gclone::error::AuthError;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-const STATE: &str = "AAAAAAAAAAAAAAAAAAAAAA";
-/// What Google grants when the `scope` of the authorization URL was widened on its way to the user.
+/// A grant that covers the whole Drive (an older, wider grant of the same account).
 const WIDE_SCOPE: &str = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive";
+const ENTER_THE_CODE: &str = "and enter the code  ";
 
 // ---------------------------------------------------------------------------------------------
 // helpers
@@ -37,7 +35,8 @@ fn http() -> reqwest::Client {
     auth::http_client().unwrap()
 }
 
-/// `LoginGrant` and `AccessGrant` have no `Debug` (they hold tokens), so no `unwrap_err`.
+/// `LoginGrant`, `AccessGrant` and `DeviceCode` have no `Debug` (they hold secrets), so no
+/// `unwrap_err`.
 fn err<T>(r: Result<T, AuthError>) -> AuthError {
     match r {
         Ok(_) => panic!("expected an error"),
@@ -45,32 +44,40 @@ fn err<T>(r: Result<T, AuthError>) -> AuthError {
     }
 }
 
-/// What a login printed, and the URL it showed.
+/// What a login printed.
 #[derive(Clone, Default)]
 struct Printed(Arc<Mutex<Vec<String>>>);
 
 impl Printed {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
     fn text(&self) -> String {
-        self.0.lock().unwrap().join("\n")
+        self.lines().join("\n")
     }
 
-    fn url(&self) -> Option<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|l| l.starts_with("http"))
-            .cloned()
-    }
-
-    async fn wait_for_url(&self) -> String {
+    /// The user code, once the terminal shows it — what the user reads off the screen.
+    async fn user_code(&self) -> String {
         for _ in 0..2000 {
-            if let Some(url) = self.url() {
-                return url;
+            let shown = self
+                .lines()
+                .into_iter()
+                .find_map(|l| l.strip_prefix(ENTER_THE_CODE).map(str::to_owned));
+            if let Some(code) = shown {
+                return code;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("the login printed no URL: {}", self.text());
+        panic!("the login printed no code: {}", self.text());
+    }
+
+    /// Lines that say a poll did not get through.
+    fn retry_notes(&self) -> usize {
+        self.lines()
+            .iter()
+            .filter(|l| l.contains("still trying"))
+            .count()
     }
 
     fn printer(&self) -> Box<dyn Fn(&str) + Send + Sync> {
@@ -79,57 +86,58 @@ impl Printed {
     }
 }
 
-fn opts(
-    printed: &Printed,
-    no_browser: bool,
-    open: impl Fn(&str) -> bool + Send + Sync + 'static,
-) -> InteractiveOpts {
-    InteractiveOpts {
+/// URLs the login asked to have opened in a browser.
+type Opened = Arc<Mutex<Vec<String>>>;
+
+fn opts(printed: &Printed, no_browser: bool) -> (InteractiveOpts, Opened) {
+    let opened = Opened::default();
+    let record = opened.clone();
+    let opts = InteractiveOpts {
         no_browser,
-        timeout: Duration::from_secs(30),
         print: printed.printer(),
-        open: Box::new(open),
-        paste: None,
-    }
+        open: Box::new(move |url| record.lock().unwrap().push(url.to_string())),
+    };
+    (opts, opened)
 }
 
 type Login = tokio::task::JoinHandle<Result<LoginGrant, AuthError>>;
 
-fn spawn_login(fake: &FakeDrive, opts: InteractiveOpts) -> Login {
+/// `login_interactive` against the fake, running beside the test (which plays the user).
+fn spawn_login(fake: &FakeDrive, printed: &Printed) -> Login {
     let ep = fake.auth();
+    let (opts, _) = opts(printed, true);
     tokio::spawn(async move { auth::login_interactive(&http(), &ep, opts).await })
 }
 
-/// Browser flow whose `open` hands the URL to the fake user; the page the "browser" ends on
-/// arrives on the returned channel.
-fn browser_login(fake: &FakeDrive, printed: &Printed) -> (Login, mpsc::UnboundedReceiver<String>) {
-    let (pages, rx) = mpsc::unbounded_channel();
-    let user = fake.clone();
-    let open = move |url: &str| {
-        let (user, url, pages) = (user.clone(), url.to_string(), pages.clone());
-        tokio::spawn(async move {
-            let _ = pages.send(user.browse(&url).await);
-        });
-        true
-    };
-    (spawn_login(fake, opts(printed, false, open)), rx)
-}
-
-/// A grant for `pkce`, obtained the way a headless login would: through the fake's pages.
-async fn grant_for(fake: &FakeDrive, pkce: &Pkce) -> String {
-    let pasted = fake
-        .browse(&auth::login_url(&fake.auth(), pkce, None))
-        .await;
-    auth::parse_pasted(&pasted)
-        .unwrap_or_else(|_| panic!("no paste code on the final page: {pasted}"))
+/// A whole login: the device starts, the user enters the code at "Google", the device's poll
+/// brings the tokens.
+async fn try_login(fake: &FakeDrive) -> Result<LoginGrant, AuthError> {
+    let printed = Printed::default();
+    let login = spawn_login(fake, &printed);
+    fake.approve(&printed.user_code().await);
+    login.await.unwrap()
 }
 
 async fn login_tokens(fake: &FakeDrive) -> LoginGrant {
-    let pkce = Pkce::generate();
-    let grant = grant_for(fake, &pkce).await;
-    auth::redeem(&http(), &fake.auth(), &grant, &pkce.verifier)
-        .await
-        .unwrap()
+    match try_login(fake).await {
+        Ok(grant) => grant,
+        Err(e) => panic!("the login failed: {e:?}"),
+    }
+}
+
+/// A device code to poll with by hand: short-lived, polled every 10 ms.
+fn code(device_code: &str, lifetime_ms: u64) -> DeviceCode {
+    DeviceCode {
+        device_code: device_code.to_string(),
+        user_code: "TEST-CODE".into(),
+        verification_url: VERIFICATION_URL.into(),
+        expires_in: Duration::from_millis(lifetime_ms),
+        interval: Duration::from_millis(10),
+    }
+}
+
+async fn wait(ep: &AuthEndpoints, code: &DeviceCode) -> Result<LoginGrant, AuthError> {
+    auth::device_wait(&http(), ep, code, &|_| {}).await
 }
 
 /// A server that answers every request the same way.
@@ -159,6 +167,19 @@ async fn stub_hits(server: &MockServer) -> usize {
     server.received_requests().await.unwrap().len()
 }
 
+/// An address nothing listens on.
+fn dead_endpoints() -> AuthEndpoints {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    AuthEndpoints {
+        base: format!("http://127.0.0.1:{closed}/auth"),
+        revoke_url: String::new(),
+    }
+}
+
 fn private_dir() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("state");
@@ -171,64 +192,8 @@ fn mode(path: &Path) -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// PKCE, check code, URLs
+// URLs
 // ---------------------------------------------------------------------------------------------
-
-#[test]
-fn pkce_challenge_and_check_code_vector() {
-    let pkce = Pkce::from_verifier(VERIFIER, STATE);
-    assert_eq!(
-        pkce.challenge, CHALLENGE,
-        "challenge = base64url(SHA-256(verifier))"
-    );
-    assert_eq!(pkce.check_code(), "D2KC-JCJY");
-    assert_eq!(
-        (pkce.verifier.as_str(), pkce.state.as_str()),
-        (VERIFIER, STATE)
-    );
-
-    let (a, b) = (Pkce::generate(), Pkce::generate());
-    for p in [&a, &b] {
-        assert_eq!(
-            (p.verifier.len(), p.challenge.len(), p.state.len()),
-            (43, 43, 22)
-        );
-        let url_safe = |s: &str| {
-            s.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        };
-        assert!(url_safe(&p.verifier) && url_safe(&p.challenge) && url_safe(&p.state));
-        assert_eq!(p.challenge, Pkce::from_verifier(&p.verifier, "").challenge);
-        let code = p.check_code();
-        assert_eq!(code.len(), 9);
-        assert_eq!(code.as_bytes()[4], b'-');
-        assert!(
-            code.bytes()
-                .all(|c| c == b'-' || gclone::util::CROCKFORD.contains(&c)),
-            "{code}"
-        );
-    }
-    assert_ne!(a.verifier, b.verifier);
-    assert_ne!(a.state, b.state);
-}
-
-#[test]
-fn login_url_shapes() {
-    let ep = AuthEndpoints {
-        base: "https://auth.example/base".into(),
-        revoke_url: String::new(),
-    };
-    let pkce = Pkce::from_verifier(VERIFIER, STATE);
-    assert_eq!(
-        auth::login_url(&ep, &pkce, Some(8123)),
-        format!("https://auth.example/base/login?challenge={CHALLENGE}&port=8123&state={STATE}")
-    );
-    assert_eq!(
-        auth::login_url(&ep, &pkce, None),
-        format!("https://auth.example/base/login?challenge={CHALLENGE}"),
-        "headless: no port, no state"
-    );
-}
 
 #[test]
 fn auth_url_rules() {
@@ -305,46 +270,37 @@ fn auth_url_rules() {
     );
 }
 
-#[test]
-fn pasted_and_loopback_parsing() {
-    assert_eq!(auth::parse_pasted(" gclone-code1_g-7 \r\n").unwrap(), "g-7");
-    assert!(matches!(
-        auth::parse_pasted("g-7"),
-        Err(AuthError::LoginFailed(_))
-    ));
-    assert_eq!(
-        auth::parse_loopback("code=g-7&state=s", "s").unwrap(),
-        "g-7"
-    );
-    assert!(matches!(
-        auth::parse_loopback("code=g-7&state=t", "s"),
-        Err(AuthError::StateMismatch)
-    ));
-    assert!(
-        matches!(auth::parse_loopback("error=access_denied&state=s", "s"), Err(AuthError::Denied(e)) if e == "access_denied")
-    );
-    assert_eq!(PASTE_PREFIX, "gclone-code1_");
-}
-
 // ---------------------------------------------------------------------------------------------
-// browser flow
+// the sign-in: start, show the code, poll
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn browser_flow_signs_in() {
+async fn device_flow_signs_in() {
     let fake = FakeDrive::start().await;
     let printed = Printed::default();
-    let (login, mut pages) = browser_login(&fake, &printed);
-    let page = pages.recv().await.unwrap();
-    // The page says "connected" only once the redeem has succeeded.
-    assert!(page.contains("gclone is connected"), "{page}");
-    assert_eq!(
-        fake.issued_refresh_tokens(),
-        ["rt-1"],
-        "redeemed before the page was served"
-    );
-    assert_eq!(fake.hits(Route::AuthToken), 1);
+    let (o, opened) = opts(&printed, false);
+    let ep = fake.auth();
+    let login = tokio::spawn(async move { auth::login_interactive(&http(), &ep, o).await });
 
+    // The terminal: where to go, the code, and whose code to trust — nothing else.
+    let user_code = printed.user_code().await;
+    assert_eq!(Some(user_code.clone()), fake.last_user_code());
+    assert_eq!(
+        printed.lines(),
+        [
+            format!("To sign in, open  {VERIFICATION_URL}"),
+            format!("{ENTER_THE_CODE}{user_code}"),
+            "(enter only a code shown in this terminal; waiting…)".to_string(),
+        ]
+    );
+    // Nobody has entered the code yet: the device polls, and nothing is handed out.
+    while fake.hits(Route::AuthPoll) < 3 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(fake.issued_refresh_tokens().is_empty());
+    assert!(!login.is_finished());
+
+    fake.approve(&user_code);
     let grant = login.await.unwrap().unwrap();
     assert_eq!(grant.refresh_token, "rt-1");
     assert_eq!(grant.email, "me@example.com");
@@ -353,19 +309,37 @@ async fn browser_flow_signs_in() {
     assert!(grant.refresh_expires_in.is_none());
     let in_an_hour = gclone::util::now_ms() + 3_599_000;
     assert!(grant.expires_at_ms.abs_diff(in_an_hour) < 10_000);
+    assert_eq!(fake.issued_refresh_tokens(), ["rt-1"]);
+    assert_eq!(printed.lines().len(), 3, "nothing more was printed");
+    // The browser was pointed at Google's page — the address as the Worker gave it.
+    assert_eq!(*opened.lock().unwrap(), [VERIFICATION_URL]);
 
-    // The terminal shows the URL and the check code of the page the fake served — which was a
-    // confirmation page (200), not a redirect: `browse` insists on that.
-    let text = printed.text();
-    let url = printed.url().expect("the URL is printed as well");
-    assert!(
-        url.starts_with(&format!("{}/login?challenge=", fake.auth().base)),
-        "{url}"
+    // What went over the wire: one start with an empty object, polls that carry the device code.
+    let starts = fake.requests(Route::AuthStart);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        (starts[0].method.as_str(), starts[0].path.as_str()),
+        ("POST", "/auth/device/start")
     );
-    assert!(url.contains("&port=") && url.contains("&state="));
-    let code = fake.last_check_code().unwrap();
-    assert!(text.contains(&code), "check code {code} not in: {text}");
-    assert_eq!(fake.hits(Route::AuthLogin), 1);
+    assert_eq!(starts[0].json, Some(json!({})));
+    assert!(starts[0].headers["content-type"].starts_with("application/json"));
+    assert!(starts[0].headers["user-agent"].starts_with("gclone/"));
+    let polls = fake.requests(Route::AuthPoll);
+    assert!(polls.len() >= 4);
+    let device_code = polls[0].json.as_ref().unwrap()["device_code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for poll in &polls {
+        assert_eq!(
+            (poll.method.as_str(), poll.path.as_str()),
+            ("POST", "/auth/device/poll")
+        );
+        assert_eq!(poll.json, Some(json!({ "device_code": device_code })));
+    }
+    // The device code never reaches the terminal; the user code never goes back to the Worker.
+    assert!(!printed.text().contains(&device_code));
+    assert_ne!(device_code, user_code);
 
     // The new login works on Drive.
     let tokens = fake.token_provider_for(&grant.refresh_token);
@@ -375,437 +349,171 @@ async fn browser_flow_signs_in() {
 }
 
 #[tokio::test]
-async fn loopback_listener_is_local_and_ignores_stray_requests() {
+async fn no_browser_prints_the_same_and_opens_nothing() {
     let fake = FakeDrive::start().await;
     let printed = Printed::default();
-    // The browser "opens" but the user is slow: the test drives the listener by hand first.
-    let login = spawn_login(&fake, opts(&printed, false, |_| true));
-    let url = printed.wait_for_url().await;
-    let port: u16 = url
-        .split("&port=")
-        .nth(1)
-        .unwrap()
-        .split('&')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let local = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    let get = |path: &str| {
-        let request = client.get(format!("{local}{path}"));
-        async move {
-            let r = request.send().await.unwrap();
-            (r.status().as_u16(), r.text().await.unwrap())
-        }
-    };
-
-    // 127.0.0.1 only: not on ::1, not on this machine's other addresses.
-    assert!(
-        tokio::net::TcpStream::connect(("::1", port)).await.is_err(),
-        "the listener must not be on ::1"
-    );
-    let outward = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| s.connect("192.0.2.1:9").and_then(|()| s.local_addr()))
-        .map(|a| a.ip())
-        .ok()
-        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
-    if let Some(ip) = outward {
-        let attempt = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::net::TcpStream::connect((ip, port)),
-        )
-        .await;
-        assert!(
-            !matches!(attempt, Ok(Ok(_))),
-            "the listener must not be reachable on {ip}"
-        );
-    }
-
-    // Requests that are not the answer: 404, and the login keeps waiting.
-    for path in [
-        "/favicon.ico",
-        "/",
-        "/?foo=1",
-        "/other?code=x&state=y",
-        "/favicon.ico?code=x",
-    ] {
-        let (status, body) = get(path).await;
-        assert_eq!(status, 404, "{path}");
-        assert!(!body.contains("connected"));
-    }
-    let post = client
-        .post(format!("{local}/?code=x&state=y"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(post.status(), 404, "only GET carries the answer");
-    // A wrong state: 400, and the login keeps waiting.
-    for path in [
-        "/?code=g-1&state=wrong",
-        "/?code=g-1",
-        "/?error=access_denied&state=wrong",
-    ] {
-        let (status, body) = get(path).await;
-        assert_eq!(status, 400, "{path}");
-        assert!(!body.contains("connected"));
-    }
-    // A connection that never sends a request does not block the others.
-    let _idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    assert_eq!(get("/favicon.ico").await.0, 404);
-    assert!(!login.is_finished());
-    assert_eq!(
-        fake.hits(Route::AuthToken),
-        0,
-        "nothing was redeemed for a stray request"
-    );
-
-    // The Worker's redirect with a tampered state: 400 again — then the real one completes.
-    fake.tamper_loopback_state_once();
-    let page = fake.browse(&url).await;
-    assert!(
-        page.contains("does not belong") && !page.contains("connected"),
-        "{page}"
-    );
-    assert!(!login.is_finished());
-    let page = fake.browse(&url).await;
-    assert!(page.contains("gclone is connected"), "{page}");
-    let grant = login.await.unwrap().unwrap();
-    assert_eq!(grant.refresh_token, "rt-1");
-    assert_eq!(fake.hits(Route::AuthToken), 1);
-    // The listener is gone with the login.
-    assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err()
-    );
-}
-
-/// A browser sends every cookie it holds for host 127.0.0.1 — on any port — with the redirect to
-/// the loopback listener. Only the request line matters: however large the headers are, the
-/// sign-in is redeemed and the page is served (the listener used to drop a request whose head
-/// passed 16 KiB, and the login then waited out its ten minutes).
-#[tokio::test]
-async fn loopback_answer_with_huge_headers_still_signs_in() {
-    let fake = FakeDrive::start().await;
-    let printed = Printed::default();
-    let login = spawn_login(&fake, opts(&printed, false, |_| true));
-    let url = printed.wait_for_url().await;
-    // The walk a browser makes, by hand, up to the redirect to the loopback address.
-    let client = http();
-    let confirmation = client.get(&url).send().await.unwrap();
-    let check_code = fake.last_check_code().unwrap();
-    let redirect = walk_consent(&client, confirmation, true, &check_code)
-        .await
-        .unwrap();
-    assert_eq!(redirect.status(), 302);
-    let loopback = redirect.headers()["location"].to_str().unwrap().to_string();
-    assert!(loopback.starts_with("http://127.0.0.1:"), "{loopback}");
-
-    let cookies = |request: reqwest::RequestBuilder, count: usize| {
-        (0..count).fold(request, |request, i| {
-            request.header("cookie", format!("session{i}={}", "x".repeat(4000)))
-        })
-    };
-
-    // A request line that cannot be a sign-in answer is refused with a page, not dropped —
-    // and the login keeps waiting.
-    let long = format!("{loopback}&pad={}", "p".repeat(20_000));
-    let refused = cookies(client.get(&long), 2).send().await.unwrap();
-    assert_eq!(refused.status(), 414);
-    assert!(!refused.text().await.unwrap().contains("connected"));
-    assert!(!login.is_finished());
-    assert_eq!(fake.hits(Route::AuthToken), 0);
-
-    // 240 KiB of cookies in front of nothing that matters.
-    let answered = cookies(client.get(&loopback), 60).send().await.unwrap();
-    assert_eq!(answered.status(), 200);
-    let page = answered.text().await.unwrap();
-    assert!(page.contains("gclone is connected"), "{page}");
-    let grant = login.await.unwrap().unwrap();
-    assert_eq!(grant.refresh_token, "rt-1");
-    assert_eq!(fake.hits(Route::AuthToken), 1);
+    let (o, opened) = opts(&printed, true);
+    let ep = fake.auth();
+    let login = tokio::spawn(async move { auth::login_interactive(&http(), &ep, o).await });
+    let user_code = printed.user_code().await;
+    fake.approve(&user_code);
+    assert_eq!(login.await.unwrap().unwrap().refresh_token, "rt-1");
+    assert!(opened.lock().unwrap().is_empty());
+    assert_eq!(printed.lines().len(), 3);
+    assert!(printed.text().contains(VERIFICATION_URL));
 }
 
 #[tokio::test]
-async fn denied_consent_ends_the_browser_flow() {
+async fn a_refused_consent_ends_the_login() {
     let fake = FakeDrive::start().await;
-    fake.deny_consent_once();
     let printed = Printed::default();
-    let (login, mut pages) = browser_login(&fake, &printed);
-    let page = pages.recv().await.unwrap();
-    assert!(
-        page.contains("could not sign in") && !page.contains("connected"),
-        "{page}"
-    );
+    let login = spawn_login(&fake, &printed);
+    fake.deny(&printed.user_code().await);
     let e = err(login.await.unwrap());
     assert!(
-        matches!(&e, AuthError::Denied(reason) if reason == "access_denied"),
+        matches!(&e, AuthError::Denied(msg) if msg.contains("access_denied")),
         "{e:?}"
     );
-    assert_eq!(fake.hits(Route::AuthToken), 0);
     assert!(fake.issued_refresh_tokens().is_empty());
 }
 
 #[tokio::test]
-async fn the_page_does_not_say_connected_when_the_redeem_fails() {
-    // the Worker is down at /token
+async fn a_code_that_runs_out_ends_the_login() {
+    // Google says so …
     let fake = FakeDrive::start().await;
-    fake.fail_next(Route::AuthToken, 1, 502, "upstream_error");
-    let (login, mut pages) = browser_login(&fake, &Printed::default());
-    let page = pages.recv().await.unwrap();
-    assert!(
-        page.contains("could not sign in") && !page.contains("connected"),
-        "{page}"
-    );
-    assert!(matches!(err(login.await.unwrap()), AuthError::Network(_)));
-    assert_eq!(fake.hits(Route::AuthToken), 1);
-
-    // the account is not on the allowlist
-    let fake = FakeDrive::start().await;
-    fake.set_login_email("other@example.com");
-    let (login, mut pages) = browser_login(&fake, &Printed::default());
-    let page = pages.recv().await.unwrap();
-    assert!(!page.contains("connected"), "{page}");
-    let e = err(login.await.unwrap());
-    assert!(
-        matches!(&e, AuthError::NotAllowed(msg) if msg.contains("other@example.com")),
-        "{e:?}"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn browser_flow_times_out_when_nothing_arrives() {
-    let ep = AuthEndpoints {
-        base: "http://127.0.0.1:9/auth".into(),
-        revoke_url: "http://127.0.0.1:9/revoke".into(),
-    };
     let printed = Printed::default();
-    let mut o = opts(&printed, false, |_| true);
-    o.timeout = gclone::consts::AUTH_TIMEOUT;
-    let started = tokio::time::Instant::now();
-    let e = err(auth::login_interactive(&http(), &ep, o).await);
+    let login = spawn_login(&fake, &printed);
+    printed.user_code().await;
+    fake.expire_codes();
+    let e = err(login.await.unwrap());
     assert!(matches!(e, AuthError::Timeout), "{e:?}");
-    assert!(started.elapsed() >= Duration::from_secs(600));
-    assert!(printed.url().is_some());
-}
 
-// ---------------------------------------------------------------------------------------------
-// headless flow
-// ---------------------------------------------------------------------------------------------
-
-/// A headless login fed through a paste channel; `open` must not be called unless `no_browser`
-/// is false.
-fn headless_login(
-    fake: &FakeDrive,
-    printed: &Printed,
-    no_browser: bool,
-) -> (Login, mpsc::Sender<String>, Arc<AtomicUsize>) {
-    let opened = Arc::new(AtomicUsize::new(0));
-    let count = opened.clone();
-    let mut o = opts(printed, no_browser, move |_| {
-        count.fetch_add(1, Ordering::SeqCst);
-        false
-    });
-    let (tx, rx) = mpsc::channel(8);
-    o.paste = Some(rx);
-    (spawn_login(fake, o), tx, opened)
-}
-
-#[tokio::test]
-async fn headless_flow_redeems_a_pasted_code() {
-    let fake = FakeDrive::start().await;
+    // … or the device's own clock does: it stops polling when the lifetime it was told is over.
+    fake.set_code_lifetime(0.4);
     let printed = Printed::default();
-    let (login, paste, opened) = headless_login(&fake, &printed, true);
-    let url = printed.wait_for_url().await;
-    assert!(!url.contains("port=") && !url.contains("state="), "{url}");
-    assert!(url.starts_with(&format!("{}/login?challenge=", fake.auth().base)));
-
-    let code = fake.browse(&url).await;
-    assert!(code.starts_with(PASTE_PREFIX), "{code}");
-    // The check code in the terminal is the one on the confirmation page.
+    let started = Instant::now();
+    let login = spawn_login(&fake, &printed);
+    let e = err(login.await.unwrap());
+    assert!(matches!(e, AuthError::Timeout), "{e:?}");
+    let took = started.elapsed();
     assert!(
-        printed.text().contains(&fake.last_check_code().unwrap()),
-        "{}",
-        printed.text()
+        took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+        "{took:?}"
     );
-
-    // Pasted with a line break in the middle and stray whitespace around.
-    let (a, b) = code.split_at(code.len() / 2);
-    paste.send("   ".to_string()).await.unwrap();
-    paste.send(format!("  {a} \r\n\t{b}  \n")).await.unwrap();
-    let grant = login.await.unwrap().unwrap();
-    assert_eq!(grant.refresh_token, "rt-1");
-    assert_eq!(grant.email, "me@example.com");
-    assert_eq!(
-        opened.load(Ordering::SeqCst),
-        0,
-        "--no-browser never opens one"
-    );
-    assert_eq!(fake.hits(Route::AuthToken), 1);
+    assert!(fake.hits(Route::AuthPoll) > 3, "it polled until then");
+    assert!(fake.issued_refresh_tokens().is_empty());
 }
 
 #[tokio::test]
-async fn headless_flow_gives_up_after_three_wrong_pastes() {
+async fn slow_down_adds_five_seconds_to_the_interval() {
     let fake = FakeDrive::start().await;
     let printed = Printed::default();
-    let (login, paste, _) = headless_login(&fake, &printed, true);
-    for garbage in [
-        "hello",
-        "",
-        "gclone-code2_abc",
-        "   ",
-        "4/0AfakeGoogleCode",
-        "never read",
-    ] {
-        paste.send(garbage.to_string()).await.unwrap();
+    fake.slow_down(1);
+    let login = spawn_login(&fake, &printed);
+    let user_code = printed.user_code().await;
+    // The first poll is answered slow_down; the second comes 5 s + the interval later.
+    while fake.hits(Route::AuthPoll) < 1 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let e = err(login.await.unwrap());
-    assert!(
-        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("not a gclone sign-in code")),
-        "{e:?}"
-    );
-    assert_eq!(
-        fake.hits(Route::AuthToken),
-        0,
-        "garbage is never sent to the Worker"
-    );
-    assert_eq!(
-        printed
-            .text()
-            .matches("That is not a gclone sign-in code")
-            .count(),
-        2,
-        "asked again twice"
-    );
-}
-
-#[tokio::test]
-async fn a_browser_that_does_not_open_falls_back_to_the_headless_flow() {
-    let fake = FakeDrive::start().await;
-    let printed = Printed::default();
-    let (login, paste, opened) = headless_login(&fake, &printed, false);
-    let url = printed.wait_for_url().await;
-    assert_eq!(opened.load(Ordering::SeqCst), 1);
-    assert!(
-        !url.contains("port="),
-        "the fallback prints the headless URL only: {url}"
-    );
-    assert_eq!(
-        printed.text().matches("http").count(),
-        1,
-        "one URL, not two: {}",
-        printed.text()
-    );
-    paste.send(fake.browse(&url).await).await.unwrap();
+    let slowed = Instant::now();
+    fake.approve(&user_code);
     assert_eq!(login.await.unwrap().unwrap().refresh_token, "rt-1");
+    assert!(
+        slowed.elapsed() >= Duration::from_millis(4900),
+        "{:?}",
+        slowed.elapsed()
+    );
+    assert_eq!(fake.hits(Route::AuthPoll), 2);
+    assert_eq!(printed.retry_notes(), 0, "slow_down is not a failure");
 }
 
 #[tokio::test]
-async fn headless_flow_without_a_terminal_fails() {
+async fn polls_that_fail_are_followed_by_the_next_one() {
     let fake = FakeDrive::start().await;
+    // What a network blip, a Worker that cannot reach Google, and a rate limit look like.
+    fake.fail_next(Route::AuthPoll, 2, 502, "upstream_error");
+    fake.fail_next_raw(Route::AuthPoll, 1, 503, "<html>Service Unavailable</html>");
+    fake.fail_next(Route::AuthPoll, 1, 500, "internal_error");
+    fake.fail_next(Route::AuthPoll, 1, 429, "rate_limited");
     let printed = Printed::default();
-    let e =
-        err(auth::login_interactive(&http(), &fake.auth(), opts(&printed, true, |_| true)).await);
+    let login = spawn_login(&fake, &printed);
+    fake.approve(&printed.user_code().await);
+    let started = Instant::now();
+    assert_eq!(login.await.unwrap().unwrap().refresh_token, "rt-1");
+    assert_eq!(fake.hits(Route::AuthPoll), 6);
     assert!(
-        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("no terminal")),
-        "{e:?}"
+        started.elapsed() >= Duration::from_millis(900),
+        "Retry-After: 1 was honoured"
     );
-    assert!(
-        printed.url().is_none(),
-        "nothing is asked of a user who cannot answer"
-    );
+    // One note for the whole streak, not one per failed poll.
+    assert_eq!(printed.retry_notes(), 1, "{}", printed.text());
+    assert!(printed.text().contains("502"), "{}", printed.text());
 
-    // input that ends before a code arrives
-    let (login, paste, _) = headless_login(&fake, &Printed::default(), true);
-    drop(paste);
-    assert!(matches!(
-        err(login.await.unwrap()),
-        AuthError::LoginFailed(_)
-    ));
-
-    // a denied consent in paste mode leaves nothing to paste; a wrong code is refused by /token
-    fake.deny_consent_once();
-    let printed = Printed::default();
-    let (login, paste, _) = headless_login(&fake, &printed, true);
-    let page = fake.browse(&printed.wait_for_url().await).await;
-    assert!(page.contains("access_denied") && !page.contains(PASTE_PREFIX));
-    paste.send(format!("{PASTE_PREFIX}g-999")).await.unwrap();
-    let e = err(login.await.unwrap());
-    assert!(
-        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("expired or was already used")),
-        "{e:?}"
-    );
+    // A Worker that disappears for good: the login ends when the code does, as a network error.
+    let fake = FakeDrive::start().await;
+    fake.set_code_lifetime(0.5);
+    let started = auth::device_start(&http(), &fake.auth()).await.unwrap();
+    let e = err(wait(&dead_endpoints(), &started).await);
+    assert!(matches!(e, AuthError::Network(_)), "{e:?}");
 }
 
-// ---------------------------------------------------------------------------------------------
-// redeem
-// ---------------------------------------------------------------------------------------------
-
 #[tokio::test]
-async fn redeem_binds_the_grant_to_the_verifier_and_uses_it_once() {
+async fn a_device_code_is_good_for_one_login() {
     let fake = FakeDrive::start().await;
     let (http, ep) = (http(), fake.auth());
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
+    let started = auth::device_start(&http, &ep).await.unwrap();
+    assert_eq!(started.verification_url, VERIFICATION_URL);
+    assert_eq!(started.expires_in, Duration::from_secs(1800));
+    assert_eq!(started.interval, Duration::from_millis(20));
+    fake.approve(&started.user_code);
+    let grant = wait(&ep, &started).await.unwrap();
+    assert_eq!(grant.refresh_token, "rt-1");
 
-    let other = Pkce::generate();
-    let e = err(auth::redeem(&http, &ep, &grant, &other.verifier).await);
+    // used: Google's device code is single-use
+    let e = err(wait(&ep, &started).await);
     assert!(
-        matches!(&e, AuthError::LoginFailed(msg) if msg == "the sign-in code expired or was already used"),
+        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("no longer valid")),
         "{e:?}"
     );
-    // The failed attempt did not burn the grant.
-    let tokens = auth::redeem(&http, &ep, &grant, &pkce.verifier)
-        .await
-        .unwrap();
-    assert_eq!(tokens.refresh_token, "rt-1");
-    let seen = fake.requests(Route::AuthToken);
-    assert_eq!(
-        (seen[1].method.as_str(), seen[1].path.as_str()),
-        ("POST", "/auth/token")
-    );
-    assert_eq!(
-        seen[1].json,
-        Some(json!({ "code": grant, "verifier": pkce.verifier }))
-    );
-    assert!(seen[1].headers["content-type"].starts_with("application/json"));
-    assert!(seen[1].headers["user-agent"].starts_with("gclone/"));
-
-    // reused
-    assert!(matches!(
-        err(auth::redeem(&http, &ep, &grant, &pkce.verifier).await),
-        AuthError::LoginFailed(_)
-    ));
-    // expired
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
-    fake.expire_grants();
-    assert!(matches!(
-        err(auth::redeem(&http, &ep, &grant, &pkce.verifier).await),
-        AuthError::LoginFailed(_)
-    ));
     // never issued
+    let unknown = code("dc-never-issued-xxxxxxxxxxxx", 2000);
     assert!(matches!(
-        err(auth::redeem(&http, &ep, "g-12345", &pkce.verifier).await),
+        err(wait(&ep, &unknown).await),
         AuthError::LoginFailed(_)
     ));
+    // a string the Worker's pre-filter refuses
+    let e = err(wait(&ep, &code("not a device code", 2000)).await);
+    assert!(
+        matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
+        "{e:?}"
+    );
     assert_eq!(fake.issued_refresh_tokens(), ["rt-1"]);
+
+    // Two logins side by side: approving one does not end the other.
+    let (a, b) = (
+        auth::device_start(&http, &ep).await.unwrap(),
+        auth::device_start(&http, &ep).await.unwrap(),
+    );
+    assert_ne!(a.device_code, b.device_code);
+    assert_ne!(a.user_code, b.user_code);
+    fake.approve(&b.user_code);
+    assert_eq!(wait(&ep, &b).await.unwrap().refresh_token, "rt-2");
+    let short = code(&a.device_code, 150);
+    assert!(matches!(err(wait(&ep, &short).await), AuthError::Timeout));
+    fake.approve(&a.user_code);
+    assert_eq!(wait(&ep, &a).await.unwrap().refresh_token, "rt-3");
 }
 
 #[tokio::test]
-async fn redeem_maps_the_workers_refusals() {
+async fn poll_maps_the_workers_refusals() {
     let fake = FakeDrive::start().await;
     let (http, ep) = (http(), fake.auth());
 
+    // The answer names the account masked: the route is open to anyone who has a device code.
     fake.set_login_email("other@example.com");
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
-    let e = err(auth::redeem(&http, &ep, &grant, &pkce.verifier).await);
+    let e = err(try_login(&fake).await);
     assert!(
-        matches!(&e, AuthError::NotAllowed(msg) if msg.contains("other@example.com")),
+        matches!(&e, AuthError::NotAllowed(msg) if msg.contains("o***@example.com") && !msg.contains("other")),
         "{e:?}"
     );
     // an allowlist entry in another case matches
@@ -816,18 +524,14 @@ async fn redeem_maps_the_workers_refusals() {
     fake.set_allowed_emails(&["me@example.com"]);
 
     fake.set_granted_scope("openid");
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
     assert!(matches!(
-        err(auth::redeem(&http, &ep, &grant, &pkce.verifier).await),
+        err(try_login(&fake).await),
         AuthError::ScopeMissing
     ));
-    // More than gclone's scopes: the Worker hands out nothing, on /token …
+    // More than gclone's scopes: the Worker hands out nothing, on /device/poll …
     fake.set_granted_scope(WIDE_SCOPE);
     let issued_before = fake.issued_refresh_tokens().len();
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
-    let e = err(auth::redeem(&http, &ep, &grant, &pkce.verifier).await);
+    let e = err(try_login(&fake).await);
     assert!(
         matches!(&e, AuthError::Denied(msg) if msg.contains("myaccount.google.com/permissions")),
         "{e:?}"
@@ -840,21 +544,30 @@ async fn redeem_maps_the_workers_refusals() {
     // … and on /refresh for a token whose grant is that wide.
     fake.set_granted_scope(&format!("openid {SCOPE_DRIVE_FILE}"));
     let tokens = login_tokens(&fake).await;
-    assert!(
-        auth::refresh(&http, &ep, &tokens.refresh_token)
-            .await
-            .is_ok()
-    );
+    let refresh = |token: String| {
+        let (http, ep) = (http.clone(), ep.clone());
+        async move { auth::refresh(&http, &ep, &token, AuthClient::Device).await }
+    };
+    assert!(refresh(tokens.refresh_token.clone()).await.is_ok());
     fake.set_granted_scope(WIDE_SCOPE);
-    let e = err(auth::refresh(&http, &ep, &tokens.refresh_token).await);
+    let e = err(refresh(tokens.refresh_token.clone()).await);
     assert!(matches!(e, AuthError::Denied(_)), "{e:?}");
     fake.set_granted_scope(&format!("openid {SCOPE_DRIVE_FILE}"));
 
+    // A client Google no longer accepts: at the poll, and already at the start.
+    let started = auth::device_start(&http, &ep).await.unwrap();
+    fake.approve(&started.user_code);
     fake.break_client();
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
-    let e = err(auth::redeem(&http, &ep, &grant, &pkce.verifier).await);
+    let e = err(wait(&ep, &started).await);
     assert!(matches!(e, AuthError::WorkerMisconfigured(_)), "{e:?}");
+    let starts = fake.hits(Route::AuthStart);
+    let e = err(auth::device_start(&http, &ep).await);
+    assert!(matches!(e, AuthError::WorkerMisconfigured(_)), "{e:?}");
+    assert_eq!(
+        fake.hits(Route::AuthStart),
+        starts + 1,
+        "a broken client is not retried"
+    );
 
     // The device checks the scope of a 200 answer itself.
     let body = json!({ "refresh_token": "1//r", "access_token": "ya29.a", "expires_in": 3599,
@@ -866,18 +579,38 @@ async fn redeem_maps_the_workers_refusals() {
         &[],
     )
     .await;
+    let any = code("dc-any-xxxxxxxxxxxxxxxx", 2000);
     assert!(matches!(
-        err(auth::redeem(&http, &ep, "g", VERIFIER).await),
+        err(wait(&ep, &any).await),
         AuthError::ScopeMissing
     ));
-    // … and refuses a 200 answer that is not the promised shape.
+    // … and refuses a 200 answer that is not the promised shape — also one whose account
+    // address is not plain text: it is printed ("Signed in as …") and stored.
+    let with_email = |email: &str| {
+        json!({ "refresh_token": "1//r", "access_token": "a", "expires_in": 1,
+                "scope": SCOPE_DRIVE_FILE, "email": email })
+    };
+    let (_server, ok_ep) = stub(
+        200,
+        "application/json",
+        with_email("me@example.com").to_string().as_bytes(),
+        &[],
+    )
+    .await;
+    assert_eq!(wait(&ok_ep, &any).await.unwrap().email, "me@example.com");
     for body in [
-        json!({ "access_token": "a", "expires_in": 1, "scope": SCOPE_DRIVE_FILE, "email": "e" }),
+        json!({ "access_token": "a", "expires_in": 1, "scope": SCOPE_DRIVE_FILE, "email": "e@x" }),
+        with_email("me@example.com\u{1b}[31mRED\u{1b}]0;title\u{7}\nerror: fake second line"),
+        with_email("me@example.com\nSigned in as someone@else.example"),
+        with_email("me @example.com"),
+        with_email("m\u{e9}@example.com"),
+        with_email("not-an-address"),
+        with_email(&format!("{}@example.com", "l".repeat(250))),
         json!([1]),
         json!("ok"),
     ] {
         let (_server, ep) = stub(200, "application/json", body.to_string().as_bytes(), &[]).await;
-        let e = err(auth::redeem(&http, &ep, "g", VERIFIER).await);
+        let e = err(wait(&ep, &any).await);
         assert!(
             matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
             "{e:?}"
@@ -890,7 +623,7 @@ async fn redeem_maps_the_workers_refusals() {
         &[],
     )
     .await;
-    let e = err(auth::redeem(&http, &ep, "g", VERIFIER).await);
+    let e = err(wait(&ep, &any).await);
     assert!(
         matches!(&e, AuthError::Denied(msg) if msg == "org_internal"),
         "{e:?}"
@@ -898,7 +631,7 @@ async fn redeem_maps_the_workers_refusals() {
 }
 
 #[tokio::test]
-async fn redeem_passes_refresh_token_expires_in_through() {
+async fn poll_passes_refresh_token_expires_in_through() {
     let fake = FakeDrive::start().await;
     assert!(login_tokens(&fake).await.refresh_expires_in.is_none());
     fake.set_refresh_expires_in(Some(604_799));
@@ -908,74 +641,342 @@ async fn redeem_passes_refresh_token_expires_in_through() {
 }
 
 #[tokio::test]
-async fn token_route_is_not_retried_except_once_after_429() {
-    let (http, pkce) = (http(), Pkce::generate());
+async fn device_start_is_retried_and_its_answer_is_checked() {
+    let http = http();
 
-    // 502: Google may have seen the code — never resend
+    // a 502 is retried and then succeeds; so is a 500 without a mapped code and an HTML 503
     let fake = FakeDrive::start().await;
-    let grant = grant_for(&fake, &pkce).await;
-    fake.fail_next(Route::AuthToken, 1, 502, "upstream_error");
-    assert!(matches!(
-        err(auth::redeem(&http, &fake.auth(), &grant, &pkce.verifier).await),
-        AuthError::Network(_)
-    ));
-    assert_eq!(fake.hits(Route::AuthToken), 1);
-    // other 5xx, HTML included
-    fake.fail_next_raw(Route::AuthToken, 1, 503, "<html>Service Unavailable</html>");
-    assert!(matches!(
-        err(auth::redeem(&http, &fake.auth(), &grant, &pkce.verifier).await),
-        AuthError::Network(_)
-    ));
-    assert_eq!(fake.hits(Route::AuthToken), 2);
+    fake.fail_next(Route::AuthStart, 1, 502, "upstream_error");
+    fake.fail_next(Route::AuthStart, 1, 500, "internal_error");
+    fake.fail_next_raw(Route::AuthStart, 1, 503, "<html>down</html>");
+    assert!(auth::device_start(&http, &fake.auth()).await.is_ok());
+    assert_eq!(fake.hits(Route::AuthStart), 4);
 
-    // 429: answered before the grant was opened — one retry after Retry-After, which succeeds
+    // five failures are the end
     let fake = FakeDrive::start().await;
-    let grant = grant_for(&fake, &pkce).await;
-    fake.fail_next(Route::AuthToken, 1, 429, "rate_limited");
-    let started = std::time::Instant::now();
-    let tokens = auth::redeem(&http, &fake.auth(), &grant, &pkce.verifier)
-        .await
-        .unwrap();
-    assert_eq!(tokens.refresh_token, "rt-1");
-    assert_eq!(fake.hits(Route::AuthToken), 2);
+    fake.fail_next(Route::AuthStart, u32::MAX, 502, "upstream_error");
+    let e = err(auth::device_start(&http, &fake.auth()).await);
+    assert!(
+        matches!(&e, AuthError::Network(msg) if msg.contains("502")),
+        "{e:?}"
+    );
+    assert_eq!(fake.hits(Route::AuthStart), 5);
+
+    // one 429 is waited out, two are not
+    let fake = FakeDrive::start().await;
+    fake.fail_next(Route::AuthStart, 1, 429, "rate_limited");
+    let started = Instant::now();
+    assert!(auth::device_start(&http, &fake.auth()).await.is_ok());
+    assert_eq!(fake.hits(Route::AuthStart), 2);
     assert!(
         started.elapsed() >= Duration::from_millis(900),
         "Retry-After: 1 was honoured"
     );
-
-    // two 429s in a row → Network
-    let fake = FakeDrive::start().await;
-    let grant = grant_for(&fake, &pkce).await;
-    fake.fail_next(Route::AuthToken, 2, 429, "rate_limited");
-    let e = err(auth::redeem(&http, &fake.auth(), &grant, &pkce.verifier).await);
+    fake.fail_next(Route::AuthStart, 2, 429, "rate_limited");
+    let e = err(auth::device_start(&http, &fake.auth()).await);
     assert!(
         matches!(&e, AuthError::Network(msg) if msg.contains("rate-limiting")),
         "{e:?}"
     );
-    assert_eq!(fake.hits(Route::AuthToken), 2);
-    // the grant is still good afterwards
-    assert_eq!(
-        auth::redeem(&http, &fake.auth(), &grant, &pkce.verifier)
-            .await
-            .unwrap()
-            .refresh_token,
-        "rt-1"
-    );
+    assert_eq!(fake.hits(Route::AuthStart), 4);
 
-    // nothing listening → Network at once
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let ep = AuthEndpoints {
-        base: format!("http://127.0.0.1:{closed}/auth"),
-        revoke_url: String::new(),
-    };
+    // nothing listening → Network
     assert!(matches!(
-        err(auth::redeem(&http, &ep, "g", &pkce.verifier).await),
+        err(auth::device_start(&http, &dead_endpoints()).await),
         AuthError::Network(_)
     ));
+
+    // a Worker from before 0.2.0 has no such route: the message says what to do
+    let (_server, ep) = stub(
+        404,
+        "application/json; charset=utf-8",
+        br#"{"error":"not_found","message":"There is nothing at this address."}"#,
+        &[],
+    )
+    .await;
+    let e = err(auth::device_start(&http, &ep).await);
+    assert!(
+        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("older version")),
+        "{e:?}"
+    );
+
+    // An answer whose code or address is not plain text never reaches the terminal or a browser.
+    let good = json!({ "device_code": "dc-1-xxxxxxxxxxxxxxxx", "user_code": "ABCD-EFGH",
+                       "verification_url": VERIFICATION_URL, "expires_in": 1800, "interval": 5 });
+    for (field, bad) in [
+        ("user_code", json!("ABCD\u{1b}[2J")),
+        ("user_code", json!("")),
+        ("verification_url", json!("http://www.google.com/device")),
+        ("verification_url", json!("javascript:alert(1)")),
+        ("device_code", json!("")),
+        ("expires_in", json!("soon")),
+        ("interval", json!(0)),
+    ] {
+        let mut body = good.clone();
+        body[field] = bad.clone();
+        let (server, ep) = stub(200, "application/json", body.to_string().as_bytes(), &[]).await;
+        let printed = Printed::default();
+        let (o, opened) = opts(&printed, false);
+        let e = err(auth::login_interactive(&http, &ep, o).await);
+        assert!(
+            matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
+            "{field} = {bad}: {e:?}"
+        );
+        assert!(printed.lines().is_empty(), "{field}: {}", printed.text());
+        assert!(opened.lock().unwrap().is_empty(), "{field}");
+        assert_eq!(stub_hits(&server).await, 1, "{field}: no poll");
+    }
+}
+
+/// One raw `POST /device/poll`: the status and the error code of the answer.
+async fn raw_poll(ep: &AuthEndpoints, device_code: &str) -> (u16, String) {
+    let response = reqwest::Client::new()
+        .post(format!("{}/device/poll", ep.base))
+        .json(&json!({ "device_code": device_code }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap();
+    (status, body["error"].as_str().unwrap_or("").to_string())
+}
+
+/// The fake holds a login to the two timing rules of the grant as Google does: a poll that
+/// comes sooner than `interval` after the previous one is `slow_down`, and a code runs out.
+#[tokio::test]
+async fn the_fake_enforces_the_poll_interval_and_the_lifetime_of_a_code() {
+    let fake = FakeDrive::start().await;
+    let (http, ep) = (http(), fake.auth());
+    // Wide margins: "too early" has 300 ms to spare, "late enough" 30 ms.
+    let interval = Duration::from_millis(400);
+    let pending = (400, "authorization_pending".to_string());
+    let slow_down = (400, "slow_down".to_string());
+
+    fake.set_poll_interval(0.4);
+    let started = auth::device_start(&http, &ep).await.unwrap();
+    assert_eq!(started.interval, interval);
+    // The first poll has no previous one; the second comes at once: too early.
+    assert_eq!(raw_poll(&ep, &started.device_code).await, pending);
+    assert_eq!(raw_poll(&ep, &started.device_code).await, slow_down);
+    assert_eq!(fake.early_polls(), 1);
+    // … and that poll counts as the previous one of the next.
+    tokio::time::sleep(interval / 4).await;
+    assert_eq!(raw_poll(&ep, &started.device_code).await, slow_down);
+    tokio::time::sleep(interval + Duration::from_millis(30)).await;
+    assert_eq!(raw_poll(&ep, &started.device_code).await, pending);
+    // A poll that comes too early does not redeem an approved code either.
+    fake.approve(&started.user_code);
+    assert_eq!(raw_poll(&ep, &started.device_code).await, slow_down);
+    assert!(fake.issued_refresh_tokens().is_empty());
+    assert_eq!(fake.early_polls(), 3);
+    tokio::time::sleep(interval + Duration::from_millis(30)).await;
+    assert_eq!(raw_poll(&ep, &started.device_code).await.0, 200);
+    assert_eq!(fake.issued_refresh_tokens(), ["rt-1"]);
+    // Used: the state of the code, whatever the timing.
+    assert_eq!(
+        raw_poll(&ep, &started.device_code).await,
+        (400, "invalid_grant".to_string())
+    );
+
+    // A code runs out by itself, entered or not; another login has its own clock.
+    fake.set_poll_interval(0.02);
+    fake.set_code_lifetime(0.6);
+    let (short, approved) = (
+        auth::device_start(&http, &ep).await.unwrap(),
+        auth::device_start(&http, &ep).await.unwrap(),
+    );
+    fake.set_code_lifetime(1800.0);
+    let lasting = auth::device_start(&http, &ep).await.unwrap();
+    assert_eq!(raw_poll(&ep, &short.device_code).await, pending);
+    fake.approve(&approved.user_code);
+    tokio::time::sleep(Duration::from_millis(630)).await;
+    let expired = (400, "expired_token".to_string());
+    assert_eq!(raw_poll(&ep, &short.device_code).await, expired);
+    assert_eq!(raw_poll(&ep, &approved.device_code).await, expired);
+    assert_eq!(raw_poll(&ep, &lasting.device_code).await, pending);
+    assert_eq!(fake.issued_refresh_tokens(), ["rt-1"]);
+}
+
+/// The device never polls sooner than the interval it was told — against a server that
+/// would answer `slow_down` if it did, as Google does.
+#[tokio::test]
+async fn the_device_keeps_to_the_poll_interval() {
+    let fake = FakeDrive::start().await;
+    let interval = Duration::from_millis(300);
+    fake.set_poll_interval(0.3);
+    let printed = Printed::default();
+    let login = spawn_login(&fake, &printed);
+    let user_code = printed.user_code().await;
+    while fake.hits(Route::AuthPoll) < 4 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fake.approve(&user_code);
+    assert_eq!(login.await.unwrap().unwrap().refresh_token, "rt-1");
+
+    let start = fake.requests(Route::AuthStart)[0].at;
+    let polls: Vec<Instant> = fake
+        .requests(Route::AuthPoll)
+        .iter()
+        .map(|poll| poll.at)
+        .collect();
+    let n = polls.len();
+    assert_eq!(
+        n, 5,
+        "four polls while nobody had entered the code, one after"
+    );
+    // The first poll comes no earlier than one interval after /device/start …
+    assert!(
+        polls[0].duration_since(start) >= interval,
+        "{:?}",
+        polls[0].duration_since(start)
+    );
+    // … and each one no earlier than one interval after the one before.
+    for pair in polls.windows(2) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(gap >= interval, "{gap:?}");
+    }
+    assert!(polls[n - 1].duration_since(polls[0]) >= interval * (n as u32 - 1));
+    assert_eq!(fake.early_polls(), 0, "the fake never had to say slow_down");
+    assert_eq!(printed.retry_notes(), 0);
+}
+
+/// RFC 8628 §3.5: polls that fail are spaced further and further apart, and the first poll
+/// that gets an answer about the login ends the back-off.
+#[tokio::test]
+async fn failed_polls_back_off() {
+    let fake = FakeDrive::start().await;
+    let (http, ep) = (http(), fake.auth());
+    let interval = Duration::from_millis(40);
+    fake.set_poll_interval(0.04);
+    // A Worker that cannot reach Google (or that Google is rate-limiting), four times.
+    fake.fail_next(Route::AuthPoll, 4, 502, "upstream_error");
+    let started = auth::device_start(&http, &ep).await.unwrap();
+    let printed = Printed::default();
+    let note = printed.printer();
+    let wait_ep = ep.clone();
+    let login =
+        tokio::spawn(async move { auth::device_wait(&http, &wait_ep, &started, &*note).await });
+    // Four failures, then two polls that are answered "not yet".
+    while fake.hits(Route::AuthPoll) < 6 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    fake.approve(&fake.last_user_code().unwrap());
+    assert_eq!(login.await.unwrap().unwrap().refresh_token, "rt-1");
+
+    let start = fake.requests(Route::AuthStart)[0].at;
+    let polls: Vec<Instant> = fake
+        .requests(Route::AuthPoll)
+        .iter()
+        .map(|poll| poll.at)
+        .collect();
+    assert!(polls.len() >= 7, "{}", polls.len());
+    let gaps: Vec<Duration> = polls
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .collect();
+    assert!(polls[0].duration_since(start) >= interval);
+    // After the n-th failure in a row the device stays away 2^n intervals.
+    for (n, gap) in gaps[..4].iter().enumerate() {
+        let least = interval * 2u32.pow(n as u32 + 1);
+        assert!(
+            *gap >= least,
+            "gap {n}: {gap:?}, expected at least {least:?}"
+        );
+    }
+    // The poll after the fourth failure was answered: back to the plain interval (not 32 of
+    // them, which is what the next pause would have been).
+    assert!(
+        gaps[4] >= interval && gaps[4] < interval * 12,
+        "{:?}",
+        gaps[4]
+    );
+    assert_eq!(fake.early_polls(), 0);
+    assert_eq!(printed.retry_notes(), 1, "{}", printed.text());
+}
+
+/// Google has issued the grant — the device code is used up — and the Worker cannot hand it
+/// out (here: no ID token in Google's answer). The login ends at once with that reason; the
+/// device does not poll the dead code again, which would only get "no longer valid".
+#[tokio::test]
+async fn a_grant_the_worker_cannot_use_ends_the_login_with_its_reason() {
+    let fake = FakeDrive::start().await;
+    let (http, ep) = (http(), fake.auth());
+    fake.omit_id_token();
+    let started = auth::device_start(&http, &ep).await.unwrap();
+    fake.approve(&started.user_code);
+    let printed = Printed::default();
+    let e = err(auth::device_wait(&http, &ep, &started, &*printed.printer()).await);
+    assert!(
+        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("no ID token") && msg.contains("Google approved the sign-in")),
+        "{e:?}"
+    );
+    assert_eq!(fake.hits(Route::AuthPoll), 1, "one poll, not a second one");
+    assert_eq!(printed.retry_notes(), 0, "{}", printed.text());
+    assert!(fake.issued_refresh_tokens().is_empty());
+    // The code was consumed by that answer, as at Google: this is what polling on would get.
+    let e = err(wait(&ep, &started).await);
+    assert!(
+        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("no longer valid")),
+        "{e:?}"
+    );
+
+    // The same answer under a 502 would be polled again: the code must be 403.
+    let (server, stub_ep) = stub(
+        403,
+        "application/json; charset=utf-8",
+        br#"{"error":"grant_unusable","message":"Google approved the sign-in, but its answer carried no refresh token, so nothing was handed out and the code is used up."}"#,
+        &[],
+    )
+    .await;
+    let e = err(wait(&stub_ep, &code("dc-any-xxxxxxxxxxxxxxxx", 2000)).await);
+    assert!(
+        matches!(&e, AuthError::LoginFailed(msg) if msg.contains("no refresh token")),
+        "{e:?}"
+    );
+    assert_eq!(stub_hits(&server).await, 1);
+}
+
+/// The address to open is the Worker's word. One that is not Google's is shown with a
+/// warning and is not opened: a Worker (or whoever answers under its name) cannot put a page
+/// of its choice in front of the user.
+#[tokio::test]
+async fn an_address_that_is_not_googles_is_not_opened() {
+    for url in [
+        "https://sign-in.example.net/device",
+        "https://www.google.com.example.net/device",
+    ] {
+        let fake = FakeDrive::start().await;
+        fake.set_verification_url(url);
+        let printed = Printed::default();
+        let (o, opened) = opts(&printed, false);
+        let ep = fake.auth();
+        let login = tokio::spawn(async move { auth::login_interactive(&http(), &ep, o).await });
+        let user_code = printed.user_code().await;
+        fake.approve(&user_code);
+        // The login itself still works: Google may move its page one day.
+        assert_eq!(login.await.unwrap().unwrap().refresh_token, "rt-1");
+        assert_eq!(
+            printed.lines(),
+            [
+                format!("To sign in, open  {url}"),
+                format!("{ENTER_THE_CODE}{user_code}"),
+                NOT_GOOGLE_NOTE.to_string(),
+                "(enter only a code shown in this terminal; waiting…)".to_string(),
+            ]
+        );
+        assert!(NOT_GOOGLE_NOTE.contains("not a google.com address"));
+        assert!(opened.lock().unwrap().is_empty(), "{url} was opened");
+    }
+    // An address that reads like Google's and is another host is not shown at all.
+    let body = json!({ "device_code": "dc-1-xxxxxxxxxxxxxxxx", "user_code": "ABCD-EFGH",
+                       "verification_url": "https://www.google.com@example.net/device",
+                       "expires_in": 1800, "interval": 5 });
+    let (_server, ep) = stub(200, "application/json", body.to_string().as_bytes(), &[]).await;
+    let printed = Printed::default();
+    let (o, opened) = opts(&printed, false);
+    let e = err(auth::login_interactive(&http(), &ep, o).await);
+    assert!(matches!(e, AuthError::Network(_)), "{e:?}");
+    assert!(printed.lines().is_empty() && opened.lock().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -986,7 +987,8 @@ async fn token_route_is_not_retried_except_once_after_429() {
 async fn refresh_maps_the_workers_answers() {
     let fake = FakeDrive::start().await;
     let (http, ep) = (http(), fake.auth());
-    let ok: AccessGrant = auth::refresh(&http, &ep, "rt-ok").await.unwrap();
+    let device = AuthClient::Device;
+    let ok: AccessGrant = auth::refresh(&http, &ep, "rt-ok", device).await.unwrap();
     assert!(ok.access_token.starts_with("at-"));
     assert!(
         ok.expires_at_ms
@@ -998,14 +1000,17 @@ async fn refresh_maps_the_workers_answers() {
         (seen.method.as_str(), seen.path.as_str()),
         ("POST", "/auth/refresh")
     );
-    assert_eq!(seen.json, Some(json!({ "refresh_token": "rt-ok" })));
+    assert_eq!(
+        seen.json,
+        Some(json!({ "refresh_token": "rt-ok", "client": "device" }))
+    );
 
     // a token Google never issued; a string the Worker's pre-filter refuses
     assert!(matches!(
-        err(auth::refresh(&http, &ep, "1//0unknown-but-well-formed-token").await),
+        err(auth::refresh(&http, &ep, "1//0unknown-but-well-formed-token", device).await),
         AuthError::Expired
     ));
-    let e = err(auth::refresh(&http, &ep, "not a refresh token").await);
+    let e = err(auth::refresh(&http, &ep, "not a refresh token", device).await);
     assert!(
         matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
         "{e:?}"
@@ -1013,13 +1018,13 @@ async fn refresh_maps_the_workers_answers() {
 
     fake.revoke_refresh_token();
     assert!(matches!(
-        err(auth::refresh(&http, &ep, "rt-ok").await),
+        err(auth::refresh(&http, &ep, "rt-ok", device).await),
         AuthError::Expired
     ));
 
     let fake = FakeDrive::start().await;
     fake.break_client();
-    let e = err(auth::refresh(&http, &fake.auth(), "rt-ok").await);
+    let e = err(auth::refresh(&http, &fake.auth(), "rt-ok", device).await);
     assert!(matches!(e, AuthError::WorkerMisconfigured(_)), "{e:?}");
     assert_eq!(
         fake.hits(Route::AuthRefresh),
@@ -1028,26 +1033,116 @@ async fn refresh_maps_the_workers_answers() {
     );
     fake.fail_next(Route::AuthRefresh, 1, 500, "server_misconfigured");
     assert!(matches!(
-        err(auth::refresh(&http, &fake.auth(), "rt-ok").await),
+        err(auth::refresh(&http, &fake.auth(), "rt-ok", device).await),
         AuthError::WorkerMisconfigured(_)
     ));
+}
+
+/// The transition of 0.2.0: a login made before it belongs to the Worker's legacy client, and
+/// the device says so by sending no `client` field.
+#[tokio::test]
+async fn a_legacy_login_refreshes_only_while_the_worker_keeps_the_legacy_client() {
+    let fake = FakeDrive::start().await;
+    let (http, ep) = (http(), fake.auth());
+    let legacy_token = fake.add_legacy_token();
+
+    // The Worker has the legacy secrets: the old token goes on working.
+    fake.set_legacy_client(true);
+    assert!(
+        auth::refresh(&http, &ep, &legacy_token, AuthClient::Legacy)
+            .await
+            .is_ok()
+    );
+    let seen = fake.requests(Route::AuthRefresh);
+    assert_eq!(
+        seen[0].json,
+        Some(json!({ "refresh_token": legacy_token })),
+        "no client field at all"
+    );
+    // through the provider, as every command uses it
+    let provider = TokenProvider::new(
+        http.clone(),
+        ep.clone(),
+        legacy_token.clone(),
+        AuthClient::Legacy,
+        None,
+    );
+    assert!(provider.access_token().await.unwrap().starts_with("at-"));
+    assert!(
+        fake.requests(Route::AuthRefresh)[1]
+            .json
+            .as_ref()
+            .unwrap()
+            .get("client")
+            .is_none()
+    );
+    // Each token under its own client only.
+    assert!(matches!(
+        err(auth::refresh(&http, &ep, &legacy_token, AuthClient::Device).await),
+        AuthError::Expired
+    ));
+    assert!(matches!(
+        err(auth::refresh(&http, &ep, "rt-ok", AuthClient::Legacy).await),
+        AuthError::Expired
+    ));
+    assert!(
+        auth::refresh(&http, &ep, "rt-ok", AuthClient::Device)
+            .await
+            .is_ok()
+    );
+
+    // Only one of the two legacy secrets is there (the Worker's owner is in the middle of
+    // putting or deleting the pair): a legacy login is told so — it is not asked to log in
+    // again — and everything of the device client goes on working.
+    fake.set_legacy_client_half_set();
+    let hits = fake.hits(Route::AuthRefresh);
+    let e = err(auth::refresh(&http, &ep, &legacy_token, AuthClient::Legacy).await);
+    assert!(
+        matches!(&e, AuthError::WorkerMisconfigured(msg) if msg.contains("GOOGLE_LEGACY_CLIENT_SECRET")),
+        "{e:?}"
+    );
+    assert_eq!(fake.hits(Route::AuthRefresh), hits + 1);
+    assert!(
+        auth::refresh(&http, &ep, "rt-ok", AuthClient::Device)
+            .await
+            .is_ok()
+    );
+    assert!(login_tokens(&fake).await.refresh_token.starts_with("rt-"));
+
+    // The legacy secrets are gone: "run `gclone login`", at once and without a retry.
+    fake.set_legacy_client(false);
+    let hits = fake.hits(Route::AuthRefresh);
+    let e = err(auth::refresh(&http, &ep, &legacy_token, AuthClient::Legacy).await);
+    assert!(matches!(e, AuthError::Expired), "{e:?}");
+    assert!(e.to_string().contains("run `gclone login`"));
+    assert_eq!(fake.hits(Route::AuthRefresh), hits + 1);
+    // A login of the device client is not affected.
+    assert!(
+        auth::refresh(&http, &ep, "rt-ok", AuthClient::Device)
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
 async fn refresh_retries_server_errors_and_one_429() {
     let http = http();
+    let refresh = |fake: &FakeDrive| {
+        let (http, ep) = (http.clone(), fake.auth());
+        async move { auth::refresh(&http, &ep, "rt-ok", AuthClient::Device).await }
+    };
     // a 502 is retried and then succeeds; so is a 500 without a mapped code and an HTML 503
     let fake = FakeDrive::start().await;
     fake.fail_next(Route::AuthRefresh, 1, 502, "upstream_error");
     fake.fail_next(Route::AuthRefresh, 1, 500, "internal_error");
     fake.fail_next_raw(Route::AuthRefresh, 1, 503, "<html>down</html>");
-    assert!(auth::refresh(&http, &fake.auth(), "rt-ok").await.is_ok());
+    assert!(refresh(&fake).await.is_ok());
     assert_eq!(fake.hits(Route::AuthRefresh), 4);
 
     // five failures are the end
     let fake = FakeDrive::start().await;
     fake.fail_next(Route::AuthRefresh, u32::MAX, 502, "upstream_error");
-    let e = err(auth::refresh(&http, &fake.auth(), "rt-ok").await);
+    let e = err(refresh(&fake).await);
     assert!(
         matches!(&e, AuthError::Network(msg) if msg.contains("502")),
         "{e:?}"
@@ -1057,12 +1152,12 @@ async fn refresh_retries_server_errors_and_one_429() {
     // one 429 is waited out, two are not
     let fake = FakeDrive::start().await;
     fake.fail_next(Route::AuthRefresh, 1, 429, "rate_limited");
-    let started = std::time::Instant::now();
-    assert!(auth::refresh(&http, &fake.auth(), "rt-ok").await.is_ok());
+    let started = Instant::now();
+    assert!(refresh(&fake).await.is_ok());
     assert_eq!(fake.hits(Route::AuthRefresh), 2);
     assert!(started.elapsed() >= Duration::from_millis(900));
     fake.fail_next(Route::AuthRefresh, 2, 429, "rate_limited");
-    let e = err(auth::refresh(&http, &fake.auth(), "rt-ok").await);
+    let e = err(refresh(&fake).await);
     assert!(
         matches!(&e, AuthError::Network(msg) if msg.contains("rate-limiting")),
         "{e:?}"
@@ -1078,7 +1173,7 @@ async fn a_redirect_from_the_worker_is_an_error_and_is_not_followed() {
     for status in [301, 302, 303, 307, 308] {
         let hits = fake.hits(Route::AuthRefresh);
         fake.fail_next_raw(Route::AuthRefresh, 1, status, "");
-        let e = err(auth::refresh(&http, &fake.auth(), "rt-ok").await);
+        let e = err(auth::refresh(&http, &fake.auth(), "rt-ok", AuthClient::Device).await);
         assert!(
             matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
             "{status}: {e:?}"
@@ -1089,15 +1184,23 @@ async fn a_redirect_from_the_worker_is_an_error_and_is_not_followed() {
             "{status}: neither followed nor retried"
         );
     }
-    let pkce = Pkce::generate();
-    let grant = grant_for(&fake, &pkce).await;
-    fake.fail_next_raw(Route::AuthToken, 1, 302, "");
-    let e = err(auth::redeem(&http, &fake.auth(), &grant, &pkce.verifier).await);
+    fake.fail_next_raw(Route::AuthStart, 1, 302, "");
+    let e = err(auth::device_start(&http, &fake.auth()).await);
     assert!(
         matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
         "{e:?}"
     );
-    assert_eq!(fake.hits(Route::AuthToken), 1);
+    assert_eq!(fake.hits(Route::AuthStart), 1);
+    // … and a redirected poll ends the login: the device code is not sent anywhere else.
+    let started = auth::device_start(&http, &fake.auth()).await.unwrap();
+    fake.approve(&started.user_code);
+    fake.fail_next_raw(Route::AuthPoll, 1, 307, "");
+    let e = err(wait(&fake.auth(), &started).await);
+    assert!(
+        matches!(&e, AuthError::Network(msg) if msg.contains("unexpected answer")),
+        "{e:?}"
+    );
+    assert_eq!(fake.hits(Route::AuthPoll), 1);
     assert!(fake.issued_refresh_tokens().is_empty());
 }
 
@@ -1113,8 +1216,13 @@ async fn two_logins_give_two_refresh_tokens_that_both_work() {
         [a.refresh_token.clone(), b.refresh_token.clone()]
     );
     for _ in 0..2 {
-        assert!(auth::refresh(&http, &ep, &a.refresh_token).await.is_ok());
-        assert!(auth::refresh(&http, &ep, &b.refresh_token).await.is_ok());
+        for token in [&a.refresh_token, &b.refresh_token] {
+            assert!(
+                auth::refresh(&http, &ep, token, AuthClient::Device)
+                    .await
+                    .is_ok()
+            );
+        }
     }
     // both devices reach Drive side by side
     for grant in [&a, &b] {
@@ -1157,7 +1265,7 @@ async fn revoke_is_grant_wide() {
     for token in [&a.refresh_token, &b.refresh_token, &"rt-ok".to_string()] {
         assert!(
             matches!(
-                err(auth::refresh(&http, &ep, token).await),
+                err(auth::refresh(&http, &ep, token, AuthClient::Device).await),
                 AuthError::Expired
             ),
             "{token}"
@@ -1169,7 +1277,11 @@ async fn revoke_is_grant_wide() {
     assert_eq!(fake.revoked().len(), 1);
     // a new login works again
     let c = login_tokens(&fake).await;
-    assert!(auth::refresh(&http, &ep, &c.refresh_token).await.is_ok());
+    assert!(
+        auth::refresh(&http, &ep, &c.refresh_token, AuthClient::Device)
+            .await
+            .is_ok()
+    );
 
     // anything else is a network error and the caller keeps its secrets
     fake.fail_next(Route::Revoke, 1, 503, "backend_error");
@@ -1202,6 +1314,7 @@ fn provider(fake: &FakeDrive, cache: Option<&Path>) -> TokenProvider {
         http(),
         fake.auth(),
         "rt-ok".into(),
+        AuthClient::Device,
         cache.map(Path::to_path_buf),
     )
 }
@@ -1282,6 +1395,7 @@ async fn prime_avoids_a_refresh_and_writes_no_file() {
         http(),
         fake.auth(),
         grant.refresh_token.clone(),
+        AuthClient::Device,
         Some(cache.clone()),
     );
     p.prime(&grant.access_token, grant.expires_at_ms);
@@ -1307,7 +1421,13 @@ async fn prime_avoids_a_refresh_and_writes_no_file() {
     assert!(p.last_refresh_ms().is_some());
 
     // a primed token that is about to expire is refreshed like any other
-    let p = TokenProvider::new(http(), fake.auth(), grant.refresh_token.clone(), None);
+    let p = TokenProvider::new(
+        http(),
+        fake.auth(),
+        grant.refresh_token.clone(),
+        AuthClient::Device,
+        None,
+    );
     p.prime("at-short", gclone::util::now_ms() + 10_000);
     assert_ne!(p.access_token().await.unwrap(), "at-short");
 }
@@ -1443,82 +1563,90 @@ async fn concurrent_callers_share_one_refresh() {
 // The contract fixture worker/test/contract.json (§16.5)
 // ---------------------------------------------------------------------------------------------
 
-const GIVEN: [&str; 16] = [
+const GIVEN: [&str; 23] = [
     "none",
-    "consent_ok",
-    "consent_denied",
-    "grant",
-    "grant_expired",
-    "grant_other_account",
-    "grant_no_drive_scope",
-    "grant_wide_scope",
-    "grant_expiring",
+    "pending",
+    "slow_down",
+    "denied",
+    "expired",
+    "used",
+    "approved",
+    "approved_expiring",
+    "approved_other_account",
+    "approved_no_drive_scope",
+    "approved_wide_scope",
+    "approved_no_id_token",
     "refresh_token",
     "refresh_revoked",
     "refresh_wide_scope",
+    "legacy_token",
+    "legacy_unconfigured",
+    "legacy_half_set",
+    "legacy_half_set_device_token",
     "client_broken",
     "google_down",
     "rate_limited",
     "unconfigured",
 ];
 
-const REQUIRED_CASES: [&str; 36] = [
-    "login_loopback",
-    "login_paste",
-    "login_bad_challenge",
-    "loopback_grant",
-    "loopback_denied",
-    "paste_code",
-    "token_ok",
-    "token_expiring",
-    "token_wrong_verifier",
-    "token_expired_grant",
-    "token_email_not_allowed",
-    "token_scope_missing",
-    "token_scope_not_allowed",
-    "token_client_invalid",
-    "token_upstream",
-    "token_rate_limited",
-    "token_unconfigured",
-    "token_wrong_content_type",
-    "token_too_large",
-    "token_not_json",
-    "token_missing_field",
-    "token_get",
+const REQUIRED_CASES: [&str; 48] = [
+    "start_ok",
+    "start_client_invalid",
+    "start_upstream",
+    "start_rate_limited",
+    "start_unconfigured",
+    "start_wrong_content_type",
+    "start_get",
+    "poll_pending",
+    "poll_slow_down",
+    "poll_denied",
+    "poll_expired",
+    "poll_used",
+    "poll_ok",
+    "poll_expiring",
+    "poll_email_not_allowed",
+    "poll_scope_missing",
+    "poll_scope_not_allowed",
+    "poll_grant_unusable",
+    "poll_client_invalid",
+    "poll_upstream",
+    "poll_rate_limited",
+    "poll_unconfigured",
+    "poll_wrong_content_type",
+    "poll_too_large",
+    "poll_not_json",
+    "poll_missing_field",
+    "poll_malformed_code",
+    "poll_get",
     "refresh_ok",
+    "refresh_legacy_ok",
+    "refresh_legacy_unconfigured",
+    "refresh_legacy_half_set",
+    "refresh_half_set_device_ok",
+    "refresh_bad_client",
     "refresh_invalid_grant",
     "refresh_malformed_token",
     "refresh_scope_not_allowed",
     "refresh_client_invalid",
     "refresh_upstream",
     "refresh_rate_limited",
-    "not_found",
-    // delivered beyond the required list (§17.2)
-    "login_bad_port",
-    "login_missing_state",
-    "paste_denied",
-    "refresh_missing_field",
     "refresh_unconfigured",
     "refresh_get",
+    "not_found",
+    // the routes of the browser sign-in before 0.2.0 are gone
+    "login_gone",
+    "callback_gone",
+    "token_gone",
+    // delivered beyond the required list
+    "start_not_json",
+    "refresh_missing_field",
 ];
 
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct Contract {
     version: u32,
-    vector: Vector,
     cases: Vec<Case>,
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-struct Vector {
-    verifier: String,
-    challenge: String,
-    state: String,
-    port: u16,
-    check_code: String,
-    email: String,
 }
 
 /// `request` and `response` stay raw so that the runner — not the loader — refuses what it
@@ -1539,7 +1667,6 @@ struct WantedRequest {
     path: String,
     #[serde(default)]
     headers: BTreeMap<String, String>,
-    query: Option<BTreeMap<String, String>>,
     json: Option<Value>,
     body: Option<String>,
 }
@@ -1551,9 +1678,6 @@ struct WantedResponse {
     #[serde(default)]
     headers: BTreeMap<String, String>,
     json: Option<serde_json::Map<String, Value>>,
-    location: Option<String>,
-    #[serde(default)]
-    body_contains: Vec<String>,
 }
 
 fn contract() -> Contract {
@@ -1588,184 +1712,28 @@ fn placeholders(text: &str) -> Vec<String> {
     found
 }
 
-/// A regular expression must match `text` in full. Only what the fixture's `location`
-/// patterns use is understood — literals, `\` escapes, `.`, `[...]` classes with ranges, and
-/// the quantifiers `+ * ?`; anything else is an error, so the fixture cannot outgrow this.
-fn regex_full_match(pattern: &str, text: &str) -> Result<bool, String> {
-    enum Set {
-        Any,
-        Of(Vec<(char, char)>),
-    }
-    struct Atom {
-        set: Set,
-        min: usize,
-        max: usize,
-    }
-    let inner = pattern.strip_prefix('^').unwrap_or(pattern);
-    let inner = match inner.strip_suffix('$') {
-        Some(body) if !body.ends_with('\\') => body,
-        _ => inner,
-    };
-    let mut atoms: Vec<Atom> = Vec::new();
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        let set = match c {
-            '\\' => {
-                let escaped = chars.next().ok_or("a pattern ends in a backslash")?;
-                if escaped.is_ascii_alphanumeric() {
-                    return Err(format!("unsupported escape \\{escaped}"));
-                }
-                Set::Of(vec![(escaped, escaped)])
-            }
-            '.' => Set::Any,
-            '[' => {
-                let mut ranges = Vec::new();
-                if chars.peek() == Some(&'^') {
-                    return Err("negated classes are not supported".into());
-                }
-                loop {
-                    let mut lo = chars.next().ok_or("unterminated character class")?;
-                    if lo == ']' {
-                        break;
-                    }
-                    if lo == '\\' {
-                        lo = chars.next().ok_or("unterminated character class")?;
-                    }
-                    if chars.peek() == Some(&'-') {
-                        chars.next();
-                        match chars.peek() {
-                            Some(']') | None => ranges.extend([(lo, lo), ('-', '-')]),
-                            Some(_) => ranges.push((lo, chars.next().unwrap())),
-                        }
-                    } else {
-                        ranges.push((lo, lo));
-                    }
-                }
-                Set::Of(ranges)
-            }
-            '(' | ')' | '|' | '{' | '}' | '^' | '$' | '+' | '*' | '?' => {
-                return Err(format!(
-                    "unsupported regular expression syntax {c:?} in {pattern}"
-                ));
-            }
-            literal => Set::Of(vec![(literal, literal)]),
-        };
-        let (min, max) = match chars.peek() {
-            Some('+') => (1, usize::MAX),
-            Some('*') => (0, usize::MAX),
-            Some('?') => (0, 1),
-            _ => (1, 1),
-        };
-        if (min, max) != (1, 1) {
-            chars.next();
-        }
-        atoms.push(Atom { set, min, max });
-    }
-    fn matches(atoms: &[Atom], text: &[char]) -> bool {
-        let Some((atom, rest)) = atoms.split_first() else {
-            return text.is_empty();
-        };
-        let fits = |c: char| match &atom.set {
-            Set::Any => true,
-            Set::Of(ranges) => ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c)),
-        };
-        let longest = text.iter().take(atom.max).take_while(|c| fits(**c)).count();
-        (atom.min..=longest)
-            .rev()
-            .any(|n| matches(rest, &text[n..]))
-    }
-    Ok(matches(&atoms, &text.chars().collect::<Vec<_>>()))
-}
-
-/// The walk from the `/login` answer to where the browser ends up (the 302 to the loopback
-/// address, or the final page): follow the confirmation page's one link to "Google". When
-/// Google granted access (`granted`), `/callback` must answer the second confirmation page —
-/// never a redirect, never the paste code — showing `check_code`; its one link is followed too.
-async fn walk_consent(
-    http: &reqwest::Client,
-    confirmation: reqwest::Response,
-    granted: bool,
-    check_code: &str,
-) -> Result<reqwest::Response, String> {
-    async fn page_and_link(
-        page: reqwest::Response,
-        what: &str,
-    ) -> Result<(String, String), String> {
-        if page.status() != 200 || page.headers().contains_key("location") {
-            return Err(format!("{what} answered {}", page.status()));
-        }
-        let text = page.text().await.map_err(|e| e.to_string())?;
-        let links = page_links(&text);
-        match links.as_slice() {
-            [link] => Ok((text.clone(), link.clone())),
-            _ => Err(format!(
-                "{what} must have exactly one link, found {links:?}"
-            )),
-        }
-    }
-    let get = |url: String| async move { http.get(url).send().await.map_err(|e| e.to_string()) };
-    let (_, to_google) = page_and_link(confirmation, "the confirmation page").await?;
-    let back = get(to_google).await?;
-    if !granted {
-        return Ok(back);
-    }
-    let (page, finish) = page_and_link(back, "the confirmation page after Google").await?;
-    if page.contains(PASTE_PREFIX) || !page.contains(check_code) {
-        return Err(format!(
-            "the page after Google must show the check code {check_code} and no paste code: {page}"
-        ));
-    }
-    get(finish).await
-}
-
-async fn fixture_grant(
-    fake: &FakeDrive,
-    http: &reqwest::Client,
-    v: &Vector,
-) -> Result<String, String> {
-    let url = format!(
-        "{}/login?challenge={}&port={}&state={}",
-        fake.auth().base,
-        v.challenge,
-        v.port,
-        v.state
-    );
-    let confirmation = http.get(url).send().await.map_err(|e| e.to_string())?;
-    let redirect = walk_consent(http, confirmation, true, &v.check_code).await?;
-    let location = redirect
-        .headers()
-        .get("location")
-        .and_then(|l| l.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let query = location.split_once('?').map(|(_, q)| q).unwrap_or("");
-    url::form_urlencoded::parse(query.as_bytes())
-        .find(|(k, _)| k == "code")
-        .map(|(_, code)| code.into_owned())
-        .ok_or_else(|| format!("no grant in the loopback redirect {location:?}"))
-}
-
 /// Reproduces one case against a fresh fake's auth routes with a plain HTTP client and checks
 /// the answer. `Err` names the first thing that is wrong — or that this runner does not know.
-async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
+async fn run_case(case: &Case) -> Result<Answered, String> {
     let request: WantedRequest = serde_json::from_value(case.request.clone())
         .map_err(|e| format!("request: unknown key or shape: {e}"))?;
     let want: WantedResponse = serde_json::from_value(case.response.clone())
         .map_err(|e| format!("response: unknown key or shape: {e}"))?;
-    if !GIVEN.contains(&case.given.as_str()) {
-        return Err(format!("unknown given {:?}", case.given));
+    let given = case.given.as_str();
+    if !GIVEN.contains(&given) {
+        return Err(format!("unknown given {given:?}"));
     }
     if request.json.is_some() && request.body.is_some() {
         return Err("both json and body".into());
     }
     let route = match request.path.as_str() {
-        "/login" => Some(Route::AuthLogin),
-        "/token" => Some(Route::AuthToken),
+        "/device/start" => Some(Route::AuthStart),
+        "/device/poll" => Some(Route::AuthPoll),
         "/refresh" => Some(Route::AuthRefresh),
         _ => None,
     };
     let fake = FakeDrive::start().await;
-    let base = fake.auth().base;
+    let (ep, client) = (fake.auth(), http());
     // No redirect following: what the Worker answers is what is compared.
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1774,41 +1742,59 @@ async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
 
     // Placeholders this side produces from its own implementation — before the given state.
     let request_text = case.request.to_string();
-    let mut values: BTreeMap<&str, String> = BTreeMap::from([
-        ("<verifier>", v.verifier.clone()),
-        ("<challenge>", v.challenge.clone()),
-        ("<state>", v.state.clone()),
-        ("<port>", v.port.to_string()),
-        (
-            "<other_verifier>",
-            "another-verifier_another-verifier_another-verifier".to_string(),
-        ),
-    ]);
-    if request_text.contains("<grant>") {
-        match case.given.as_str() {
-            "grant_other_account" => fake.set_login_email("stranger@example.com"),
-            "grant_no_drive_scope" => {
+    let mut values: BTreeMap<&str, String> = BTreeMap::new();
+    if request_text.contains("<device_code>") {
+        match given {
+            "approved_other_account" => fake.set_login_email("stranger@example.com"),
+            "approved_no_drive_scope" => {
                 fake.set_granted_scope("openid https://www.googleapis.com/auth/userinfo.email")
             }
-            "grant_wide_scope" => fake.set_granted_scope(WIDE_SCOPE),
-            "grant_expiring" => fake.set_refresh_expires_in(Some(604_799)),
+            "approved_wide_scope" => fake.set_granted_scope(WIDE_SCOPE),
+            "approved_expiring" => fake.set_refresh_expires_in(Some(604_799)),
+            "approved_no_id_token" => fake.omit_id_token(),
             _ => {}
         }
-        values.insert("<grant>", fixture_grant(&fake, &http, v).await?);
-        if case.given == "grant_expired" {
-            fake.expire_grants();
-        }
-    }
-    if request_text.contains("<refresh_token>") {
-        let grant = fixture_grant(&fake, &http, v).await?;
-        let tokens = auth::redeem(&http, &fake.auth(), &grant, &v.verifier)
+        let started = auth::device_start(&client, &ep)
             .await
             .map_err(|e| e.to_string())?;
-        values.insert("<refresh_token>", tokens.refresh_token);
-        if case.given == "refresh_revoked" {
+        match given {
+            "slow_down" => fake.slow_down(1),
+            "denied" => fake.deny(&started.user_code),
+            "expired" => fake.expire_codes(),
+            "used" => {
+                fake.approve(&started.user_code);
+                wait(&ep, &started).await.map_err(|e| e.to_string())?;
+            }
+            g if g.starts_with("approved") => fake.approve(&started.user_code),
+            _ => {}
+        }
+        values.insert("<device_code>", started.device_code);
+    }
+    if request_text.contains("<refresh_token>") {
+        let token = match given {
+            "legacy_token" | "legacy_unconfigured" => {
+                fake.set_legacy_client(given == "legacy_token");
+                fake.add_legacy_token()
+            }
+            "legacy_half_set" => {
+                fake.set_legacy_client_half_set();
+                fake.add_legacy_token()
+            }
+            _ => {
+                if given == "legacy_half_set_device_token" {
+                    fake.set_legacy_client_half_set();
+                }
+                try_login(&fake)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .refresh_token
+            }
+        };
+        values.insert("<refresh_token>", token);
+        if given == "refresh_revoked" {
             fake.revoke_refresh_token();
         }
-        if case.given == "refresh_wide_scope" {
+        if given == "refresh_wide_scope" {
             fake.set_granted_scope(WIDE_SCOPE);
         }
     }
@@ -1831,30 +1817,21 @@ async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
             Ok(())
         }
         None => Err(format!(
-            "given {:?} on a path without a route: {}",
-            case.given, request.path
+            "given {given:?} on a path without a route: {}",
+            request.path
         )),
     };
-    match case.given.as_str() {
+    match given {
         "client_broken" => fake.break_client(),
         "google_down" => inject(502, "upstream_error")?,
         "rate_limited" => inject(429, "rate_limited")?,
         "unconfigured" => inject(500, "server_misconfigured")?,
-        "consent_denied" => fake.deny_consent_once(),
         _ => {}
     }
 
-    let mut url = format!("{base}{}", request.path);
-    if let Some(query) = &request.query {
-        let mut pairs = url::form_urlencoded::Serializer::new(String::new());
-        for (name, value) in query {
-            pairs.append_pair(name, &fill(value));
-        }
-        url = format!("{url}?{}", pairs.finish());
-    }
     let method =
         reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|e| e.to_string())?;
-    let mut builder = http.request(method, url);
+    let mut builder = http.request(method, format!("{}{}", ep.base, request.path));
     for (name, value) in &request.headers {
         builder = builder.header(name, fill(value));
     }
@@ -1864,13 +1841,7 @@ async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
     if let Some(body) = &request.body {
         builder = builder.body(fill(body));
     }
-    let mut response = builder.send().await.map_err(|e| e.to_string())?;
-    if matches!(case.given.as_str(), "consent_ok" | "consent_denied") {
-        // The request was the device's /login URL; the expected answer is where the browser
-        // ends up after the walk.
-        let granted = case.given == "consent_ok";
-        response = walk_consent(&http, response, granted, &v.check_code).await?;
-    }
+    let response = builder.send().await.map_err(|e| e.to_string())?;
 
     // --- compare
     let status = response.status().as_u16();
@@ -1896,15 +1867,8 @@ async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
             Some(_) => {}
         }
     }
-    match (&want.location, header("location")) {
-        (None, None) => {}
-        (None, Some(got)) => return Err(format!("an unexpected Location header: {got}")),
-        (Some(pattern), got) => {
-            let got = got.unwrap_or_default();
-            if !regex_full_match(pattern, &got)? {
-                return Err(format!("Location {got:?} does not match {pattern}"));
-            }
-        }
+    if let Some(got) = header("location") {
+        return Err(format!("an unexpected Location header: {got}"));
     }
     let answered = Answered {
         status,
@@ -1912,15 +1876,9 @@ async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
         retry_after: header("retry-after"),
         body: response.bytes().await.map_err(|e| e.to_string())?.to_vec(),
     };
-    let text = String::from_utf8_lossy(&answered.body);
-    for part in &want.body_contains {
-        if !text.contains(part.as_str()) {
-            return Err(format!("the body does not contain {part:?}"));
-        }
-    }
     if let Some(expected) = &want.json {
-        let got: Value =
-            serde_json::from_str(&text).map_err(|e| format!("the body is not JSON: {e}"))?;
+        let got: Value = serde_json::from_slice(&answered.body)
+            .map_err(|e| format!("the body is not JSON: {e}"))?;
         let got = got.as_object().ok_or("the body is not a JSON object")?;
         let (got_keys, want_keys): (Vec<_>, Vec<_>) =
             (got.keys().collect(), expected.keys().collect());
@@ -1946,11 +1904,16 @@ async fn run_case(v: &Vector, case: &Case) -> Result<Answered, String> {
     Ok(answered)
 }
 
-/// What the mapping table of §2.4 assigns to an answer of `/token` or `/refresh`.
+/// What the mapping table of §2.4 assigns to an answer of one of the three routes.
 #[derive(Debug, PartialEq)]
 enum Mapped {
-    Tokens { refresh_expires_in: Option<u64> },
+    /// `/device/start` answered a code.
+    Started,
+    Tokens {
+        refresh_expires_in: Option<u64>,
+    },
     Expired,
+    Timeout,
     LoginFailed,
     NotAllowed,
     ScopeMissing,
@@ -1962,6 +1925,7 @@ enum Mapped {
 fn mapped_error(e: &AuthError) -> Mapped {
     match e {
         AuthError::Expired => Mapped::Expired,
+        AuthError::Timeout => Mapped::Timeout,
         AuthError::LoginFailed(_) => Mapped::LoginFailed,
         AuthError::NotAllowed(_) => Mapped::NotAllowed,
         AuthError::ScopeMissing => Mapped::ScopeMissing,
@@ -1972,32 +1936,54 @@ fn mapped_error(e: &AuthError) -> Mapped {
     }
 }
 
-/// The table, written out independently of `auth/login.rs`: (expected result, requests the
-/// client may send before it gives that result).
-fn table(token_route: bool, status: u16, body: &Value) -> (Mapped, usize) {
+/// How many requests the client may send before it gives its result.
+#[derive(Debug)]
+enum Requests {
+    Exactly(usize),
+    /// A poll that is repeated until the code runs out.
+    Several,
+}
+
+/// The table, written out independently of `auth/login.rs`. The poll replay uses a code that
+/// lives 300 ms and is polled every 10 ms: "keeps polling" ends in `Timeout` (nobody came) or
+/// `Network` (the polls failed).
+fn table(route: Route, status: u16, body: &Value) -> (Mapped, Requests) {
+    use Requests::{Exactly, Several};
     let code = body.get("error").and_then(Value::as_str).unwrap_or("");
+    let poll = route == Route::AuthPoll;
     match (status, code) {
+        (200, _) if route == Route::AuthStart => (Mapped::Started, Exactly(1)),
         (200, _) => {
             let refresh_expires_in = body.get("refresh_token_expires_in").and_then(Value::as_u64);
-            (Mapped::Tokens { refresh_expires_in }, 1)
+            (Mapped::Tokens { refresh_expires_in }, Exactly(1))
         }
-        (400, "invalid_grant") if token_route => (Mapped::LoginFailed, 1),
-        (400, "invalid_grant") => (Mapped::Expired, 1),
-        (403, "email_not_allowed") => (Mapped::NotAllowed, 1),
-        (403, "scope_missing") => (Mapped::ScopeMissing, 1),
-        (403, "scope_not_allowed") => (Mapped::Denied, 1),
-        (403, "access_denied") => (Mapped::Denied, 1),
-        (500, "client_invalid" | "server_misconfigured") => (Mapped::WorkerMisconfigured, 1),
-        // wait Retry-After, retry once
-        (429, _) => (Mapped::Network, 2),
-        // /token: at once; /refresh: five tries
-        (500..=599, _) => (Mapped::Network, if token_route { 1 } else { 5 }),
-        _ => (Mapped::Network, 1),
+        (400, "authorization_pending") if poll => (Mapped::Timeout, Several),
+        // the interval grows by 5 s, past the end of the code
+        (400, "slow_down") if poll => (Mapped::Timeout, Exactly(1)),
+        (400, "expired_token") if poll => (Mapped::Timeout, Exactly(1)),
+        (400, "invalid_grant") if poll => (Mapped::LoginFailed, Exactly(1)),
+        (400, "invalid_grant") if route == Route::AuthRefresh => (Mapped::Expired, Exactly(1)),
+        // the grant was issued and could not be handed out: final, never polled again
+        (403, "grant_unusable") if poll => (Mapped::LoginFailed, Exactly(1)),
+        (403, "email_not_allowed") => (Mapped::NotAllowed, Exactly(1)),
+        (403, "scope_missing") => (Mapped::ScopeMissing, Exactly(1)),
+        (403, "scope_not_allowed") => (Mapped::Denied, Exactly(1)),
+        (403, "access_denied") => (Mapped::Denied, Exactly(1)),
+        (500, "client_invalid" | "server_misconfigured") => {
+            (Mapped::WorkerMisconfigured, Exactly(1))
+        }
+        // a poll waits Retry-After (here: longer than the code lives); the others retry once
+        (429, _) if poll => (Mapped::Network, Exactly(1)),
+        (429, _) => (Mapped::Network, Exactly(2)),
+        // a poll goes on; /device/start and /refresh: five tries
+        (500..=599, _) if poll => (Mapped::Network, Several),
+        (500..=599, _) => (Mapped::Network, Exactly(5)),
+        _ => (Mapped::Network, Exactly(1)),
     }
 }
 
 /// Feeds a recorded answer through the Rust client and compares with the table.
-async fn check_client_mapping(name: String, token_route: bool, answered: Answered) {
+async fn check_client_mapping(name: String, route: Route, answered: Answered) {
     let headers: Vec<(&str, &str)> = answered
         .retry_after
         .iter()
@@ -2011,47 +1997,43 @@ async fn check_client_mapping(name: String, token_route: bool, answered: Answere
     )
     .await;
     let body: Value = serde_json::from_slice(&answered.body).unwrap_or(Value::Null);
-    let (want, requests) = table(token_route, answered.status, &body);
-    let got = if token_route {
-        match auth::redeem(&http(), &ep, "g-1", VERIFIER).await {
-            Ok(grant) => Mapped::Tokens {
-                refresh_expires_in: grant.refresh_expires_in,
-            },
+    let (want, requests) = table(route, answered.status, &body);
+    let tokens = |r: Result<Option<u64>, AuthError>| match r {
+        Ok(refresh_expires_in) => Mapped::Tokens { refresh_expires_in },
+        Err(e) => mapped_error(&e),
+    };
+    let got = match route {
+        Route::AuthStart => match auth::device_start(&http(), &ep).await {
+            Ok(_) => Mapped::Started,
             Err(e) => mapped_error(&e),
-        }
-    } else {
-        match auth::refresh(&http(), &ep, "rt-contract").await {
-            Ok(_) => Mapped::Tokens {
-                refresh_expires_in: None,
-            },
-            Err(e) => mapped_error(&e),
-        }
+        },
+        Route::AuthPoll => tokens(
+            wait(&ep, &code("dc-contract-xxxxxxxxxxxx", 300))
+                .await
+                .map(|grant| grant.refresh_expires_in),
+        ),
+        _ => tokens(
+            auth::refresh(&http(), &ep, "rt-contract", AuthClient::Device)
+                .await
+                .map(|_| None),
+        ),
     };
     assert_eq!(
         got, want,
         "case {name}: the client's result for a {} answer",
         answered.status
     );
-    assert_eq!(
-        stub_hits(&server).await,
-        requests,
-        "case {name}: requests sent"
-    );
+    let sent = stub_hits(&server).await;
+    match requests {
+        Requests::Exactly(n) => assert_eq!(sent, n, "case {name}: requests sent"),
+        Requests::Several => assert!(sent >= 3, "case {name}: {sent} requests sent"),
+    }
 }
 
 #[tokio::test]
 async fn contract_fixture_matches_the_fake_and_the_client() {
     let contract = contract();
-    assert_eq!(contract.version, 1);
-    let v = &contract.vector;
-    let pkce = Pkce::from_verifier(&v.verifier, &v.state);
-    assert_eq!(pkce.challenge, v.challenge);
-    assert_eq!(pkce.check_code(), v.check_code);
-    assert_eq!(
-        (v.verifier.as_str(), v.challenge.as_str(), v.state.as_str()),
-        (VERIFIER, CHALLENGE, STATE)
-    );
-    assert_eq!((v.port, v.email.as_str()), (8123, "me@example.com"));
+    assert_eq!(contract.version, 2);
 
     let names: Vec<&str> = contract.cases.iter().map(|c| c.name.as_str()).collect();
     let unique: std::collections::HashSet<&&str> = names.iter().collect();
@@ -2062,46 +2044,41 @@ async fn contract_fixture_matches_the_fake_and_the_client() {
         .collect();
     assert!(missing.is_empty(), "the fixture lacks {missing:?}");
 
-    // Every case against the fake's routes; every /token and /refresh answer through the client.
+    // Every case against the fake's routes; every answer of a route through the client.
     let mut replays = Vec::new();
     for case in &contract.cases {
-        let answered = run_case(v, case)
+        let answered = run_case(case)
             .await
             .unwrap_or_else(|why| panic!("case {} (given {}): {why}", case.name, case.given));
-        let path = case.request["path"].as_str().unwrap_or("");
-        if matches!(path, "/token" | "/refresh") {
-            replays.push(check_client_mapping(
-                case.name.clone(),
-                path == "/token",
-                answered,
-            ));
-        }
+        let route = match case.request["path"].as_str().unwrap_or("") {
+            "/device/start" => Route::AuthStart,
+            "/device/poll" => Route::AuthPoll,
+            "/refresh" => Route::AuthRefresh,
+            _ => continue,
+        };
+        replays.push(check_client_mapping(case.name.clone(), route, answered));
     }
-    assert!(
-        replays.len() >= 21,
-        "every /token and /refresh case is replayed"
-    );
+    assert!(replays.len() >= 44, "every case of a route is replayed");
     futures_util::future::join_all(replays).await;
 }
 
 #[tokio::test]
 async fn contract_runner_refuses_what_it_does_not_know_and_notices_wrong_answers() {
     let contract = contract();
-    let v = &contract.vector;
     let base: Case = serde_json::from_value(json!({
         "name": "x", "given": "none",
         "request": { "method": "GET", "path": "/nothing-here" },
         "response": { "status": 404 }
     }))
     .unwrap();
-    run_case(v, &base).await.unwrap();
+    run_case(&base).await.unwrap();
     let with = |patch: fn(&mut Case)| {
         let mut case = base.clone();
         patch(&mut case);
         case
     };
     let refused = |case: Case, why: &'static str| async move {
-        match run_case(v, &case).await {
+        match run_case(&case).await {
             Ok(_) => panic!("the runner accepted: {why}"),
             Err(e) => assert!(e.contains(why), "{e:?} should mention {why:?}"),
         }
@@ -2112,15 +2089,21 @@ async fn contract_runner_refuses_what_it_does_not_know_and_notices_wrong_answers
         "unknown key",
     )
     .await;
-    refused(with(|c| c.request["cookies"] = json!({})), "unknown key").await;
     refused(
-        with(|c| c.request["query"] = json!({ "a": "<nonce>" })),
+        with(|c| c.response["location"] = json!("http://.+")),
+        "unknown key",
+    )
+    .await;
+    refused(with(|c| c.request["cookies"] = json!({})), "unknown key").await;
+    refused(with(|c| c.request["query"] = json!({})), "unknown key").await;
+    refused(
+        with(|c| c.request["json"] = json!({ "refresh_token": "<grant>" })),
         "unknown placeholder",
     )
     .await;
     refused(
-        with(|c| c.response["location"] = json!("(a|b)")),
-        "unsupported regular expression",
+        with(|c| c.given = "google_down".into()),
+        "path without a route",
     )
     .await;
     assert!(
@@ -2129,19 +2112,23 @@ async fn contract_runner_refuses_what_it_does_not_know_and_notices_wrong_answers
         )
         .is_err()
     );
+    assert!(
+        serde_json::from_value::<Contract>(json!({ "version": 2, "cases": [], "vector": {} }))
+            .is_err()
+    );
 
-    let token_get = contract
+    let poll_get = contract
         .cases
         .iter()
-        .find(|c| c.name == "token_get")
+        .find(|c| c.name == "poll_get")
         .unwrap()
         .clone();
     let wrong = |patch: fn(&mut Case)| {
-        let mut case = token_get.clone();
+        let mut case = poll_get.clone();
         patch(&mut case);
         case
     };
-    run_case(v, &token_get).await.unwrap();
+    run_case(&poll_get).await.unwrap();
     refused(wrong(|c| c.response["status"] = json!(404)), "status").await;
     refused(
         wrong(|c| c.response["headers"]["allow"] = json!("GET")),
@@ -2178,86 +2165,14 @@ async fn contract_runner_refuses_what_it_does_not_know_and_notices_wrong_answers
         "unknown matcher",
     )
     .await;
-    refused(
-        wrong(|c| c.response["location"] = json!("http://.+")),
-        "Location",
-    )
-    .await;
-    refused(
-        wrong(|c| c.response["body_contains"] = json!(["no such text"])),
-        "does not contain",
-    )
-    .await;
-    // a redirect where the fixture expects none
-    let loopback = contract
+    // a state the fake is not in: the fixture's answer for it does not come
+    let pending = contract
         .cases
         .iter()
-        .find(|c| c.name == "loopback_grant")
+        .find(|c| c.name == "poll_pending")
         .unwrap()
         .clone();
-    let mut no_location = loopback.clone();
-    no_location
-        .response
-        .as_object_mut()
-        .unwrap()
-        .remove("location");
-    refused(no_location, "unexpected Location").await;
-    let mut other_port = loopback;
-    other_port.response["location"] =
-        json!("^http://127\\.0\\.0\\.1:9999/\\?code=[A-Za-z0-9_-]+&state=AAAAAAAAAAAAAAAAAAAAAA$");
-    refused(other_port, "does not match").await;
-}
-
-#[test]
-fn the_fixture_regex_subset() {
-    let m = |p: &str, t: &str| regex_full_match(p, t).unwrap();
-    let grant = r"^http://127\.0\.0\.1:8123/\?code=[A-Za-z0-9_-]+&state=AAAAAAAAAAAAAAAAAAAAAA$";
-    assert!(m(
-        grant,
-        "http://127.0.0.1:8123/?code=g-3&state=AAAAAAAAAAAAAAAAAAAAAA"
-    ));
-    assert!(
-        !m(
-            grant,
-            "http://127.0.0.1:8123/?code=&state=AAAAAAAAAAAAAAAAAAAAAA"
-        ),
-        "+ needs one"
-    );
-    assert!(
-        !m(
-            grant,
-            "http://127x0.0.1:8123/?code=g&state=AAAAAAAAAAAAAAAAAAAAAA"
-        ),
-        "an escaped dot is a dot"
-    );
-    assert!(
-        !m(
-            grant,
-            "http://127.0.0.1:8123/?code=g.3&state=AAAAAAAAAAAAAAAAAAAAAA"
-        ),
-        "the class is closed"
-    );
-    assert!(
-        !m(
-            grant,
-            "xhttp://127.0.0.1:8123/?code=g&state=AAAAAAAAAAAAAAAAAAAAAA"
-        ),
-        "in full"
-    );
-    assert!(
-        !m(
-            grant,
-            "http://127.0.0.1:8123/?code=g&state=AAAAAAAAAAAAAAAAAAAAAAB"
-        ),
-        "in full"
-    );
-    assert!(m(
-        r"/\?error=access_denied&state=.*",
-        "/?error=access_denied&state=xyz"
-    ));
-    assert!(m("ab?c*[x-z]", "acccz") && m("ab?c*[x-z]", "abx") && !m("ab?c*[x-z]", "abbx"));
-    assert!(m("[a-]+", "a-a") && !m("[a-]+", "b"));
-    for unsupported in ["(a)", "a|b", "a{2}", r"\d+", "[^a]"] {
-        assert!(regex_full_match(unsupported, "a").is_err(), "{unsupported}");
-    }
+    let mut denied = pending.clone();
+    denied.given = "denied".into();
+    refused(denied, "status").await;
 }

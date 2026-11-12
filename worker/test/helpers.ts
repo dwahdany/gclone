@@ -1,48 +1,48 @@
-// Test support: a literal Env, a fake Google behind the injected fetch, a settable clock, a fake rate limiter,
-// a console spy that enforces the logging rules after every test, and the runner for the contract fixture.
+// Test support: a literal Env, a fake Google behind the injected fetch, a fake rate limiter, a console spy that
+// enforces the logging rules after every test, and the runner for the contract fixture.
 
 import { afterEach, beforeEach, expect, vi } from "vitest";
-import { GRANT_TTL_S, handle, type Deps, type Env, type RateLimiter } from "../src/index";
-import { b64urlEncode, sha256 } from "../src/seal";
-
-// The shared test vector (SPEC §2.3, §2.4; also the `vector` of contract.json).
-export const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-export const CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-export const CHECK_CODE = "D2KC-JCJY";
-export const NONCE = "mKAL8fUxkA1kKo1N1fGpkTPlTwOW8hTa0YuYssR4ouw";
-export const DEVICE_STATE = "AAAAAAAAAAAAAAAAAAAAAA";
-export const PORT = 8123;
-export const OTHER_VERIFIER = "another-device-verifier_0123456789.0123456789~";
+import { handle, type Deps, type Env, type RateLimiter } from "../src/index";
 
 export const ORIGIN = "https://auth.test";
-export const CLIENT_ID = "cid.apps.googleusercontent.com";
-export const CLIENT_SECRET = "test-secret";
-export const SEAL_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="; // bytes 0..31
+export const CLIENT_ID = "device-cid.apps.googleusercontent.com";
+export const CLIENT_SECRET = "test-device-secret";
+export const LEGACY_CLIENT_ID = "legacy-cid.apps.googleusercontent.com";
+export const LEGACY_CLIENT_SECRET = "test-legacy-secret";
 export const EMAIL = "me@example.com";
-export const GOOGLE = { authUrl: "https://google.test/auth", tokenUrl: "https://google.test/token", revokeUrl: "https://google.test/revoke" };
+export const GOOGLE = { deviceCodeUrl: "https://google.test/device/code", tokenUrl: "https://google.test/token", revokeUrl: "https://google.test/revoke" };
+export const SCOPES = "openid email https://www.googleapis.com/auth/drive.file";
 export const GRANTED_SCOPE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.file";
-/** What Google grants when the `scope` of the authorization URL was widened to the whole Drive on its way to the user. */
+/** A grant that covers the whole Drive (an older, wider grant of the same account to the same project). */
 export const WIDE_SCOPE = `${GRANTED_SCOPE} https://www.googleapis.com/auth/drive`;
-export const T0_MS = 1_794_400_000_000;
+export const VERIFICATION_URL = "https://www.google.com/device";
+export const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
+/** The device client only; `withLegacy()` adds the legacy pair. */
 export function testEnv(over: Partial<Env> = {}): Env {
-  return { GOOGLE_CLIENT_ID: CLIENT_ID, GOOGLE_CLIENT_SECRET: CLIENT_SECRET, SEAL_KEY, ALLOWED_EMAILS: EMAIL, ...over };
+  return { GOOGLE_CLIENT_ID: CLIENT_ID, GOOGLE_CLIENT_SECRET: CLIENT_SECRET, ALLOWED_EMAILS: EMAIL, ...over };
 }
 
-export async function challengeOf(verifier: string): Promise<string> {
-  return b64urlEncode(await sha256(new TextEncoder().encode(verifier)));
+export function withLegacy(over: Partial<Env> = {}): Env {
+  return testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: LEGACY_CLIENT_SECRET, ...over });
 }
 
 // ---------- fake Google ----------
 
+/** base64url of the UTF-8 bytes (`btoa` alone refuses anything beyond Latin-1). */
+function b64url(text: string): string {
+  let binary = "";
+  for (const byte of new TextEncoder().encode(text)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 export function makeIdToken(claims: Record<string, unknown>): string {
-  const part = (v: unknown) => b64urlEncode(new TextEncoder().encode(JSON.stringify(v)));
+  const part = (v: unknown) => b64url(JSON.stringify(v));
   return `${part({ alg: "RS256", kid: "test", typ: "JWT" })}.${part(claims)}.c2lnbmF0dXJl`;
 }
 
+/** What the user did at google.com/device, and what Google then answers to the poll. */
 export interface Consent {
-  /** The nonce of the authorization request this code is "issued" for; null = the ID token has no nonce claim. */
-  nonce: string | null;
   email?: string;
   emailVerified?: boolean;
   scope?: string;
@@ -56,7 +56,7 @@ export interface Consent {
 }
 
 export interface GoogleCall {
-  kind: "token" | "revoke";
+  kind: "device_code" | "token" | "revoke";
   url: string;
   method: string;
   contentType: string | null;
@@ -64,31 +64,45 @@ export interface GoogleCall {
   hasTimeout: boolean;
 }
 
-/** Google's token and revoke endpoints with the wire shapes of SPEC §16.4. It answers only what a test set up:
- *  a consented code, a known refresh token, or a scripted answer. Anything else is recorded in `unexpected`,
+type DeviceState = "pending" | "slow_down" | "approved" | "denied" | "expired" | "used";
+
+/** Google's device-code, token and revoke endpoints with the wire shapes of SPEC §16.4. It answers only what a test set
+ *  up: a started device code, a known refresh token, or a scripted answer. Anything else is recorded in `unexpected`,
  *  which fails the test in the harness's afterEach. */
 export class FakeGoogle {
   readonly calls: GoogleCall[] = [];
   readonly unexpected: string[] = [];
-  /** Every refresh token this fake issued or was told about — none may show up outside a /token body. */
+  /** Every refresh token this fake issued or was told about — none may show up outside a /device/poll body. */
   readonly refreshTokens = new Set<string>();
   readonly accessTokens = new Set<string>();
   readonly idTokens = new Set<string>();
-  readonly codes = new Map<string, Consent & { used: boolean }>();
-  private readonly live = new Map<string, { revoked: boolean; idToken?: string }>();
+  /** device code → the login it stands for. Neither a device code nor a user code may show up outside a /device/start body. */
+  readonly devices = new Map<string, { userCode: string; state: DeviceState; consent: Consent }>();
+  private readonly live = new Map<string, { clientId: string; revoked: boolean; idToken?: string }>();
   private readonly script: Array<() => Response> = [];
   private counter = 0;
 
-  /** The user approved the consent screen: `code` is what Google sends to /callback. */
-  consent(code: string, consent: Consent): void {
-    this.codes.set(code, { ...consent, used: false });
+  private device(userCode: string): { userCode: string; state: DeviceState; consent: Consent } {
+    const found = [...this.devices.values()].find((d) => d.userCode === userCode);
+    if (found === undefined) throw new Error(`fake Google: no login with user code ${userCode}`);
+    return found;
   }
 
-  /** A live refresh token without a login; `idToken` is what Google adds to refresh answers for it. */
-  addRefreshToken(idToken?: string): string {
+  /** The user entered `userCode` at google.com/device and approved. */
+  approve(userCode: string, consent: Consent = {}): void {
+    Object.assign(this.device(userCode), { state: "approved", consent });
+  }
+
+  /** The user entered the code and refused; or the code ran out; or the device polls too fast. */
+  set(userCode: string, state: "denied" | "expired" | "slow_down" | "pending"): void {
+    this.device(userCode).state = state;
+  }
+
+  /** A live refresh token without a login, issued to `clientId`; `idToken` is what Google adds to refresh answers for it. */
+  addRefreshToken(idToken?: string, clientId = CLIENT_ID): string {
     const token = `1//fake-refresh-token-${++this.counter}`;
     this.refreshTokens.add(token);
-    this.live.set(token, idToken === undefined ? { revoked: false } : { revoked: false, idToken });
+    this.live.set(token, idToken === undefined ? { clientId, revoked: false } : { clientId, revoked: false, idToken });
     if (idToken !== undefined) this.idTokens.add(idToken);
     return token;
   }
@@ -98,8 +112,8 @@ export class FakeGoogle {
     for (const entry of this.live.values()) entry.revoked = true;
   }
 
-  /** The next call to the token endpoint gets this answer, whatever it asks. */
-  nextTokenAnswer(status: number, body: unknown): void {
+  /** The next call to Google (device-code or token endpoint) gets this answer, whatever it asks. */
+  nextAnswer(status: number, body: unknown): void {
     this.script.push(
       () =>
         new Response(typeof body === "string" ? body : JSON.stringify(body), {
@@ -109,8 +123,8 @@ export class FakeGoogle {
     );
   }
 
-  /** The next call to the token endpoint fails like a network error or a timeout. */
-  nextTokenThrows(error: Error): void {
+  /** The next call to Google fails like a network error or a timeout. */
+  nextThrows(error: Error): void {
     this.script.push(() => {
       throw error;
     });
@@ -126,7 +140,7 @@ export class FakeGoogle {
 
   readonly fetch: Deps["fetch"] = async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    const kind = url === GOOGLE.tokenUrl ? "token" : url === GOOGLE.revokeUrl ? "revoke" : null;
+    const kind = url === GOOGLE.deviceCodeUrl ? "device_code" : url === GOOGLE.tokenUrl ? "token" : url === GOOGLE.revokeUrl ? "revoke" : null;
     if (kind === null) return this.fail(`request to ${url}`);
     const body = init?.body;
     if (typeof body !== "string") return this.fail(`${kind} request without a text body`);
@@ -142,20 +156,39 @@ export class FakeGoogle {
     if (call.method !== "POST" || call.contentType !== "application/x-www-form-urlencoded") {
       return this.fail(`${kind} request is not a form POST`);
     }
-    return kind === "token" ? this.token(call.form) : this.revoke(call.form);
-  };
-
-  private token(form: Record<string, string>): Response {
+    if (kind === "revoke") return this.revoke(call.form);
     const scripted = this.script.shift();
     if (scripted !== undefined) return scripted();
-    if (form.client_id !== CLIENT_ID || form.client_secret !== CLIENT_SECRET) {
+    return kind === "device_code" ? this.deviceCode(call.form) : this.token(call.form);
+  };
+
+  private deviceCode(form: Record<string, string>): Response {
+    if (form.client_id !== CLIENT_ID) return answer(401, { error: "invalid_client", error_description: "Invalid client type." });
+    if (form.scope !== SCOPES) return this.fail(`device-code request for the scope ${form.scope}`);
+    const n = ++this.counter;
+    const deviceCode = `AH-1Ng-fake_device.code/${n}`;
+    const userCode = `FAKE-${String(n).padStart(4, "0")}`;
+    this.devices.set(deviceCode, { userCode, state: "pending", consent: {} });
+    return answer(200, { device_code: deviceCode, user_code: userCode, expires_in: 1800, interval: 5, verification_url: VERIFICATION_URL });
+  }
+
+  private token(form: Record<string, string>): Response {
+    const secrets: Record<string, string> = { [CLIENT_ID]: CLIENT_SECRET, [LEGACY_CLIENT_ID]: LEGACY_CLIENT_SECRET };
+    if (form.client_id === undefined || secrets[form.client_id] !== form.client_secret) {
       return answer(401, { error: "invalid_client", error_description: "Unauthorized" });
     }
-    if (form.grant_type === "authorization_code") {
-      const consent = this.codes.get(form.code ?? "");
-      if (consent === undefined) return this.fail(`code exchange for an unknown code`);
-      if (consent.used) return answer(400, { error: "invalid_grant", error_description: "Bad Request" });
-      consent.used = true;
+    if (form.grant_type === DEVICE_GRANT) {
+      // The statuses are Google's (428 and 403), not RFC 8628's 400.
+      if (form.client_id !== CLIENT_ID) return answer(401, { error: "invalid_client", error_description: "Invalid client type." });
+      const device = this.devices.get(form.device_code ?? "");
+      if (device === undefined) return this.fail("poll for an unknown device code");
+      if (device.state === "pending") return answer(428, { error: "authorization_pending", error_description: "Precondition Required" });
+      if (device.state === "slow_down") return answer(403, { error: "slow_down", error_description: "Forbidden" });
+      if (device.state === "denied") return answer(403, { error: "access_denied", error_description: "Forbidden" });
+      if (device.state === "expired") return answer(400, { error: "expired_token", error_description: "Expired token" });
+      if (device.state === "used") return answer(400, { error: "invalid_grant", error_description: "Malformed auth code." });
+      device.state = "used";
+      const { consent } = device;
       const n = ++this.counter;
       const refreshToken = `1//fake-refresh-token-${n}`;
       const accessToken = `ya29.fake-access-token-${n}`;
@@ -167,14 +200,13 @@ export class FakeGoogle {
           sub: "1234567890",
           email: consent.email ?? EMAIL,
           email_verified: consent.emailVerified ?? true,
-          ...(consent.nonce === null ? {} : { nonce: consent.nonce }),
           iat: 1794400000,
           exp: 1794403600,
         });
       this.refreshTokens.add(refreshToken);
       this.accessTokens.add(accessToken);
       this.idTokens.add(idToken);
-      this.live.set(refreshToken, { revoked: false });
+      this.live.set(refreshToken, { clientId: CLIENT_ID, revoked: false });
       const body: Record<string, unknown> = {
         access_token: accessToken,
         expires_in: 3599,
@@ -190,6 +222,8 @@ export class FakeGoogle {
     if (form.grant_type === "refresh_token") {
       const entry = this.live.get(form.refresh_token ?? "");
       if (entry === undefined) return this.fail("refresh with an unknown refresh token");
+      // What Google really answers to a refresh token presented by another client of the project is unverified.
+      if (entry.clientId !== form.client_id) return this.fail("refresh with the credentials of another client");
       if (entry.revoked) return answer(400, { error: "invalid_grant", error_description: "Token has been expired or revoked." });
       const accessToken = `ya29.fake-access-token-${++this.counter}`;
       this.accessTokens.add(accessToken);
@@ -244,36 +278,30 @@ export interface CallInit {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
-  /** The origin the request arrives at; default ORIGIN. */
-  origin?: string;
 }
+
+export const ROUTES = ["/", "/privacy", "/device/start", "/device/poll", "/refresh"];
 
 export class Harness {
   env: Env = testEnv();
-  clock = { ms: T0_MS };
   google = new FakeGoogle();
-  deps: Deps = { fetch: this.google.fetch, now: () => this.clock.ms, google: GOOGLE };
+  deps: Deps = { fetch: this.google.fetch, google: GOOGLE };
   readonly logs: string[] = [];
   readonly strayConsole: string[] = [];
   readonly recorded: Recorded[] = [];
-  /** Further strings that must never leave the Worker (other SEAL_KEY spellings, client secrets of a test's own env). */
-  readonly secrets = new Set<string>();
 
   reset(): void {
     this.env = testEnv();
-    this.clock = { ms: T0_MS };
     this.google = new FakeGoogle();
-    this.deps = { fetch: this.google.fetch, now: () => this.clock.ms, google: GOOGLE };
+    this.deps = { fetch: this.google.fetch, google: GOOGLE };
     this.logs.length = 0;
     this.strayConsole.length = 0;
     this.recorded.length = 0;
-    this.secrets.clear();
   }
 
   /** One request through handle() with the harness's env and deps. */
   async call(path: string, init: CallInit = {}): Promise<Response> {
-    const { origin = ORIGIN, ...requestInit } = init;
-    const response = await handle(new Request(origin + path, requestInit), this.env, this.deps);
+    const response = await handle(new Request(ORIGIN + path, init), this.env, this.deps);
     await this.record(path, response);
     return response;
   }
@@ -298,40 +326,42 @@ export class Harness {
     expect(this.strayConsole, "console output other than console.log").toEqual([]);
     expect(this.logs.length, "at most one log line per request").toBeLessThanOrEqual(this.recorded.length);
 
-    const routes = ["/", "/privacy", "/login", "/callback", "/token", "/refresh", "other"];
     for (const line of this.logs) {
       const entry = JSON.parse(line) as Record<string, unknown>;
       expect(Object.keys(entry).filter((k) => !["route", "status", "error"].includes(k)), `log line ${line}`).toEqual([]);
-      expect(routes, `log line ${line}`).toContain(entry.route);
+      expect([...ROUTES, "other"], `log line ${line}`).toContain(entry.route);
       expect(typeof entry.status, `log line ${line}`).toBe("number");
       if (entry.error !== undefined) expect(entry.error, `log line ${line}`).toMatch(/^[a-z_]{1,40}$/);
     }
 
-    const neverAnywhere = [CLIENT_SECRET, ...this.secrets, ...sealKeySpellings(SEAL_KEY)];
-    if (this.env.GOOGLE_CLIENT_SECRET) neverAnywhere.push(this.env.GOOGLE_CLIENT_SECRET);
-    if (this.env.SEAL_KEY) neverAnywhere.push(this.env.SEAL_KEY);
-    const neverLogged = [...this.google.refreshTokens, ...this.google.accessTokens, ...this.google.idTokens, ...this.google.codes.keys()];
+    const neverAnywhere = [CLIENT_SECRET, LEGACY_CLIENT_SECRET];
+    for (const secret of [this.env.GOOGLE_CLIENT_SECRET, this.env.GOOGLE_LEGACY_CLIENT_SECRET]) if (secret) neverAnywhere.push(secret);
+    const deviceCodes = [...this.google.devices.keys()];
+    const userCodes = [...this.google.devices.values()].map((d) => d.userCode);
+    const neverLogged = [...this.google.refreshTokens, ...this.google.accessTokens, ...this.google.idTokens, ...deviceCodes, ...userCodes];
     for (const line of this.logs) {
       for (const secret of [...neverAnywhere, ...neverLogged]) expect(line.includes(secret), `a secret in log line ${line}`).toBe(false);
     }
     for (const r of this.recorded) {
-      const where = `${r.status} answer of ${r.path.split("?")[0]}`;
+      const where = `${r.status} answer of ${r.path}`;
       for (const secret of neverAnywhere) {
         expect(r.headers.includes(secret) || r.body.includes(secret), `a Worker secret in the ${where}`).toBe(false);
       }
-      for (const token of this.google.refreshTokens) {
-        expect(r.headers.includes(token), `a refresh token in a header of the ${where}`).toBe(false);
-        if (!r.path.startsWith("/token")) expect(r.body.includes(token), `a refresh token in the ${where}`).toBe(false);
+      // A refresh token leaves the Worker only in a /device/poll body; a device or user code only in a /device/start body.
+      for (const [tokens, path, what] of [
+        [[...this.google.refreshTokens], "/device/poll", "a refresh token"],
+        [[...deviceCodes, ...userCodes], "/device/start", "a device or user code"],
+      ] as const) {
+        for (const token of tokens) {
+          expect(r.headers.includes(token), `${what} in a header of the ${where}`).toBe(false);
+          if (r.path !== path) expect(r.body.includes(token), `${what} in the ${where}`).toBe(false);
+        }
       }
       expect(r.headers.toLowerCase(), `CORS header on the ${where}`).not.toContain("access-control-");
       expect(r.headers.toLowerCase(), `cookie on the ${where}`).not.toContain("set-cookie");
+      expect(r.headers, `no-store on the ${where}`).toContain("cache-control: no-store");
     }
   }
-}
-
-function sealKeySpellings(base64: string): string[] {
-  const unpadded = base64.replace(/=+$/, "");
-  return [unpadded, unpadded.replace(/\+/g, "-").replace(/\//g, "_")];
 }
 
 /** Call once at the top of a test file: a fresh harness state per test, the console spy, and the hygiene check after each test. */
@@ -355,78 +385,37 @@ export function useHarness(): Harness {
   return h;
 }
 
-// ---------- the browser's and the device's part of a login ----------
+// ---------- the device's part of a login ----------
 
-export function loginPath(opts: { challenge?: string; paste?: boolean; port?: number | string; state?: string } = {}): string {
-  const q = new URLSearchParams({ challenge: opts.challenge ?? CHALLENGE });
-  if (!opts.paste) {
-    q.set("port", String(opts.port ?? PORT));
-    q.set("state", opts.state ?? DEVICE_STATE);
-  }
-  return `/login?${q}`;
+export interface Started {
+  device_code: string;
+  user_code: string;
+  verification_url: string;
+  expires_in: number;
+  interval: number;
 }
 
-export function unescapeHtml(s: string): string {
-  return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
-}
-
-export function links(html: string): string[] {
-  return [...html.matchAll(/<a\b[^>]*\bhref="([^"]*)"/g)].map((m) => unescapeHtml(m[1]!));
-}
-
-/** GET /login and read the confirmation page the way a browser user would: the one link is what Google receives. */
-export async function startLogin(h: Harness, opts: Parameters<typeof loginPath>[0] = {}): Promise<{ page: string; link: URL; state: string; nonce: string }> {
-  const res = await h.get(loginPath(opts));
+/** POST /device/start: what the device shows (user code) and polls with (device code). */
+export async function startLogin(h: Harness): Promise<Started> {
+  const res = await h.post("/device/start", {});
   expect(res.status).toBe(200);
-  const page = await res.text();
-  const found = links(page);
-  expect(found).toHaveLength(1);
-  const link = new URL(found[0]!);
-  return { page, link, state: link.searchParams.get("state") ?? "", nonce: link.searchParams.get("nonce") ?? "" };
+  return (await res.json()) as Started;
 }
 
-let codeCounter = 0;
-export function newGoogleCode(): string {
-  return `4/0AfakeGoogleCode-${++codeCounter}_x`;
+export function poll(h: Harness, deviceCode: string): Promise<Response> {
+  return h.post("/device/poll", { device_code: deviceCode });
 }
 
-export function grantFromLocation(response: Response): string {
-  const location = new URL(response.headers.get("location") ?? "");
-  return location.searchParams.get("code") ?? "";
-}
-
-/** The one link of the confirmation page that /callback answers to Google's redirect — never a redirect, never a grant. */
-export async function finishLink(response: Response): Promise<string> {
-  expect(response.status, "Google's redirect is answered with the confirmation page").toBe(200);
-  expect(response.headers.get("location"), "no redirect before the user confirmed").toBeNull();
-  const page = await response.text();
-  expect(page, "no paste code before the user confirmed").not.toContain("gclone-code1_");
-  const found = links(page);
-  expect(found).toHaveLength(1);
-  expect(found[0]).toMatch(/^\/callback\?confirmed=[A-Za-z0-9_-]+$/);
-  return found[0]!;
-}
-
-/** The browser's whole visit to /callback after Google: the confirmation page, then its link. Returns the last answer
- *  (loopback mode: the 302 to the device; paste mode: the page with the code). */
-export async function callbackAndConfirm(h: Harness, query: string, init: CallInit = {}): Promise<Response> {
-  return h.call(await finishLink(await h.call(`/callback?${query}`, init)), init);
-}
-
-/** /login → consent at the fake Google (the code is issued for the nonce on the Continue link) → /callback → the
- *  confirmation page → its link → the grant. */
-export async function obtainGrant(h: Harness, opts: { verifier?: string; consent?: Partial<Consent> } = {}): Promise<string> {
-  const { state, nonce } = await startLogin(h, { challenge: await challengeOf(opts.verifier ?? VERIFIER) });
-  const code = newGoogleCode();
-  h.google.consent(code, { nonce, ...opts.consent });
-  const res = await callbackAndConfirm(h, String(new URLSearchParams({ code, state })));
-  expect(res.status).toBe(302);
-  return grantFromLocation(res);
+/** A login whose user approved at Google with `consent`; the answer to the device's next poll. */
+export async function login(h: Harness, consent: Consent = {}): Promise<Response> {
+  const started = await startLogin(h);
+  h.google.approve(started.user_code, consent);
+  return poll(h, started.device_code);
 }
 
 /** A whole login; returns what the device would store. */
 export async function obtainRefreshToken(h: Harness): Promise<string> {
-  const res = await h.post("/token", { code: await obtainGrant(h), verifier: VERIFIER });
+  const res = await login(h);
   expect(res.status).toBe(200);
   return ((await res.json()) as { refresh_token: string }).refresh_token;
 }
@@ -445,30 +434,38 @@ export async function errorOf(res: Response): Promise<{ status: number; error: s
 export interface ContractCase {
   name: string;
   given: string;
-  request: { method: string; path: string; headers?: Record<string, string>; query?: Record<string, string>; json?: unknown; body?: string };
-  response: { status: number; headers?: Record<string, string>; json?: Record<string, unknown>; location?: string; body_contains?: string[] };
+  request: { method: string; path: string; headers?: Record<string, string>; json?: unknown; body?: string };
+  response: { status: number; headers?: Record<string, string>; json?: Record<string, unknown> };
 }
 
 export interface Contract {
   version: number;
-  vector: { verifier: string; challenge: string; state: string; port: number; check_code: string; email: string };
   cases: ContractCase[];
 }
 
-/** The closed list of SPEC §16.5. */
+/** The closed list of SPEC §16.5: the state a case starts from. `<device_code>` is a started login in that state;
+ *  `<refresh_token>` a refresh token of the device client (`legacy_token`, `legacy_unconfigured`, `legacy_half_set`:
+ *  of the legacy client). */
 export const GIVEN = [
   "none",
-  "consent_ok",
-  "consent_denied",
-  "grant",
-  "grant_expired",
-  "grant_other_account",
-  "grant_no_drive_scope",
-  "grant_wide_scope",
-  "grant_expiring",
+  "pending",
+  "slow_down",
+  "denied",
+  "expired",
+  "used",
+  "approved",
+  "approved_expiring",
+  "approved_other_account",
+  "approved_no_drive_scope",
+  "approved_wide_scope",
+  "approved_no_id_token",
   "refresh_token",
   "refresh_revoked",
   "refresh_wide_scope",
+  "legacy_token",
+  "legacy_unconfigured",
+  "legacy_half_set",
+  "legacy_half_set_device_token",
   "client_broken",
   "google_down",
   "rate_limited",
@@ -476,36 +473,52 @@ export const GIVEN = [
 ] as const;
 
 export const REQUIRED_CASES = [
-  "login_loopback",
-  "login_paste",
-  "login_bad_challenge",
-  "loopback_grant",
-  "loopback_denied",
-  "paste_code",
-  "token_ok",
-  "token_expiring",
-  "token_wrong_verifier",
-  "token_expired_grant",
-  "token_email_not_allowed",
-  "token_scope_missing",
-  "token_scope_not_allowed",
-  "token_client_invalid",
-  "token_upstream",
-  "token_rate_limited",
-  "token_unconfigured",
-  "token_wrong_content_type",
-  "token_too_large",
-  "token_not_json",
-  "token_missing_field",
-  "token_get",
+  "start_ok",
+  "start_client_invalid",
+  "start_upstream",
+  "start_rate_limited",
+  "start_unconfigured",
+  "start_wrong_content_type",
+  "start_get",
+  "poll_pending",
+  "poll_slow_down",
+  "poll_denied",
+  "poll_expired",
+  "poll_used",
+  "poll_ok",
+  "poll_expiring",
+  "poll_email_not_allowed",
+  "poll_scope_missing",
+  "poll_scope_not_allowed",
+  "poll_grant_unusable",
+  "poll_client_invalid",
+  "poll_upstream",
+  "poll_rate_limited",
+  "poll_unconfigured",
+  "poll_wrong_content_type",
+  "poll_too_large",
+  "poll_not_json",
+  "poll_missing_field",
+  "poll_malformed_code",
+  "poll_get",
   "refresh_ok",
+  "refresh_legacy_ok",
+  "refresh_legacy_unconfigured",
+  "refresh_legacy_half_set",
+  "refresh_half_set_device_ok",
+  "refresh_bad_client",
   "refresh_invalid_grant",
   "refresh_malformed_token",
   "refresh_scope_not_allowed",
   "refresh_client_invalid",
   "refresh_upstream",
   "refresh_rate_limited",
+  "refresh_unconfigured",
+  "refresh_get",
   "not_found",
+  "login_gone",
+  "callback_gone",
+  "token_gone",
 ];
 
 function onlyKeys(what: string, value: object, allowed: string[]): void {
@@ -514,80 +527,64 @@ function onlyKeys(what: string, value: object, allowed: string[]): void {
 }
 
 /** Reproduces one fixture case with the real handle(). Throws on an unknown `given` keyword, matcher or placeholder. */
-export async function runContractCase(h: Harness, contract: Contract, c: ContractCase): Promise<void> {
+export async function runContractCase(h: Harness, c: ContractCase): Promise<void> {
   onlyKeys(`case ${c.name}`, c, ["name", "given", "request", "response"]);
-  onlyKeys(`case ${c.name} request`, c.request, ["method", "path", "headers", "query", "json", "body"]);
-  onlyKeys(`case ${c.name} response`, c.response, ["status", "headers", "json", "location", "body_contains"]);
+  onlyKeys(`case ${c.name} request`, c.request, ["method", "path", "headers", "json", "body"]);
+  onlyKeys(`case ${c.name} response`, c.response, ["status", "headers", "json"]);
   if (!(GIVEN as readonly string[]).includes(c.given)) throw new Error(`case ${c.name}: unknown given "${c.given}"`);
   if (c.request.json !== undefined && c.request.body !== undefined) throw new Error(`case ${c.name}: both json and body`);
-  const { vector } = contract;
 
   // Placeholders the harness has to produce from its own implementation — before the `given` state can get in the way.
   const requestText = JSON.stringify(c.request);
-  const values: Record<string, string> = {
-    "<verifier>": vector.verifier,
-    "<challenge>": vector.challenge,
-    "<state>": vector.state,
-    "<port>": String(vector.port),
-    "<other_verifier>": OTHER_VERIFIER,
-  };
-  if (requestText.includes("<grant>")) {
-    const consents: Record<string, Partial<Consent>> = {
-      grant_other_account: { email: "stranger@example.com" },
-      grant_no_drive_scope: { scope: "openid https://www.googleapis.com/auth/userinfo.email" },
-      grant_wide_scope: { scope: WIDE_SCOPE },
-      grant_expiring: { refreshTokenExpiresIn: 604799 },
+  const values: Record<string, string> = {};
+  if (requestText.includes("<device_code>")) {
+    const started = await startLogin(h);
+    values["<device_code>"] = started.device_code;
+    const consents: Record<string, Consent> = {
+      approved: {},
+      used: {},
+      approved_expiring: { refreshTokenExpiresIn: 604799 },
+      approved_other_account: { email: "stranger@example.com" },
+      approved_no_drive_scope: { scope: "openid https://www.googleapis.com/auth/userinfo.email" },
+      approved_wide_scope: { scope: WIDE_SCOPE },
+      approved_no_id_token: { omit: ["id_token"] },
     };
-    const consent = consents[c.given] ?? {};
-    values["<grant>"] = await obtainGrant(h, { verifier: vector.verifier, consent });
-    if (c.given === "grant_expired") h.clock.ms += GRANT_TTL_S * 1000;
+    const consent = consents[c.given];
+    if (consent !== undefined) h.google.approve(started.user_code, consent);
+    if (c.given === "slow_down" || c.given === "denied" || c.given === "expired") h.google.set(started.user_code, c.given);
+    if (c.given === "used") expect((await poll(h, started.device_code)).status).toBe(200);
   }
   if (requestText.includes("<refresh_token>")) {
-    values["<refresh_token>"] = await obtainRefreshToken(h);
+    // Exactly one of the two legacy secrets: the state between two `wrangler secret put` / `delete` commands.
+    const halfSet = () => testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID });
+    if (c.given === "legacy_token" || c.given === "legacy_unconfigured" || c.given === "legacy_half_set") {
+      values["<refresh_token>"] = h.google.addRefreshToken(undefined, LEGACY_CLIENT_ID);
+      if (c.given === "legacy_token") h.env = withLegacy();
+      if (c.given === "legacy_half_set") h.env = halfSet();
+    } else {
+      if (c.given === "legacy_half_set_device_token") h.env = halfSet();
+      values["<refresh_token>"] = await obtainRefreshToken(h);
+    }
     if (c.given === "refresh_revoked") h.google.revokeAll();
     if (c.given === "refresh_wide_scope") {
       // The grant behind this refresh token covers more than gclone's scopes: Google says so on every refresh.
       h.google.accessTokens.add("ya29.wide-access-token");
-      h.google.nextTokenAnswer(200, { access_token: "ya29.wide-access-token", expires_in: 3599, scope: WIDE_SCOPE, token_type: "Bearer" });
+      h.google.nextAnswer(200, { access_token: "ya29.wide-access-token", expires_in: 3599, scope: WIDE_SCOPE, token_type: "Bearer" });
     }
   }
   const unknownPlaceholder = requestText.match(/<[a-z_]+>/g)?.find((p) => !(p in values));
   if (unknownPlaceholder !== undefined) throw new Error(`case ${c.name}: unknown placeholder ${unknownPlaceholder}`);
   const fill = (text: string) => text.replace(/<[a-z_]+>/g, (p) => values[p] ?? p);
 
-  if (c.given === "client_broken") h.google.nextTokenAnswer(401, { error: "invalid_client", error_description: "The OAuth client was not found." });
-  if (c.given === "google_down") h.google.nextTokenAnswer(503, "<html><title>503 Service Unavailable</title></html>");
+  if (c.given === "client_broken") h.google.nextAnswer(401, { error: "invalid_client", error_description: "The OAuth client was not found." });
+  if (c.given === "google_down") h.google.nextAnswer(503, "<html><title>503 Service Unavailable</title></html>");
   if (c.given === "rate_limited") h.env.RATE_LIMIT = new FakeRateLimiter(false);
-  if (c.given === "unconfigured") h.env = { GOOGLE_CLIENT_ID: "", GOOGLE_CLIENT_SECRET: "", SEAL_KEY: "" };
+  if (c.given === "unconfigured") h.env = { GOOGLE_CLIENT_ID: "", GOOGLE_CLIENT_SECRET: "" };
 
-  const query = c.request.query === undefined ? "" : `?${new URLSearchParams(Object.entries(c.request.query).map(([k, v]) => [k, fill(v)]))}`;
   const init: CallInit = { method: c.request.method, headers: c.request.headers ?? {} };
   if (c.request.json !== undefined) init.body = fill(JSON.stringify(c.request.json));
   if (c.request.body !== undefined) init.body = fill(c.request.body);
-  let res = await h.call(c.request.path + query, init);
-
-  if (c.given === "consent_ok" || c.given === "consent_denied") {
-    // The request was the device's /login URL; the expected response is where the browser ends up after the user
-    // followed the confirmation page's link, Google sent them back and — when Google granted access — they followed
-    // the link of the second confirmation page.
-    expect(res.status, "confirmation page").toBe(200);
-    const found = links(await res.text());
-    expect(found).toHaveLength(1);
-    const link = new URL(found[0]!);
-    const back = new URLSearchParams({ state: link.searchParams.get("state") ?? "" });
-    if (c.given === "consent_ok") {
-      const code = newGoogleCode();
-      h.google.consent(code, { nonce: link.searchParams.get("nonce") });
-      back.set("code", code);
-    } else {
-      back.set("error", "access_denied");
-    }
-    res = await h.get(`/callback?${back}`);
-    if (c.given === "consent_ok") {
-      expect(await res.clone().text(), "the post-consent confirmation page shows the check code").toContain(vector.check_code);
-      res = await h.get(await finishLink(res));
-    }
-  }
+  const res = await h.call(c.request.path, init);
 
   const want = c.response;
   expect(res.status, "status").toBe(want.status);
@@ -597,15 +594,9 @@ export async function runContractCase(h: Harness, contract: Contract, c: Contrac
     expect(got, `header ${name}`).not.toBeNull();
     if (value !== "<string>") expect(got, `header ${name}`).toBe(value);
   }
-  if (want.location === undefined) {
-    expect(res.headers.get("location"), "no Location header").toBeNull();
-  } else {
-    expect(res.headers.get("location") ?? "", "Location header").toMatch(new RegExp(`^(?:${want.location})$`));
-  }
-  const text = await res.text();
-  for (const part of want.body_contains ?? []) expect(text, "body").toContain(part);
+  expect(res.headers.get("location"), "no Location header").toBeNull();
   if (want.json !== undefined) {
-    const got = JSON.parse(text) as Record<string, unknown>;
+    const got = (await res.json()) as Record<string, unknown>;
     expect(Object.keys(got).sort(), "exact key set").toEqual(Object.keys(want.json).sort());
     for (const [key, expected] of Object.entries(want.json)) {
       if (expected === "<string>") expect(typeof got[key], `json.${key}`).toBe("string");

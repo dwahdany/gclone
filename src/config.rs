@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::auth::AuthEndpoints;
+use crate::auth::{AuthClient, AuthEndpoints};
 use crate::backend::Handle;
 use crate::crypto::{Keyring, MasterKey};
 use crate::error::ConfigError;
@@ -133,6 +133,11 @@ pub struct Secrets {
     /// §2.4 expiring-grant check.
     #[serde(default)]
     pub refresh_expires_at_ms: Option<u64>,
+    /// Which OAuth client of the Worker issued `refresh_token` (sent with every `/refresh`).
+    /// `"device"` for every login since 0.2.0; a file without the field holds a login from
+    /// before, made through the legacy client, and is written back without it.
+    #[serde(default, skip_serializing_if = "AuthClient::is_legacy")]
+    pub client: AuthClient,
     /// `[]` = signed in but not unlocked yet; then the cached master key.
     #[serde(default)]
     pub keys: Vec<KeyEntry>,
@@ -150,6 +155,7 @@ impl Secrets {
             email: None,
             consent_ms: None,
             refresh_expires_at_ms: None,
+            client: AuthClient::Legacy,
             keys: Vec::new(),
             min_epoch: 0,
         }
@@ -460,7 +466,7 @@ mod tests {
         let s: Secrets = parse_json(
             "secrets.json",
             br#"{ "version": 1, "auth_url": "https://gclone-auth.example.workers.dev", "refresh_token": "1//x", "email": "me@example.com",
-                 "consent_ms": 1794400000000, "refresh_expires_at_ms": null,
+                 "consent_ms": 1794400000000, "refresh_expires_at_ms": null, "client": "device",
                  "keys": [ { "epoch": 1, "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } ], "min_epoch": 1 }"#,
         )
         .unwrap();
@@ -471,6 +477,29 @@ mod tests {
         );
         let keys = s.keyring([1; 16]).unwrap();
         assert_eq!((keys.current_epoch(), keys.min_epoch()), (1, 1));
+        assert_eq!(s.client, AuthClient::Device);
+    }
+
+    /// `secrets.json` as gclone wrote it before 0.2.0 has no `client`: that login belongs to
+    /// the Worker's legacy client, and the file is written back without the field.
+    #[test]
+    fn secrets_without_a_client_field_are_a_legacy_login() {
+        let old = br#"{ "version": 1, "auth_url": "https://auth.example", "refresh_token": "1//x", "email": "me@example.com",
+                        "consent_ms": 1794400000000, "refresh_expires_at_ms": null, "keys": [], "min_epoch": 0 }"#;
+        let mut s: Secrets = parse_json("secrets.json", old).unwrap();
+        assert!(s.has_login());
+        assert_eq!(s.client, AuthClient::Legacy);
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(!text.contains("client"), "{text}");
+
+        s.client = AuthClient::Device;
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["client"], "device");
+        let back: Secrets = serde_json::from_value(json).unwrap();
+        assert_eq!(back.client, AuthClient::Device);
+        // a value this build does not know is not guessed at
+        let unknown = br#"{ "version": 1, "refresh_token": "1//x", "client": "tv" }"#;
+        assert!(parse_json::<Secrets>("secrets.json", unknown).is_err());
     }
 
     #[test]
@@ -484,7 +513,7 @@ mod tests {
         assert_eq!(mode(&p.state_root), 0o700);
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(p.secrets_file()).unwrap()).unwrap();
-        for absent in ["auth_url", "refresh_token", "email", "consent_ms"] {
+        for absent in ["auth_url", "refresh_token", "email", "consent_ms", "client"] {
             assert!(json.get(absent).is_none(), "{absent} must be absent");
         }
         let back = store.load().unwrap().unwrap();

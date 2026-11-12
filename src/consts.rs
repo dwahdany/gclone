@@ -188,12 +188,14 @@ pub const LEDGER_WINDOW_MS: u64 = DAY_MS;
 // §2.2 — device-side auth and keyfile constants
 // ---------------------------------------------------------------------------------------------
 
-/// `/login → /callback`: time the user may spend on Google's consent screen (Worker side).
-pub const STATE_TTL: Duration = Duration::from_secs(600);
-/// `/callback → /token`: lifetime of a grant.
-pub const GRANT_TTL: Duration = Duration::from_secs(120);
-/// The device waits this long for the loopback request (= `STATE_TTL`).
-pub const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
+/// Longest a sign-in is waited for: the lifetime Google gives a device code (30 min), and the
+/// cap on whatever lifetime the Worker's answer names.
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(1800);
+/// `slow_down` from `/device/poll`: the poll interval grows by this much (RFC 8628 §3.5).
+pub const AUTH_POLL_SLOW_DOWN: Duration = Duration::from_secs(5);
+/// The poll interval when the answer of `/device/start` names none (RFC 8628 §3.5: "clients
+/// MUST use 5 as the default").
+pub const AUTH_POLL_INTERVAL_DEFAULT: Duration = Duration::from_secs(5);
 /// Refresh the access token when less than this is left.
 pub const ACCESS_TOKEN_SKEW: Duration = Duration::from_secs(60);
 pub const ACCESS_TOKEN_SKEW_MS: u64 = 60_000;
@@ -201,11 +203,13 @@ pub const ACCESS_TOKEN_SKEW_MS: u64 = 60_000;
 pub const IDLE_WARN_DAYS: u64 = 150;
 /// Largest request body the Worker reads.
 pub const AUTH_BODY_MAX: usize = 8 * 1024;
-/// After `429 rate_limited` the device waits `Retry-After`, capped at this, and retries once (§2.4).
+/// After `429 rate_limited` the device waits `Retry-After`, capped at this, and retries once
+/// (§2.4). Also the longest poll interval the device accepts from `/device/start`, and the
+/// longest pause between two polls that failed (the back-off of RFC 8628 §3.5).
 pub const AUTH_RETRY_AFTER_MAX: Duration = Duration::from_secs(60);
-/// `/refresh` is tried this often on 5xx / network errors (§2.4).
+/// `/refresh` and `/device/start` are tried this often on 5xx / network errors (§2.4).
 pub const AUTH_REFRESH_ATTEMPTS: u32 = 5;
-/// Attempts at pasting a sign-in code / typing the passphrase (§2.4, §2.6).
+/// Attempts at typing the passphrase (§2.6).
 pub const PROMPT_ATTEMPTS: u32 = 3;
 
 /// Unicode scalar values, for a typed passphrase.
@@ -258,7 +262,6 @@ mod tests {
 
     #[test]
     fn duration_and_integer_forms_agree() {
-        assert_eq!(AUTH_TIMEOUT, STATE_TTL);
         for (d, ms) in [
             (INDEX_TRASH_DELAY, INDEX_TRASH_DELAY_MS),
             (GC_GRACE, GC_GRACE_MS),

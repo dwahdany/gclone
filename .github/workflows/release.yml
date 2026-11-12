@@ -42,10 +42,7 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-          # macOS: the runner is Apple silicon; the Intel build is a cross build.
           - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
             os: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -308,6 +308,13 @@ pub(crate) fn describe(e: &anyhow::Error) -> String {
                          app, then run `gclone login`.",
                         &crate::util::format_local_minute(end)[..10]
                     ),
+                    // A login of the legacy client is refused by the Worker itself once its
+                    // legacy secrets are gone — Google was not even asked (§2.3).
+                    _ if hints.legacy_login => "This device's login was made with the browser \
+                                                sign-in of gclone before 0.2.0, and the auth \
+                                                Worker no longer serves it (or Google ended \
+                                                it). Run `gclone login`."
+                        .into(),
                     _ => "Google no longer accepts this device's login (revoked, signed out \
                           everywhere, or unused for 6 months). Run `gclone login`."
                         .into(),
@@ -325,8 +332,9 @@ pub(crate) fn describe(e: &anyhow::Error) -> String {
                     "The auth Worker cannot authenticate to Google ({message}): its secrets are \
                      missing or wrong, or the OAuth client was deleted (Google removes clients \
                      idle for 6 months; restorable for 30 days). Fix it per worker/README.md — \
-                     restore the client, or create a new Web application client in the same \
-                     Cloud project and `wrangler secret put` its ID and secret — then retry."
+                     restore the client, or create a new \"TVs and Limited Input devices\" \
+                     client in the same Cloud project and `wrangler secret put` its ID and \
+                     secret — then retry."
                 );
             }
             AuthError::Denied(reason) => return incomplete(&format!("access denied: {reason}")),
@@ -335,13 +343,10 @@ pub(crate) fn describe(e: &anyhow::Error) -> String {
             }
             AuthError::LoginFailed(reason) => return incomplete(reason),
             AuthError::Timeout => {
-                return format!(
-                    "{} Without a browser on this machine: `gclone login --no-browser`.",
-                    incomplete("no answer from the browser in time")
+                return incomplete(
+                    "the code was not entered at Google before it expired; a code is good \
+                     for 30 minutes",
                 );
-            }
-            AuthError::StateMismatch => {
-                return incomplete("the answer does not belong to this sign-in");
             }
             AuthError::BadAuthUrl(detail) if detail.contains("(given: ") => {
                 return format!("The auth Worker URL must be https://… — {detail}.");

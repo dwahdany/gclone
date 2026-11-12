@@ -3,8 +3,9 @@
 //! Every test spawns the built debug binary. A "device" is one pair of config and state
 //! directories (`GCLONE_CONFIG_DIR` / `GCLONE_STATE_DIR`): the login and the cached key live
 //! under the state root. Vaults are directories (`--vault-dir`), except in `drive_mode`, which
-//! drives the binary against `FakeDrive` — there every `login` passes `--no-browser` and gets
-//! its code through the child's stdin, so the test behaves the same on a desktop and under SSH.
+//! drives the binary against `FakeDrive` — there every `login` passes `--no-browser` (no test
+//! may open a browser) and the test plays the user: it reads the code the binary prints and
+//! enters it at the fake "Google" (`FakeDrive::approve`).
 
 #[path = "support/fake_drive.rs"]
 mod fake_drive;
@@ -2431,32 +2432,43 @@ fn gclones_own_directories_under_the_sync_root_are_not_synced() {
     assert!(listing.contains("secrets.json"), "{listing}");
 }
 
-#[test]
-fn ctrl_c_exits_130() {
+/// Ctrl-C while `login` polls for the code to be entered: exit 130, and nothing is left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_exits_130() {
+    let fake = FakeDrive::start().await;
     let lab = Lab::new();
     let d = lab.device("a");
-    // A headless login waits for a pasted code; nothing is contacted before that.
+    let auth_url = format!("{}/auth", fake.base());
     let mut child = d
-        .command(&["login", "http://127.0.0.1:9/auth", "--no-browser"])
-        .stdin(Stdio::piped())
+        .command(&["login", &auth_url, "--no-browser"])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn gclone");
-    let _keep_stdin_open = child.stdin.take();
-    let mut lines = std::io::BufReader::new(child.stderr.take().expect("stderr")).lines();
-    let waiting = lines
-        .by_ref()
-        .map(|l| l.expect("stderr"))
-        .any(|l| l.contains("paste the code"));
-    assert!(waiting, "the login asks for the code");
-    // SAFETY: signals the child this test spawned and still owns.
-    assert_eq!(
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
-    let status = child.wait().expect("wait");
+    let stderr = child.stderr.take().expect("stderr");
+    let (status, polls) = tokio::task::spawn_blocking(move || {
+        let mut lines = std::io::BufReader::new(stderr).lines();
+        let waiting = lines
+            .by_ref()
+            .map(|l| l.expect("stderr"))
+            .any(|l| l.contains("waiting…"));
+        assert!(waiting, "the login shows the code and waits");
+        // Nobody enters the code; the login is polling by now.
+        std::thread::sleep(Duration::from_millis(200));
+        // SAFETY: signals the child this test spawned and still owns.
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+            0
+        );
+        (child.wait().expect("wait"), lines.count())
+    })
+    .await
+    .expect("join");
     assert_eq!(status.code(), Some(130));
+    assert_eq!(polls, 0, "nothing more was printed");
+    assert!(fake.hits(Route::AuthPoll) > 0);
+    assert!(fake.issued_refresh_tokens().is_empty());
     assert!(!d.secrets_file().exists());
 }
 
@@ -2477,17 +2489,17 @@ async fn run_async(d: &Device, args: &[&str]) -> Out {
     .expect("join")
 }
 
-/// Runs a `login` that may ask for a sign-in code: reads the printed URL, plays the user in a
-/// browser (`FakeDrive::browse`) and writes the code to the child's stdin.
+/// Runs a `login` that may ask for a sign-in: reads the code the binary prints and plays the
+/// user, who enters it at the fake "Google" and approves (`FakeDrive::approve`) as the account
+/// of `set_login_email`.
 async fn drive_login(fake: &FakeDrive, d: &Device, args: &[&str]) -> Out {
     let mut child = d
         .command(args)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn gclone");
-    let mut stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("stdout");
     let stderr = child.stderr.take().expect("stderr");
     let stdout = std::thread::spawn(move || std::io::read_to_string(stdout).expect("stdout"));
@@ -2502,28 +2514,22 @@ async fn drive_login(fake: &FakeDrive, d: &Device, args: &[&str]) -> Out {
         }
         all
     });
+    let mut signed_in = false;
     loop {
         match rx.try_recv() {
-            Ok(line) if line.contains("/login?challenge=") => {
-                let url = line.trim();
-                assert!(
-                    !url.contains("port="),
-                    "--no-browser prints the paste-mode URL: {url}"
-                );
-                let code = fake.browse(url).await;
-                let mut pipe = stdin.take().expect("one sign-in per run");
-                // Stray whitespace, as a terminal paste has it.
-                pipe.write_all(format!("  {code} \n").as_bytes())
-                    .expect("write the code");
+            Ok(line) => {
+                if let Some(code) = line.strip_prefix("and enter the code  ") {
+                    assert!(!signed_in, "one sign-in per run");
+                    signed_in = true;
+                    fake.approve(code);
+                }
             }
-            Ok(_) => {}
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    drop(stdin);
     let status = tokio::task::spawn_blocking(move || child.wait().expect("wait"))
         .await
         .expect("join");
@@ -2583,7 +2589,7 @@ async fn drive_mode() {
         .await
         .code(4)
         .stderr_has("gclone login <AUTH_URL>");
-    assert_eq!(fake.hits(Route::AuthLogin) + fake.hits(Route::AuthToken), 0);
+    assert_eq!(fake.hits(Route::AuthStart) + fake.hits(Route::AuthPoll), 0);
     assert!(!a.secrets_file().exists());
 
     // --- first device: sign in, create the vault
@@ -2604,12 +2610,14 @@ async fn drive_mode() {
     .ok()
     .stdout_has("Signed in as me@example.com.")
     .stdout_has("Vault created. This device: \"mbp\".")
-    .stderr_has("Open this URL in a browser on any device:")
-    .stderr_has("The page must show the check code ");
+    .stderr_has("To sign in, open  https://www.google.com/device")
+    .stderr_has("(enter only a code shown in this terminal; waiting…)");
+    let user_code = fake.last_user_code().expect("a login was started");
     assert!(
         out.stderr
-            .contains(&fake.last_check_code().expect("check code")),
-        "the terminal shows the code of the confirmation page"
+            .contains(&format!("and enter the code  {user_code}\n")),
+        "the terminal shows the code Google expects:\n{}",
+        out.stderr
     );
     assert!(!a.token_file().exists(), "login never writes token.json");
 
@@ -2646,6 +2654,7 @@ async fn drive_mode() {
     let secrets = a.json(&a.secrets_file());
     assert_eq!(secrets["auth_url"], auth_url.as_str());
     assert_eq!(secrets["email"], "me@example.com");
+    assert_eq!(secrets["client"], "device");
     assert!(secrets["consent_ms"].is_u64());
     assert!(secrets["refresh_expires_at_ms"].is_null());
     assert!(secrets.get("client_id").is_none() && secrets.get("client_secret").is_none());
@@ -2725,8 +2734,9 @@ async fn drive_mode() {
     drive_login(&fake, &a, &["login", "--no-browser"])
         .await
         .code(4)
-        .stderr_has("This Google login cannot see the vault this device is attached to")
-        .stderr_has("gclone logout --forget");
+        .stderr_has("The Google login just made (signed in as me@example.com) cannot see the vault this device is attached to")
+        .stderr_has("Nothing was changed on this device, and the new sign-in was not kept.")
+        .stderr_has("worker/README.md");
     assert!(
         std::fs::read(a.secrets_file()).unwrap() == secrets_before,
         "the previous refresh token stays on file"
@@ -2754,13 +2764,13 @@ async fn drive_mode() {
         .stdout_has("a.txt");
     // A login that still works is kept: no sign-in, nothing changes.
     let secrets_before = std::fs::read(a.secrets_file()).unwrap();
-    let logins = fake.hits(Route::AuthLogin);
+    let logins = fake.hits(Route::AuthStart);
     run_async(&a, &["login"])
         .await
         .ok()
         .stdout_has("Already signed in as me@example.com.")
         .stdout_has("Vault unchanged.");
-    assert_eq!(fake.hits(Route::AuthLogin), logins);
+    assert_eq!(fake.hits(Route::AuthStart), logins);
     assert!(std::fs::read(a.secrets_file()).unwrap() == secrets_before);
 
     // --- logout, then login without a URL: the same device again
@@ -3216,6 +3226,264 @@ async fn drive_mode_read_only_commands_survive_an_unreachable_auth_worker() {
         .stderr_has(&auth_url);
 }
 
+/// §17.18, the move from the browser sign-in of gclone before 0.2.0 (the Worker's legacy OAuth
+/// client) to the device sign-in: a `secrets.json` without `client` goes on working while the
+/// Worker has the legacy secrets; `gclone login` replaces that login, and only once the new one
+/// sees the vault — a new login that does not changes nothing on the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_mode_a_login_of_the_legacy_client_is_replaced_by_gclone_login() {
+    let fake = FakeDrive::start().await;
+    let lab = Lab::new();
+    let pass = lab.pass();
+    let auth_url = format!("{}/auth", fake.base());
+    let a = drive_device(&lab, &fake, "a");
+    drive_login(
+        &fake,
+        &a,
+        &[
+            "login",
+            &auth_url,
+            "--no-browser",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .ok()
+    .stdout_has("Vault created.");
+    let src = lab.path("src");
+    make_tree(&src);
+    run_async(&a, &["copy", &s(&src), ":docs"]).await.ok();
+    let identity = a.identity();
+    let last_refresh = || {
+        let seen = fake.requests(Route::AuthRefresh);
+        seen.last().expect("a refresh").json.clone().expect("JSON")
+    };
+    let forget_access_token = || {
+        let _ = std::fs::remove_file(a.token_file());
+    };
+
+    // The device as 0.1.0 left it: a refresh token of the legacy client, and no `client` field.
+    let legacy_token = fake.add_legacy_token();
+    let mut old = a.json(&a.secrets_file());
+    old.as_object_mut().unwrap().remove("client");
+    old["refresh_token"] = legacy_token.clone().into();
+    std::fs::write(a.secrets_file(), serde_json::to_vec(&old).unwrap()).unwrap();
+    let legacy_secrets = std::fs::read(a.secrets_file()).unwrap();
+    forget_access_token();
+
+    // --- the Worker has the legacy secrets: every command works as before, and the device
+    // names no client on /refresh
+    fake.set_legacy_client(true);
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    assert_eq!(
+        last_refresh(),
+        serde_json::json!({ "refresh_token": legacy_token })
+    );
+    run_async(&a, &["status"])
+        .await
+        .ok()
+        .stderr_has("browser sign-in of gclone before 0.2.0; run `gclone login` to renew it");
+
+    // --- `gclone login` signs in again although that login works — but a new login that
+    // cannot see the vault (unverified: whether Google shows the files of one OAuth client to
+    // another client of the same project) is not kept, and nothing on the device changes.
+    fake.fail_next(Route::Stat, 1, 403, "appNotAuthorizedToFile");
+    let out = drive_login(&fake, &a, &["login", "--no-browser"])
+        .await
+        .code(4)
+        .stderr_has("browser sign-in of gclone before 0.2.0")
+        .stderr_has("The Google login just made (signed in as me@example.com) cannot see the vault this device is attached to")
+        .stderr_has("this device keeps its previous login")
+        .stderr_has("GOOGLE_LEGACY_CLIENT_ID")
+        .stderr_has("\"Moving from the browser sign-in\" in worker/README.md");
+    assert!(!out.stdout.contains("Already signed in"), "{}", out.stdout);
+    assert!(
+        std::fs::read(a.secrets_file()).unwrap() == legacy_secrets,
+        "the previous login stays on file, byte for byte"
+    );
+    assert!(a.config_file().exists() && a.vault_state().join("state.db").exists());
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    assert_eq!(a.identity(), identity);
+
+    // --- only one of the two legacy secrets is on the Worker (its owner is between two
+    // `wrangler secret` commands): the device is told that, not to log in again
+    fake.set_legacy_client_half_set();
+    forget_access_token();
+    let out = run_async(&a, &["ls"])
+        .await
+        .code(4)
+        .stderr_has("Only one of GOOGLE_LEGACY_CLIENT_ID and GOOGLE_LEGACY_CLIENT_SECRET is set");
+    assert!(!out.stderr.contains("Run `gclone login`"), "{}", out.stderr);
+    assert!(std::fs::read(a.secrets_file()).unwrap() == legacy_secrets);
+
+    // --- the legacy secrets were deleted from the Worker: the old login is over, and the
+    // message names the cause — the Worker, not Google, ended it
+    fake.set_legacy_client(false);
+    forget_access_token();
+    let out = run_async(&a, &["ls"]).await.code(4).stderr_has(
+        "This device's login was made with the browser sign-in of gclone before 0.2.0, and \
+             the auth Worker no longer serves it (or Google ended it). Run `gclone login`.",
+    );
+    assert!(
+        !out.stderr.contains("Google no longer accepts"),
+        "{}",
+        out.stderr
+    );
+    assert!(std::fs::read(a.secrets_file()).unwrap() == legacy_secrets);
+
+    // --- `gclone login`: the device sign-in; the vault, the key and the device stay
+    let issued = fake.issued_refresh_tokens().len();
+    drive_login(&fake, &a, &["login", "--no-browser"])
+        .await
+        .ok()
+        .stdout_has("Signed in again as me@example.com. Vault unchanged.");
+    let new = a.json(&a.secrets_file());
+    assert_eq!(new["client"], "device");
+    assert_eq!(
+        new["refresh_token"],
+        fake.issued_refresh_tokens()[issued].as_str(),
+        "the token of this run's sign-in"
+    );
+    assert_eq!(new["keys"], old["keys"]);
+    assert!(!a.token_file().exists(), "no token cache after a login");
+    assert_eq!(a.identity(), identity);
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    assert_eq!(last_refresh()["client"], "device");
+    let status = run_async(&a, &["status"]).await.ok();
+    assert!(!status.stderr.contains("before 0.2.0"), "{}", status.stderr);
+    // From now on `gclone login` keeps the login, like any other that works.
+    let logins = fake.hits(Route::AuthStart);
+    run_async(&a, &["login"])
+        .await
+        .ok()
+        .stdout_has("Already signed in as me@example.com.");
+    assert_eq!(fake.hits(Route::AuthStart), logins);
+    // … and when that login ends, the message is the usual one: it is not a legacy login.
+    fake.revoke_refresh_token();
+    let _ = std::fs::remove_file(a.token_file());
+    let out = run_async(&a, &["ls"])
+        .await
+        .code(4)
+        .stderr_has("Google no longer accepts this device's login");
+    assert!(!out.stderr.contains("before 0.2.0"), "{}", out.stderr);
+}
+
+/// §17.18: a device that signed in with gclone before 0.2.0 and never got attached to a vault
+/// (`secrets.json` with a login of the legacy client and no key, no `config.json`). `gclone
+/// login` signs in again through the device client. If that login sees no vault, the device
+/// does not go on to create one — the vault made through the old client may only be invisible
+/// to the new one — and the old login, which cannot be issued again, stays on file. If it does
+/// see the vault, the device attaches as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_mode_a_legacy_login_without_a_vault_does_not_create_a_second_one() {
+    let lab = Lab::new();
+    let pass = lab.pass();
+    // What 0.1.0 left on a device whose `login` stopped before the vault part.
+    let signed_in_before_0_2_0 = |d: &Device, fake: &FakeDrive| {
+        gclone::util::create_dir_private(&d.state).unwrap();
+        let secrets = serde_json::json!({
+            "version": 1, "auth_url": format!("{}/auth", fake.base()),
+            "refresh_token": fake.add_legacy_token(), "email": "me@example.com",
+            "consent_ms": 1_700_000_000_000u64, "refresh_expires_at_ms": null,
+            "keys": [], "min_epoch": 0
+        });
+        gclone::util::write_atomic(&d.secrets_file(), secrets.to_string().as_bytes(), 0o600)
+            .unwrap();
+        std::fs::read(d.secrets_file()).unwrap()
+    };
+
+    // --- the new login sees no vault (a Drive without one stands in for "not visible")
+    let fake = FakeDrive::start().await;
+    fake.set_legacy_client(true);
+    let b = drive_device(&lab, &fake, "b");
+    let before = signed_in_before_0_2_0(&b, &fake);
+    let out = drive_login(
+        &fake,
+        &b,
+        &["login", "--no-browser", "--passphrase-file", &pass],
+    )
+    .await
+    .code(4)
+    .stderr_has("browser sign-in of gclone before 0.2.0")
+    .stderr_has("The Google login just made (signed in as me@example.com) sees no gclone vault")
+    .stderr_has("the previous login stays on file")
+    .stderr_has("`gclone login --new-vault`");
+    assert!(!out.stdout.contains("Vault created"), "{}", out.stdout);
+    assert!(
+        std::fs::read(b.secrets_file()).unwrap() == before,
+        "the legacy login stays on file, byte for byte"
+    );
+    assert!(!b.config_file().exists());
+    assert!(fake.object_ids().is_empty(), "nothing was created on Drive");
+    // Asked for by name, a vault is created — and only then is the old login given up.
+    drive_login(
+        &fake,
+        &b,
+        &[
+            "login",
+            "--no-browser",
+            "--new-vault",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .ok()
+    .stdout_has("Vault created.");
+    assert_eq!(b.json(&b.secrets_file())["client"], "device");
+
+    // --- the new login does see the vault: the device attaches, and the new login is kept
+    let fake = FakeDrive::start().await;
+    fake.set_legacy_client(true);
+    let auth_url = format!("{}/auth", fake.base());
+    let a = drive_device(&lab, &fake, "a");
+    drive_login(
+        &fake,
+        &a,
+        &[
+            "login",
+            &auth_url,
+            "--no-browser",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .ok()
+    .stdout_has("Vault created.");
+    let c = drive_device(&lab, &fake, "c");
+    signed_in_before_0_2_0(&c, &fake);
+    let issued = fake.issued_refresh_tokens().len();
+    drive_login(
+        &fake,
+        &c,
+        &["login", "--no-browser", "--passphrase-file", &pass],
+    )
+    .await
+    .ok()
+    .stdout_has("Signed in as me@example.com.");
+    let attached = c.json(&c.secrets_file());
+    assert_eq!(attached["client"], "device");
+    assert_eq!(
+        attached["refresh_token"],
+        fake.issued_refresh_tokens()[issued].as_str()
+    );
+    assert_eq!(
+        c.json(&c.config_file())["vault_id"],
+        a.json(&a.config_file())["vault_id"]
+    );
+}
+
 /// §2.6 A.4 / §17.9: on a device that is attached to a vault but holds no key (after `logout`),
 /// a sign-in with another allow-listed Google account is not kept — the next `gclone login`
 /// asks again instead of finding a login that "works". And where a login on file is kept
@@ -3265,8 +3533,9 @@ async fn drive_mode_wrong_account_after_logout_and_revoke_forget_order() {
     .await
     .code(4)
     .stdout_has("Signed in as second@example.com.")
-    .stderr_has("This Google login cannot see the vault this device is attached to")
-    .stderr_has("Sign in with the account that owns the vault.");
+    .stderr_has("The Google login just made (signed in as second@example.com) cannot see the vault this device is attached to")
+    .stderr_has("the new sign-in was not kept")
+    .stderr_has("run `gclone login` again and choose the right one");
     assert!(
         !out.stderr.contains("gclone logout` first"),
         "nothing was kept, so there is nothing to log out of:\n{}",
@@ -3280,7 +3549,7 @@ async fn drive_mode_wrong_account_after_logout_and_revoke_forget_order() {
 
     // `gclone login` again: a new interactive sign-in, this time with the right account.
     fake.set_login_email("me@example.com");
-    let logins = fake.hits(Route::AuthLogin);
+    let logins = fake.hits(Route::AuthStart);
     drive_login(
         &fake,
         &a,
@@ -3291,7 +3560,7 @@ async fn drive_mode_wrong_account_after_logout_and_revoke_forget_order() {
     .stdout_has("Signed in as me@example.com.")
     .stdout_has("Connected to vault \"gclone\" (5 files). This device: \"mbp\".");
     assert_eq!(
-        fake.hits(Route::AuthLogin),
+        fake.hits(Route::AuthStart),
         logins + 1,
         "the user was asked to sign in again"
     );
@@ -3306,7 +3575,7 @@ async fn drive_mode_wrong_account_after_logout_and_revoke_forget_order() {
     unlocked["keys"] = serde_json::json!([]);
     std::fs::write(a.secrets_file(), serde_json::to_vec(&unlocked).unwrap()).unwrap();
     fake.fail_next(Route::Media, 1, 404, "notFound");
-    let logins = fake.hits(Route::AuthLogin);
+    let logins = fake.hits(Route::AuthStart);
     run_async(&a, &["login", "--passphrase-file", &pass])
         .await
         .code(4)
@@ -3323,7 +3592,7 @@ async fn drive_mode_wrong_account_after_logout_and_revoke_forget_order() {
         .stdout_has("Already signed in as me@example.com.")
         .stderr_has("This Google login cannot see the vault this device is attached to")
         .stderr_has("run `gclone logout` first, then `gclone login`");
-    assert_eq!(fake.hits(Route::AuthLogin), logins, "nobody was asked");
+    assert_eq!(fake.hits(Route::AuthStart), logins, "nobody was asked");
     assert!(std::fs::read(a.secrets_file()).unwrap() == connected);
     run_async(&a, &["ls", ":docs"])
         .await

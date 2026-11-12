@@ -1,9 +1,12 @@
 // gclone's auth Worker. Several things in this file are security requirements (README.md, "Configuration");
 // scripts/check-config.mjs asserts them on every `npm test`:
-//   - no request URL with its query string reaches a log or a trace: invocation logs are off, query strings are
-//     redacted, traces are off, and nothing is exported (/callback?code=<Google's code> must not be stored anywhere)
+//   - nothing of a request beyond the Worker's own log line (route, status, error code) is stored: invocation logs
+//     are off, query strings are redacted, traces are off, and nothing is exported
 //   - there is no "vars" key: ALLOWED_EMAILS is a secret only
 //   - RATE_LIMIT is the only binding: 30 requests per 60 s and client address, and no storage of any kind
+//   - the check is an allowlist: a key that is not in this file as shipped is refused, whatever it is — no other
+//     binding, no "unsafe" (unsafe.bindings attaches any binding type), and no "env": an environment inherits no
+//     bindings, so `wrangler deploy --env <name>` would deploy a Worker without RATE_LIMIT
 //   - no versioned preview hosts: an old version of the Worker must not stay reachable under another name
 {
   "$schema": "./node_modules/wrangler/config-schema.json",

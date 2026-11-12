@@ -1,7 +1,7 @@
 //! `gclone login` (SPEC §2.4, §2.6, §9.10, §10) — owned by WP7.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -11,12 +11,10 @@ use super::{
     GlobalOpts, VAULT_NOT_VISIBLE, blocking, drive_backend, explained, kdf_params, lock_state,
     note, note_config, read_new_passphrase, read_passphrase, stored_device_name, ui_for, usage,
 };
-use crate::auth::{self, AuthEndpoints, InteractiveOpts, LoginGrant, TokenProvider};
+use crate::auth::{self, AuthClient, AuthEndpoints, InteractiveOpts, LoginGrant, TokenProvider};
 use crate::backend::{AnyBackend, Backend as _, DirBackend, ObjMeta, get_all};
 use crate::config::{BackendCfg, Config, Paths, SecretStore, Secrets, secret_store};
-use crate::consts::{
-    AUTH_TIMEOUT, KEYFILE_MAX, KEYFILE_TRY_MAX, PROMPT_ATTEMPTS, TRANSFERS_DEFAULT,
-};
+use crate::consts::{KEYFILE_MAX, KEYFILE_TRY_MAX, PROMPT_ATTEMPTS, TRANSFERS_DEFAULT};
 use crate::crypto::{Keyring, MasterKey, Passphrase};
 use crate::error::{AuthError, BackendError, ConfigError, CryptoError, FormatError, IndexError};
 use crate::format::{KeyfilePayload, open_keyfile, seal_keyfile};
@@ -30,7 +28,7 @@ use crate::util;
 pub struct LoginArgs {
     /// The auth Worker's URL (needed the first time only; env GCLONE_AUTH_URL also works).
     pub auth_url: Option<String>,
-    /// Print the sign-in URL instead of opening a browser, and read the code from the terminal.
+    /// Do not open a browser: only print the sign-in address and code (enter the code on any device).
     #[arg(long)]
     pub no_browser: bool,
     /// Name of this device in the vault (default: the host name).
@@ -66,8 +64,12 @@ struct Login {
     email: Option<String>,
     consent_ms: Option<u64>,
     refresh_expires_at_ms: Option<u64>,
+    /// The Worker's OAuth client the refresh token belongs to.
+    client: AuthClient,
     /// An interactive sign-in happened in this run (step A.3).
     fresh: bool,
+    /// That sign-in replaces a login of the legacy client (gclone before 0.2.0) that is on file.
+    replaces_legacy: bool,
 }
 
 /// Everything the vault part of the command needs.
@@ -100,6 +102,7 @@ impl Session {
             s.email = login.email.clone();
             s.consent_ms = login.consent_ms;
             s.refresh_expires_at_ms = login.refresh_expires_at_ms;
+            s.client = login.client;
         }
         if let Some(keys) = keys {
             s.set_keys(keys);
@@ -234,9 +237,14 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
     // vault was found with it (below). A sign-in with the wrong Google account must not become
     // the login on file — every later `gclone login` would find a login that works, never ask
     // again, and fail on the vault again.
+    // Not yet either where the sign-in replaces a login of the legacy client on a device that
+    // is not attached (signed in with gclone before 0.2.0, the vault part never finished): a
+    // vault made through that client may exist and be invisible to the new login (§17.18), so
+    // the old login — which cannot be issued again — is given up only once a vault was seen.
     let fresh = session.login.as_ref().filter(|l| l.fresh);
+    let unattached_legacy = fresh.is_some_and(|l| l.replaces_legacy) && session.config.is_none();
     if let Some(login) = fresh {
-        if session.config.is_none() {
+        if session.config.is_none() && !unattached_legacy {
             session.store.save(&session.secrets(None))?;
         }
         match &login.email {
@@ -274,11 +282,16 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
                 path.display()
             ),
         ),
-        (BackendCfg::Drive, Some(_)) => kept_login_hint(e, session.login.as_ref()),
+        (BackendCfg::Drive, Some(_)) => not_visible_hint(e, session.login.as_ref()),
         _ => e,
     })?;
+    // "No vault here" is what a login that cannot see the old client's files looks like: not
+    // the moment to create a second vault without being asked to (`--new-vault`).
+    if unattached_legacy && found.is_empty() && !session.args.new_vault {
+        return Err(no_vault_for_legacy_login(session.login.as_ref()));
+    }
     // The attached vault is visible to the login made in this run: now it is worth keeping.
-    if fresh.is_some() && session.config.is_some() {
+    if fresh.is_some() && (session.config.is_some() || unattached_legacy) {
         session.store.save(&session.secrets(None))?;
     }
     match choice {
@@ -351,32 +364,6 @@ fn created_date(v: &FoundVault) -> String {
 // A. Sign in (Drive backend)
 // ---------------------------------------------------------------------------------------------
 
-/// Feeds the headless flow from stdin — the terminal, or a pipe. Started only when that flow
-/// runs, and it stops reading as soon as a line is a sign-in code: nothing may sit in a read on
-/// the terminal while the passphrase prompt needs it.
-fn start_paste_reader(tx: tokio::sync::mpsc::Sender<String>) {
-    use std::io::{BufRead as _, IsTerminal as _, Write as _};
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let tty = stdin.is_terminal();
-        loop {
-            if tty {
-                eprint!("> ");
-                let _ = std::io::stderr().flush();
-            }
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(n) if n > 0 => {}
-                _ => return,
-            }
-            let done = auth::parse_pasted(&line).is_ok();
-            if tx.blocking_send(line).is_err() || done {
-                return;
-            }
-        }
-    });
-}
-
 async fn sign_in(
     ui: &Ui,
     paths: &Paths,
@@ -394,12 +381,16 @@ async fn sign_in(
     note(|h| h.auth_url = Some(auth_url.clone()));
     let ep = AuthEndpoints::new(&auth_url)?;
 
-    // A.2: the login on file still works
-    if let Some(s) = secrets.filter(|s| s.has_login())
+    // A.2: the login on file still works. Not for a login of the legacy client: `gclone login`
+    // is how a device moves to the device client, so that one is always replaced.
+    let on_file = secrets.filter(|s| s.has_login());
+    let replaces_legacy = on_file.is_some_and(|s| s.client.is_legacy());
+    if let Some(s) = on_file.filter(|_| !replaces_legacy)
         && let Some(token) = &s.refresh_token
         && s.endpoints().is_ok_and(|stored| stored.base == ep.base)
     {
-        let (backend, tokens) = drive_backend(ep.clone(), token, paths, TRANSFERS_DEFAULT, false)?;
+        let (backend, tokens) =
+            drive_backend(ep.clone(), token, s.client, paths, TRANSFERS_DEFAULT, false)?;
         match tokens.force_refresh().await {
             Ok(_) => {
                 match &s.email {
@@ -412,7 +403,9 @@ async fn sign_in(
                     email: s.email.clone(),
                     consent_ms: s.consent_ms,
                     refresh_expires_at_ms: s.refresh_expires_at_ms,
+                    client: s.client,
                     fresh: false,
+                    replaces_legacy: false,
                 };
                 return Ok((AnyBackend::Drive(backend), login));
             }
@@ -421,35 +414,23 @@ async fn sign_in(
     }
 
     // A.3
-    let headless = want_headless(
-        args.no_browser,
-        &|name| std::env::var(name).ok(),
-        cfg!(target_os = "linux"),
-    );
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let tx = Mutex::new(Some(tx));
-    let start_reader = move || {
-        if let Some(tx) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            start_paste_reader(tx);
-        }
-    };
-    if headless {
-        start_reader();
+    if replaces_legacy {
+        ui.info(
+            "This device's Google login was made with the browser sign-in of gclone before \
+             0.2.0. Signing in again replaces it; until that has worked, nothing on this \
+             device changes.",
+        );
     }
     let opts = InteractiveOpts {
-        no_browser: headless,
-        timeout: AUTH_TIMEOUT,
+        no_browser: want_headless(
+            args.no_browser,
+            &|name| std::env::var(name).ok(),
+            cfg!(target_os = "linux"),
+        ),
         // Needed to get through the sign-in at all: shown with -q and --json as well.
         print: Box::new(|line| eprintln!("{line}")),
-        open: Box::new(move |url| {
-            // Detached: some launchers stay alive as long as the browser does.
-            let opened = open::that_detached(url).is_ok();
-            if !opened {
-                start_reader();
-            }
-            opened
-        }),
-        paste: Some(rx),
+        // Detached: some launchers stay alive as long as the browser does.
+        open: Box::new(|url| drop(open::that_detached(url))),
     };
     let http = auth::http_client()?;
     let outcome = auth::login_interactive(&http, &ep, opts).await;
@@ -460,8 +441,14 @@ async fn sign_in(
     let now = util::now_ms();
     let refresh_expires_at_ms = expiring_login_decision(&grant, args.allow_expiring_login, now)?;
 
-    let (backend, tokens) =
-        drive_backend(ep, &grant.refresh_token, paths, TRANSFERS_DEFAULT, false)?;
+    let (backend, tokens) = drive_backend(
+        ep,
+        &grant.refresh_token,
+        AuthClient::Device,
+        paths,
+        TRANSFERS_DEFAULT,
+        false,
+    )?;
     prime(&tokens, &grant);
     let login = Login {
         auth_url,
@@ -469,7 +456,9 @@ async fn sign_in(
         email: Some(grant.email.clone()),
         consent_ms: Some(now),
         refresh_expires_at_ms,
+        client: AuthClient::Device,
         fresh: true,
+        replaces_legacy,
     };
     Ok((AnyBackend::Drive(backend), login))
 }
@@ -505,7 +494,7 @@ async fn relogin(s: &Session, config: &Config, secrets: Option<Secrets>) -> anyh
                 );
                 explained(e, text)
             }
-            (BackendCfg::Drive, _) => kept_login_hint(e.into(), s.login.as_ref()),
+            (BackendCfg::Drive, _) => not_visible_hint(e.into(), s.login.as_ref()),
             _ => e.into(),
         })?;
     let Some(login) = &s.login else {
@@ -539,29 +528,81 @@ async fn relogin(s: &Session, config: &Config, secrets: Option<Secrets>) -> anyh
     Ok(0)
 }
 
-/// `VaultNotVisible` while the login on file was kept (step A.2: it still works, so nobody was
-/// asked to sign in): "sign in with the account that owns the vault" then needs a `logout`
-/// first — `gclone login` alone would keep this login for ever.
-fn kept_login_hint(e: anyhow::Error, login: Option<&Login>) -> anyhow::Error {
+/// `VaultNotVisible` from `login` on a device that is attached to a vault, said so that the
+/// next step is clear (§2.8). Nothing was written before it, whichever case it is.
+///
+/// - The login on file was kept (step A.2: it still works, so nobody was asked to sign in):
+///   "sign in with the account that owns the vault" needs a `logout` first — `gclone login`
+///   alone would keep this login for ever.
+/// - A sign-in was just made and does not see the vault: another Google account — or the
+///   vault was created through the Worker's legacy OAuth client (gclone before 0.2.0) and
+///   Google does not show it to the device client. Whether Google does is unverified, so the
+///   message names both and what keeps the device working meanwhile.
+fn not_visible_hint(e: anyhow::Error, login: Option<&Login>) -> anyhow::Error {
     let not_visible = matches!(
         crate::error::find::<IndexError>(&e),
         Some(IndexError::VaultNotVisible)
     );
-    match login {
-        Some(login) if not_visible && !login.fresh => {
-            let who = match &login.email {
-                Some(email) => format!("is signed in as {email}"),
-                None => "is signed in".to_string(),
-            };
-            let text = format!(
-                "{VAULT_NOT_VISIBLE} This device {who}, and `gclone login` keeps a login that \
-                 still works: to sign in with another account run `gclone logout` first, then \
-                 `gclone login`."
-            );
-            explained(e, text)
-        }
-        _ => e,
-    }
+    let Some(login) = login.filter(|_| not_visible) else {
+        return e;
+    };
+    let who = match &login.email {
+        Some(email) => format!("signed in as {email}"),
+        None => "signed in".to_string(),
+    };
+    let text = if !login.fresh {
+        format!(
+            "{VAULT_NOT_VISIBLE} This device is {who}, and `gclone login` keeps a login that \
+             still works: to sign in with another account run `gclone logout` first, then \
+             `gclone login`."
+        )
+    } else {
+        let kept = if login.replaces_legacy {
+            "Nothing was changed: this device keeps its previous login, which goes on working \
+             as long as the auth Worker has its GOOGLE_LEGACY_CLIENT_ID and \
+             GOOGLE_LEGACY_CLIENT_SECRET secrets."
+        } else {
+            "Nothing was changed on this device, and the new sign-in was not kept."
+        };
+        format!(
+            "The Google login just made ({who}) cannot see the vault this device is attached \
+             to. {kept} If that was not the Google account that owns the vault: run `gclone \
+             login` again and choose the right one. If it was: Google does not show the \
+             vault's files to this login — they were created through another OAuth client \
+             (the browser sign-in of gclone before 0.2.0, or another Cloud project), or the \
+             app was removed and approved again. See \"Moving from the browser sign-in\" in \
+             worker/README.md for the ways out (keep the legacy secrets on the Worker, or move \
+             the vault); the last resort is to download the vault folder from \
+             drive.google.com, unzip it, and run `gclone logout --forget`, then `gclone login \
+             --vault-dir DIR`."
+        )
+    };
+    explained(e, text)
+}
+
+/// A device that holds a login of the legacy client (gclone before 0.2.0) and is attached to
+/// no vault signed in again, and the new login finds no vault at all. That is the ordinary
+/// first-device situation — and also exactly what it looks like when Google does not show a
+/// vault made through the old OAuth client to the new one (unverified, §17.18). Creating a
+/// vault here would make a second one beside the real one, so it takes `--new-vault`.
+/// Nothing was written: the previous login stays on file.
+fn no_vault_for_legacy_login(login: Option<&Login>) -> anyhow::Error {
+    let who = match login.and_then(|l| l.email.as_deref()) {
+        Some(email) => format!("signed in as {email}"),
+        None => "signed in".to_string(),
+    };
+    explained(
+        IndexError::VaultNotVisible,
+        format!(
+            "The Google login just made ({who}) sees no gclone vault. This device's previous \
+             login was made with the browser sign-in of gclone before 0.2.0, so a vault \
+             created back then may exist without being visible to the new login. Nothing was \
+             changed: the previous login stays on file. First run `gclone login` on a device \
+             that is attached to the vault and wait for \"Vault unchanged.\"; then run it here \
+             again (see \"Moving from the browser sign-in\" in worker/README.md). If there \
+             really is no vault yet, create one with `gclone login --new-vault`."
+        ),
+    )
 }
 
 fn device_name(args: &LoginArgs, stored: Option<String>) -> String {
@@ -1064,8 +1105,9 @@ pub fn expiring_login_decision(
     ))
 }
 
-/// §2.4: headless when `--no-browser`, `SSH_CONNECTION` / `SSH_TTY` set, or Linux without
-/// `DISPLAY` and `WAYLAND_DISPLAY`.
+/// §2.4: no browser is opened — the address and the code are only printed — with
+/// `--no-browser`, when `SSH_CONNECTION` / `SSH_TTY` is set, or on Linux without `DISPLAY` and
+/// `WAYLAND_DISPLAY`.
 pub fn want_headless(
     no_browser: bool,
     env: &dyn Fn(&str) -> Option<String>,

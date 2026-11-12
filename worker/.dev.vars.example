@@ -1,8 +1,10 @@
-# For `wrangler dev` only: copy to .dev.vars (git-ignored) and fill in. The deployed Worker gets the same four
-# names with `wrangler secret put` — never from a file, and never as "vars" in wrangler.jsonc.
+# For `wrangler dev` only: copy to .dev.vars (git-ignored) and fill in. The deployed Worker gets the same names
+# with `wrangler secret put` — never from a file, and never as "vars" in wrangler.jsonc.
+# The OAuth client of type "TVs and Limited Input devices":
 GOOGLE_CLIENT_ID="000000000000-placeholder.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET="placeholder-client-secret"
-# 32 random bytes in base64: openssl rand -base64 32
-SEAL_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 # comma-separated Google account addresses; empty = nobody may sign in
 ALLOWED_EMAILS="you@example.com"
+# Only while a device still holds a login from gclone < 0.2.0 (the "Web application" client); used when both are set:
+# GOOGLE_LEGACY_CLIENT_ID="000000000000-legacy.apps.googleusercontent.com"
+# GOOGLE_LEGACY_CLIENT_SECRET="legacy-client-secret"

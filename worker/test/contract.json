@@ -1,209 +1,262 @@
 {
-  "version": 1,
-  "vector": { "verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", "challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "state": "AAAAAAAAAAAAAAAAAAAAAA", "port": 8123, "check_code": "D2KC-JCJY", "email": "me@example.com" },
+  "version": 2,
   "cases": [
     {
-      "name": "login_loopback",
+      "name": "start_ok",
       "given": "none",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>","port":"<port>","state":"<state>"}},
-      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8"},"body_contains":["D2KC-JCJY"]}
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"device_code":"<string>","user_code":"<string>","verification_url":"<string>","expires_in":"<number>","interval":"<number>"}}
     },
     {
-      "name": "login_paste",
-      "given": "none",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>"}},
-      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8"},"body_contains":["D2KC-JCJY"]}
-    },
-    {
-      "name": "login_bad_challenge",
-      "given": "none",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c"}},
-      "response": {"status":400,"headers":{"content-type":"text/html; charset=utf-8"}}
-    },
-    {
-      "name": "login_bad_port",
-      "given": "none",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>","port":"80","state":"<state>"}},
-      "response": {"status":400,"headers":{"content-type":"text/html; charset=utf-8"}}
-    },
-    {
-      "name": "login_missing_state",
-      "given": "none",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>","port":"<port>"}},
-      "response": {"status":400,"headers":{"content-type":"text/html; charset=utf-8"}}
-    },
-    {
-      "name": "loopback_grant",
-      "given": "consent_ok",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>","port":"<port>","state":"<state>"}},
-      "response": {"status":302,"location":"^http://127\\.0\\.0\\.1:8123/\\?code=[A-Za-z0-9_-]+&state=AAAAAAAAAAAAAAAAAAAAAA$"}
-    },
-    {
-      "name": "loopback_denied",
-      "given": "consent_denied",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>","port":"<port>","state":"<state>"}},
-      "response": {"status":302,"location":"^http://127\\.0\\.0\\.1:8123/\\?error=access_denied&state=AAAAAAAAAAAAAAAAAAAAAA$"}
-    },
-    {
-      "name": "paste_code",
-      "given": "consent_ok",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>"}},
-      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8"},"body_contains":["gclone-code1_"]}
-    },
-    {
-      "name": "paste_denied",
-      "given": "consent_denied",
-      "request": {"method":"GET","path":"/login","query":{"challenge":"<challenge>"}},
-      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8"},"body_contains":["access_denied"]}
-    },
-    {
-      "name": "token_ok",
-      "given": "grant",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
-      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"refresh_token":"<string>","access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com"}}
-    },
-    {
-      "name": "token_expiring",
-      "given": "grant_expiring",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
-      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"refresh_token":"<string>","access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com","refresh_token_expires_in":604799}}
-    },
-    {
-      "name": "token_wrong_verifier",
-      "given": "grant",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<other_verifier>"}},
-      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
-    },
-    {
-      "name": "token_expired_grant",
-      "given": "grant_expired",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
-      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
-    },
-    {
-      "name": "token_email_not_allowed",
-      "given": "grant_other_account",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
-      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"email_not_allowed","message":"<string>"}}
-    },
-    {
-      "name": "token_scope_missing",
-      "given": "grant_no_drive_scope",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
-      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_missing","message":"<string>"}}
-    },
-    {
-      "name": "token_scope_not_allowed",
-      "given": "grant_wide_scope",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
-      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_not_allowed","message":"<string>"}}
-    },
-    {
-      "name": "token_client_invalid",
+      "name": "start_client_invalid",
       "given": "client_broken",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json"},"json":{}},
       "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"client_invalid","message":"<string>"}}
     },
     {
-      "name": "token_upstream",
+      "name": "start_upstream",
       "given": "google_down",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json"},"json":{}},
       "response": {"status":502,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"upstream_error","message":"<string>"}}
     },
     {
-      "name": "token_rate_limited",
+      "name": "start_rate_limited",
       "given": "rate_limited",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json"},"json":{}},
       "response": {"status":429,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","retry-after":"<string>"},"json":{"error":"rate_limited","message":"<string>"}}
     },
     {
-      "name": "token_unconfigured",
+      "name": "start_unconfigured",
       "given": "unconfigured",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"<grant>","verifier":"<verifier>"}},
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json"},"json":{}},
       "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"server_misconfigured","message":"<string>"}}
     },
     {
-      "name": "token_wrong_content_type",
+      "name": "start_wrong_content_type",
       "given": "none",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"text/plain"},"body":"{\"code\":\"x\",\"verifier\":\"<verifier>\"}"},
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"text/plain"},"body":"{}"},
       "response": {"status":415,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"unsupported_media_type","message":"<string>"}}
     },
     {
-      "name": "token_too_large",
+      "name": "start_not_json",
       "given": "none",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"body":"{\"code\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"verifier\":\"<verifier>\"}"},
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json"},"body":"start"},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
+    },
+    {
+      "name": "start_get",
+      "given": "none",
+      "request": {"method":"GET","path":"/device/start"},
+      "response": {"status":405,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","allow":"POST"},"json":{"error":"method_not_allowed","message":"<string>"}}
+    },
+    {
+      "name": "poll_pending",
+      "given": "pending",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"authorization_pending","message":"<string>"}}
+    },
+    {
+      "name": "poll_slow_down",
+      "given": "slow_down",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"slow_down","message":"<string>"}}
+    },
+    {
+      "name": "poll_denied",
+      "given": "denied",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"access_denied","message":"<string>"}}
+    },
+    {
+      "name": "poll_expired",
+      "given": "expired",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"expired_token","message":"<string>"}}
+    },
+    {
+      "name": "poll_used",
+      "given": "used",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
+    },
+    {
+      "name": "poll_ok",
+      "given": "approved",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"refresh_token":"<string>","access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com"}}
+    },
+    {
+      "name": "poll_expiring",
+      "given": "approved_expiring",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"refresh_token":"<string>","access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com","refresh_token_expires_in":604799}}
+    },
+    {
+      "name": "poll_email_not_allowed",
+      "given": "approved_other_account",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"email_not_allowed","message":"The Google account s***@example.com is not allowed to sign in here."}}
+    },
+    {
+      "name": "poll_scope_missing",
+      "given": "approved_no_drive_scope",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_missing","message":"<string>"}}
+    },
+    {
+      "name": "poll_scope_not_allowed",
+      "given": "approved_wide_scope",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_not_allowed","message":"<string>"}}
+    },
+    {
+      "name": "poll_grant_unusable",
+      "given": "approved_no_id_token",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"grant_unusable","message":"<string>"}}
+    },
+    {
+      "name": "poll_client_invalid",
+      "given": "client_broken",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"client_invalid","message":"<string>"}}
+    },
+    {
+      "name": "poll_upstream",
+      "given": "google_down",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":502,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"upstream_error","message":"<string>"}}
+    },
+    {
+      "name": "poll_rate_limited",
+      "given": "rate_limited",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":429,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","retry-after":"<string>"},"json":{"error":"rate_limited","message":"<string>"}}
+    },
+    {
+      "name": "poll_unconfigured",
+      "given": "unconfigured",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"<device_code>"}},
+      "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"server_misconfigured","message":"<string>"}}
+    },
+    {
+      "name": "poll_wrong_content_type",
+      "given": "none",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"text/plain"},"body":"{\"device_code\":\"AH-1Ng-well-formed-code\"}"},
+      "response": {"status":415,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"unsupported_media_type","message":"<string>"}}
+    },
+    {
+      "name": "poll_too_large",
+      "given": "none",
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"body":"{\"device_code\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}"},
       "response": {"status":413,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"payload_too_large","message":"<string>"}}
     },
     {
-      "name": "token_not_json",
+      "name": "poll_not_json",
       "given": "none",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"body":"code=x&verifier=y"},
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"body":"device_code=x"},
       "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
     },
     {
-      "name": "token_missing_field",
+      "name": "poll_missing_field",
       "given": "none",
-      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"verifier":"<verifier>"}},
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{}},
       "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
     },
     {
-      "name": "token_get",
+      "name": "poll_malformed_code",
       "given": "none",
-      "request": {"method":"GET","path":"/token"},
+      "request": {"method":"POST","path":"/device/poll","headers":{"content-type":"application/json"},"json":{"device_code":"not a device code"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
+    },
+    {
+      "name": "poll_get",
+      "given": "none",
+      "request": {"method":"GET","path":"/device/poll"},
       "response": {"status":405,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","allow":"POST"},"json":{"error":"method_not_allowed","message":"<string>"}}
     },
     {
       "name": "refresh_ok",
       "given": "refresh_token",
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>"}}
+    },
+    {
+      "name": "refresh_legacy_ok",
+      "given": "legacy_token",
       "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
       "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>"}}
     },
     {
+      "name": "refresh_legacy_unconfigured",
+      "given": "legacy_unconfigured",
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
+    },
+    {
+      "name": "refresh_legacy_half_set",
+      "given": "legacy_half_set",
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"server_misconfigured","message":"<string>"}}
+    },
+    {
+      "name": "refresh_half_set_device_ok",
+      "given": "legacy_half_set_device_token",
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>"}}
+    },
+    {
+      "name": "refresh_bad_client",
+      "given": "none",
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"1//0well-formed-refresh-token","client":"web"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
+    },
+    {
       "name": "refresh_invalid_grant",
       "given": "refresh_revoked",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
       "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
     },
     {
       "name": "refresh_malformed_token",
       "given": "none",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"not a refresh token"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"not a refresh token","client":"device"}},
       "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
     },
     {
       "name": "refresh_missing_field",
       "given": "none",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"client":"device"}},
       "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
     },
     {
       "name": "refresh_scope_not_allowed",
       "given": "refresh_wide_scope",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
       "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_not_allowed","message":"<string>"}}
     },
     {
       "name": "refresh_client_invalid",
       "given": "client_broken",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
       "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"client_invalid","message":"<string>"}}
     },
     {
       "name": "refresh_upstream",
       "given": "google_down",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
       "response": {"status":502,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"upstream_error","message":"<string>"}}
     },
     {
       "name": "refresh_rate_limited",
       "given": "rate_limited",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
       "response": {"status":429,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","retry-after":"<string>"},"json":{"error":"rate_limited","message":"<string>"}}
     },
     {
       "name": "refresh_unconfigured",
       "given": "unconfigured",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>","client":"device"}},
       "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"server_misconfigured","message":"<string>"}}
     },
     {
@@ -216,6 +269,24 @@
       "name": "not_found",
       "given": "none",
       "request": {"method":"GET","path":"/nothing-here"},
+      "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
+    },
+    {
+      "name": "login_gone",
+      "given": "none",
+      "request": {"method":"GET","path":"/login"},
+      "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
+    },
+    {
+      "name": "callback_gone",
+      "given": "none",
+      "request": {"method":"GET","path":"/callback"},
+      "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
+    },
+    {
+      "name": "token_gone",
+      "given": "none",
+      "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"x","verifier":"y"}},
       "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
     }
   ]

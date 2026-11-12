@@ -1,5 +1,6 @@
 //! `FakeDrive` (SPEC §9.6): one local HTTP server that plays Google Drive (§6.4.1 wire shapes),
-//! the auth Worker (§2.3, under `/auth`) and Google's revoke endpoint (`/revoke`).
+//! the auth Worker (§2.3, under `/auth`: its three JSON routes, with "Google" and the user who
+//! enters the code behind them) and Google's revoke endpoint (`/revoke`).
 //!
 //! Included with `#[path = "support/fake_drive.rs"] mod fake_drive;` by `tests/drive_http.rs`,
 //! `tests/auth.rs` and `tests/cli_e2e.rs`. The Drive side follows the documented wire shapes,
@@ -13,8 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use gclone::auth::{AuthEndpoints, TokenProvider};
+use gclone::auth::{AuthClient, AuthEndpoints, TokenProvider};
 use gclone::backend::drive::{DriveBackend, DriveConfig, DriveEndpoints, PacerConfig};
 use md5::Digest as _;
 use serde_json::{Value, json};
@@ -27,7 +27,8 @@ const GRANULE: u64 = 256 * 1024;
 /// Drive's documented limit for `uploadType=multipart`.
 const MULTIPART_LIMIT: usize = 5 * 1024 * 1024;
 const AUTH_BODY_MAX: usize = 8 * 1024;
-const GRANT_TTL: Duration = Duration::from_secs(120);
+/// What the fake Worker names as the user's destination; nothing in a test opens it.
+pub const VERIFICATION_URL: &str = "https://www.google.com/device";
 const SCOPE_DRIVE_FILE: &str = "https://www.googleapis.com/auth/drive.file";
 const DEFAULT_SCOPE: &str = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.file";
 /// Every scope a grant of the Worker's client may carry (§2.3); anything else is refused.
@@ -37,14 +38,14 @@ const ALLOWED_SCOPES: [&str; 4] = [
     "https://www.googleapis.com/auth/userinfo.email",
     SCOPE_DRIVE_FILE,
 ];
-const PASTE_PREFIX: &str = "gclone-code1_";
 const JSON_UTF8: &str = "application/json; charset=utf-8";
-const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
-    AuthLogin,
-    AuthToken,
+    /// `POST /auth/device/start`
+    AuthStart,
+    /// `POST /auth/device/poll`
+    AuthPoll,
     AuthRefresh,
     Revoke,
     GenerateIds,
@@ -64,7 +65,7 @@ impl Route {
     fn is_auth(self) -> bool {
         matches!(
             self,
-            Route::AuthLogin | Route::AuthToken | Route::AuthRefresh
+            Route::AuthStart | Route::AuthPoll | Route::AuthRefresh
         )
     }
 }
@@ -86,6 +87,8 @@ pub struct Seen {
     /// A small body as text (form posts and the like).
     pub text: Option<String>,
     pub body_len: usize,
+    /// When the request arrived.
+    pub at: Instant,
 }
 
 impl Seen {
@@ -158,36 +161,6 @@ impl Resp {
         Resp::auth_json(status, &json!({ "error": code, "message": message }))
     }
 
-    /// An HTML page of the auth Worker (§2.3): no script, every dynamic value escaped.
-    fn page(status: u16, title: &str, body_html: &str) -> Resp {
-        let html = format!(
-            "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>{}</title>\n</head>\n\
-             <body>\n<main>\n<h1>{}</h1>\n{body_html}\n</main>\n</body>\n</html>\n",
-            escape_html(title),
-            escape_html(title)
-        );
-        Resp {
-            status,
-            headers: Vec::new(),
-            content_type: Some("text/html; charset=utf-8"),
-            body: html.into_bytes(),
-        }
-        .header("Cache-Control", "no-store")
-        .header("Referrer-Policy", "no-referrer")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("X-Frame-Options", "DENY")
-        .header("Content-Security-Policy", CSP)
-    }
-
-    fn error_page(status: u16, message: &str) -> Resp {
-        let title = if status == 200 {
-            "Sign-in stopped"
-        } else {
-            "Sign-in failed"
-        };
-        Resp::page(status, title, &format!("<p>{}</p>", escape_html(message)))
-    }
-
     fn into_template(self) -> ResponseTemplate {
         let mut t = ResponseTemplate::new(self.status);
         for (name, value) in self.headers {
@@ -199,22 +172,6 @@ impl Resp {
             None => t.set_body_bytes(self.body),
         }
     }
-}
-
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn unescape_html(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
 }
 
 fn now_ms() -> u64 {
@@ -248,31 +205,6 @@ fn rfc3339(ms: u64) -> String {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn sha256(parts: &[&[u8]]) -> Vec<u8> {
-    let mut h = sha2::Sha256::new();
-    for p in parts {
-        h.update(p);
-    }
-    h.finalize().to_vec()
-}
-
-fn b64url(b: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-}
-
-/// §2.4: Crockford32 of the first 40 bits of SHA-256("gclone-auth/v1/check" ‖ challenge).
-fn check_code(challenge: &str) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let digest = sha256(&[b"gclone-auth/v1/check", challenge.as_bytes()]);
-    let bits = digest[..5]
-        .iter()
-        .fold(0u64, |acc, b| acc << 8 | u64::from(*b));
-    let symbols: String = (0..8)
-        .map(|i| ALPHABET[(bits >> (35 - 5 * i) & 31) as usize] as char)
-        .collect();
-    format!("{}-{}", &symbols[..4], &symbols[4..])
 }
 
 fn all_chars(s: &str, extra: &str) -> bool {
@@ -326,26 +258,52 @@ struct Fault {
     body: Result<String, String>,
 }
 
-struct PendingLogin {
-    challenge: String,
-    /// `None` = paste mode.
-    loopback: Option<(u16, String)>,
-    deny: bool,
+/// One login between `/device/start` and the poll that ends it. The two timing rules of the
+/// grant are "Google's", kept per login: a code runs out `lifetime` after it was issued, and
+/// a poll that comes less than `interval` after the previous one is answered `slow_down`.
+struct DeviceLogin {
+    user_code: String,
+    state: DeviceState,
+    started: Instant,
+    last_poll: Option<Instant>,
+    interval: Duration,
+    lifetime: Duration,
 }
 
-/// A consent that reached `/callback` and waits for the user's confirmation (§2.3).
-struct PendingConfirm {
-    login: PendingLogin,
-    /// `GRANT_TTL` runs from here: Google's redirect, not the confirmation.
-    since: Instant,
+enum DeviceState {
+    Pending,
+    /// The user entered the code at "Google" and approved, signed in as this account.
+    Approved(String),
+    Denied,
+    Expired,
+    /// A poll has redeemed it: Google's device code is single-use.
+    Used,
 }
 
-struct Grant {
-    challenge: String,
-    email: String,
-    issued: Instant,
-    expired: bool,
-    used: bool,
+/// The Worker's legacy pair of secrets (§2.3 "Configuration").
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum LegacyClient {
+    Absent,
+    /// Exactly one of the two secrets is set: the legacy client is unusable, nothing else is.
+    HalfSet,
+    Configured,
+}
+
+/// What an error answer shows of an address: the first character and the domain (§2.3).
+fn masked_email(email: &str) -> Option<String> {
+    let presentable =
+        (3..=254).contains(&email.len()) && email.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    let at = email
+        .rfind('@')
+        .filter(|at| *at >= 1 && *at + 1 < email.len())?;
+    presentable.then(|| format!("{}***{}", &email[..1], &email[at..]))
+}
+
+/// A refresh token "Google" issued.
+struct Issued {
+    valid: bool,
+    /// Issued to the Worker's legacy client (the browser sign-in before 0.2.0).
+    legacy: bool,
 }
 
 struct State {
@@ -375,22 +333,31 @@ struct State {
     session_requests: Vec<(u64, u64, u64)>,
     status_queries: u64,
     // --- auth
-    logins: HashMap<u64, PendingLogin>,
-    confirmations: HashMap<u64, PendingConfirm>,
-    grants: HashMap<String, Grant>,
-    /// Refresh token → still valid.
-    refresh_tokens: HashMap<String, bool>,
+    /// Device code → its login.
+    devices: HashMap<String, DeviceLogin>,
+    last_user_code: Option<String>,
+    /// `interval` and `expires_in` of `/device/start` answers, seconds.
+    poll_interval: f64,
+    code_lifetime: f64,
+    /// Polls of a pending login that are answered `slow_down` whatever their timing.
+    slow_down: u32,
+    /// `slow_down` answers given because a poll came too early (not the injected ones).
+    early_polls: u32,
+    /// What /device/start names as the page to open.
+    verification_url: String,
+    /// "Google's" token answer for an approved login carries no ID token.
+    no_id_token: bool,
+    /// The Worker's GOOGLE_LEGACY_CLIENT_* secrets.
+    legacy_client: LegacyClient,
+    refresh_tokens: HashMap<String, Issued>,
     issued_refresh_tokens: Vec<String>,
     access_tokens: HashSet<String>,
     revoked: Vec<String>,
     login_email: String,
     allowed_emails: Vec<String>,
     granted_scope: String,
-    deny_consent_once: bool,
-    tamper_state_once: bool,
     client_broken: bool,
     refresh_expires_in: Option<u64>,
-    last_check_code: Option<String>,
 }
 
 impl State {
@@ -419,27 +386,44 @@ impl State {
             seen: Vec::new(),
             session_requests: Vec::new(),
             status_queries: 0,
-            logins: HashMap::new(),
-            confirmations: HashMap::new(),
-            grants: HashMap::new(),
-            refresh_tokens: HashMap::from([("rt-ok".to_string(), true)]),
+            devices: HashMap::new(),
+            last_user_code: None,
+            poll_interval: 0.02,
+            code_lifetime: 1800.0,
+            slow_down: 0,
+            early_polls: 0,
+            verification_url: VERIFICATION_URL.to_string(),
+            no_id_token: false,
+            legacy_client: LegacyClient::Absent,
+            refresh_tokens: HashMap::from([(
+                "rt-ok".to_string(),
+                Issued {
+                    valid: true,
+                    legacy: false,
+                },
+            )]),
             issued_refresh_tokens: Vec::new(),
             access_tokens: HashSet::new(),
             revoked: Vec::new(),
             login_email: "me@example.com".to_string(),
             allowed_emails: vec!["me@example.com".to_string()],
             granted_scope: DEFAULT_SCOPE.to_string(),
-            deny_consent_once: false,
-            tamper_state_once: false,
             client_broken: false,
             refresh_expires_in: None,
-            last_check_code: None,
         }
     }
 
     fn next(&mut self) -> u64 {
         self.counter += 1;
         self.counter
+    }
+
+    /// The pending login `user_code` belongs to.
+    fn pending(&mut self, user_code: &str) -> &mut DeviceLogin {
+        self.devices
+            .values_mut()
+            .find(|d| d.user_code == user_code && matches!(d.state, DeviceState::Pending))
+            .unwrap_or_else(|| panic!("no pending login has the user code {user_code:?}"))
     }
 
     // -----------------------------------------------------------------------------------------
@@ -508,7 +492,7 @@ impl State {
             Route::Stat => self.stat(id, &query),
             Route::Patch => self.patch(req, id, &query),
             Route::Delete => self.delete(id),
-            Route::AuthLogin | Route::AuthToken | Route::AuthRefresh | Route::Revoke => {
+            Route::AuthStart | Route::AuthPoll | Route::AuthRefresh | Route::Revoke => {
                 unreachable!()
             }
         };
@@ -571,6 +555,7 @@ impl State {
             part_types,
             text,
             body_len: req.body.len(),
+            at: Instant::now(),
         });
     }
 
@@ -592,9 +577,6 @@ impl State {
                 content_type: Some("text/html; charset=UTF-8"),
                 body: raw.into_bytes(),
             },
-            Ok(reason) if route == Route::AuthLogin => {
-                Resp::error_page(status, &format!("injected: {reason}"))
-            }
             Ok(reason) if route.is_auth() => {
                 Resp::auth_error(status, &reason, "This failure was injected by the test.")
             }
@@ -1172,298 +1154,178 @@ impl State {
     // -----------------------------------------------------------------------------------------
 
     fn auth(&mut self, req: &Request, sub: &str) -> Resp {
-        let method = req.method.as_str();
-        let (route, wants, html) = match sub {
-            "" | "/" | "/privacy" | "/callback" | "/continue" => (None, "GET", true),
-            "/login" => (Some(Route::AuthLogin), "GET", true),
-            "/token" => (Some(Route::AuthToken), "POST", false),
-            "/refresh" => (Some(Route::AuthRefresh), "POST", false),
+        let route = match sub {
+            "/device/start" => Route::AuthStart,
+            "/device/poll" => Route::AuthPoll,
+            "/refresh" => Route::AuthRefresh,
             _ => return Resp::auth_error(404, "not_found", "There is nothing at this address."),
         };
-        if method != wants {
-            let message = format!("This address only answers {wants} requests.");
-            let resp = if html {
-                Resp::error_page(405, &message)
-            } else {
-                Resp::auth_error(405, "method_not_allowed", &message)
-            };
-            return resp.header("Allow", wants);
-        }
-        if let Some(route) = route {
-            self.note(route, req);
-            // Where the Worker's rate limiter and configuration check stand: before the body.
-            if let Some(injected) = self.take_fault(route, req) {
-                return injected;
-            }
-        }
-        match sub {
-            "/login" => self.auth_login(req),
-            "/continue" => self.auth_continue(req),
-            "/token" | "/refresh" => {
-                let body = match read_json_object(req) {
-                    Ok(body) => body,
-                    Err(resp) => return resp,
-                };
-                if sub == "/token" {
-                    self.auth_token(&body)
-                } else {
-                    self.auth_refresh(&body)
-                }
-            }
-            "/privacy" => Resp::page(
-                200,
-                "Privacy",
-                "<p>This service stores nothing.</p><p><a href=\"/auth/\">Home</a></p>",
-            ),
-            "/callback" => self.auth_callback(req),
-            _ => Resp::page(
-                200,
-                "gclone sign-in helper",
-                "<p><a href=\"/auth/privacy\">Privacy</a></p>\n<p class=\"status\">Status: ready</p>",
-            ),
-        }
-    }
-
-    fn auth_login(&mut self, req: &Request) -> Resp {
-        let q: HashMap<String, String> = req.url.query_pairs().into_owned().collect();
-        let malformed = || {
-            Resp::error_page(
-                400,
-                "This sign-in link is malformed. Run `gclone login` again.",
+        if req.method.as_str() != "POST" {
+            return Resp::auth_error(
+                405,
+                "method_not_allowed",
+                "This address only answers POST requests.",
             )
-        };
-        let challenge = q.get("challenge").cloned().unwrap_or_default();
-        if challenge.len() != 43 || !all_chars(&challenge, "_-") {
-            return malformed();
+            .header("Allow", "POST");
         }
-        let loopback = match q.get("port") {
-            None => None,
-            Some(port) => {
-                let digits = (4..=5).contains(&port.len())
-                    && port.bytes().all(|b| b.is_ascii_digit())
-                    && !port.starts_with('0');
-                let port = port
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|p| digits && (1024..=65535).contains(p));
-                let state = q.get("state").cloned().unwrap_or_default();
-                match port {
-                    Some(port) if (16..=64).contains(&state.len()) && all_chars(&state, "_-") => {
-                        Some((port as u16, state))
-                    }
-                    _ => return malformed(),
-                }
-            }
+        self.note(route, req);
+        // Where the Worker's rate limiter and configuration check stand: before the body.
+        if let Some(injected) = self.take_fault(route, req) {
+            return injected;
+        }
+        let body = match read_json_object(req) {
+            Ok(body) => body,
+            Err(resp) => return resp,
         };
-        let code = check_code(&challenge);
-        self.last_check_code = Some(code.clone());
-        let n = self.next();
-        let intro = if loopback.is_some() {
-            "gclone on this computer wants to sign in to Google Drive. Continue only if you just ran \
-             <code>gclone login</code> on this computer and its terminal shows the check code"
-        } else {
-            "A gclone device without a browser wants to sign in to Google Drive. Continue only if you started \
-             <code>gclone login</code> yourself and its terminal shows the check code"
-        };
-        let login = PendingLogin {
-            challenge,
-            loopback,
-            deny: std::mem::take(&mut self.deny_consent_once),
-        };
-        self.logins.insert(n, login);
-        // Never a redirect: the user must see the check code first. The link stands in for
-        // Google's consent screen.
-        let link = format!("{}/auth/continue?login={n}", self.base);
-        Resp::page(
-            200,
-            "Sign in to gclone",
-            &format!(
-                "<p>{intro} <strong>{code}</strong>.</p>\n<p class=\"check\">{code}</p>\n\
-                 <p class=\"warn\">If someone sent you this link, close this page.</p>\n\
-                 <a class=\"go\" href=\"{}\" rel=\"noreferrer\">Continue with Google</a>",
-                escape_html(&link)
-            ),
+        match route {
+            Route::AuthStart => self.auth_start(),
+            Route::AuthPoll => self.auth_poll(&body),
+            _ => self.auth_refresh(&body),
+        }
+    }
+
+    fn client_invalid() -> Resp {
+        Resp::auth_error(
+            500,
+            "client_invalid",
+            "Google does not accept this Worker's OAuth client (invalid_client).",
         )
     }
 
-    /// "Google" and the first visit to the Worker's `/callback` in one step: what the browser
-    /// is shown once the fake user has approved (or denied) the consent. An approval is answered
-    /// with the second confirmation page — never with a redirect or a grant (§2.3): the check
-    /// code again, and one link to `/callback?confirmed=…`.
-    fn auth_continue(&mut self, req: &Request) -> Resp {
-        let login = req
-            .url
-            .query_pairs()
-            .find(|(k, _)| k == "login")
-            .and_then(|(_, v)| v.parse::<u64>().ok())
-            .and_then(|n| self.logins.remove(&n));
-        let Some(login) = login else {
-            return Resp::error_page(
-                400,
-                "This sign-in link is invalid or has expired. Run `gclone login` again.",
-            );
-        };
-        let to_device = |param: &str, value: &str, state: &str, port: u16| {
-            Resp::empty(302)
-                .header(
-                    "Location",
-                    format!("http://127.0.0.1:{port}/?{param}={value}&state={state}"),
-                )
-                .header("Cache-Control", "no-store")
-                .header("Referrer-Policy", "no-referrer")
-        };
-        if login.deny {
-            return match &login.loopback {
-                Some((port, state)) => to_device("error", "access_denied", state, *port),
-                None => Resp::error_page(200, "Google did not grant access (access_denied)."),
-            };
+    /// `/device/start`: "Google" opens a login and names its two codes.
+    fn auth_start(&mut self) -> Resp {
+        if self.client_broken {
+            return State::client_invalid();
         }
-        let code = check_code(&login.challenge);
-        self.last_check_code = Some(code.clone());
-        let intro = if login.loopback.is_some() {
-            "You approved access at Google, but nothing is signed in yet. gclone on this computer is waiting for the \
-             last step. Finish only if you just ran <code>gclone login</code> on this computer and its terminal \
-             shows the check code"
-        } else {
-            "You approved access at Google, but nothing is signed in yet. A gclone device without a browser is \
-             waiting for the last step. Finish only if you started <code>gclone login</code> yourself and its \
-             terminal shows the check code"
-        };
         let n = self.next();
-        self.confirmations.insert(
-            n,
-            PendingConfirm {
-                login,
-                since: Instant::now(),
+        let device_code = format!("dc-{n}-{}", "x".repeat(24));
+        let user_code = format!("TEST-{n:04}");
+        self.devices.insert(
+            device_code.clone(),
+            DeviceLogin {
+                user_code: user_code.clone(),
+                state: DeviceState::Pending,
+                started: Instant::now(),
+                last_poll: None,
+                interval: Duration::from_secs_f64(self.poll_interval),
+                lifetime: Duration::from_secs_f64(self.code_lifetime),
             },
         );
-        let link = format!("{}/auth/callback?confirmed={n}", self.base);
-        Resp::page(
+        self.last_user_code = Some(user_code.clone());
+        Resp::auth_json(
             200,
-            "Finish signing in to gclone",
-            &format!(
-                "<p>{intro} <strong>{code}</strong>.</p>\n<p class=\"check\">{code}</p>\n\
-                 <p class=\"warn\">If the code differs, or if someone sent you the link that led here, close this \
-                 page: someone else is trying to sign in to your Google Drive. Never send the address of this page \
-                 to anyone.</p>\n\
-                 <a class=\"go\" href=\"{}\" rel=\"noreferrer\">Finish signing in</a>",
-                escape_html(&link)
-            ),
+            &json!({ "device_code": device_code, "user_code": user_code, "verification_url": self.verification_url,
+                     "expires_in": self.code_lifetime, "interval": self.poll_interval }),
         )
     }
 
-    /// The second visit to `/callback`: the link of the confirmation page releases the grant.
-    /// Anything else — the fake has no real Google that could send a `code` here — is the
-    /// Worker's "invalid link" page.
-    fn auth_callback(&mut self, req: &Request) -> Resp {
-        let confirmed = req
-            .url
-            .query_pairs()
-            .find(|(k, _)| k == "confirmed")
-            .and_then(|(_, v)| v.parse::<u64>().ok())
-            .and_then(|n| self.confirmations.remove(&n))
-            .filter(|c| c.since.elapsed() < GRANT_TTL);
-        let Some(PendingConfirm { login, since }) = confirmed else {
-            return Resp::error_page(
-                400,
-                "This sign-in link is invalid or has expired. Run `gclone login` again.",
-            );
-        };
-        let to_device = |param: &str, value: &str, state: &str, port: u16| {
-            Resp::empty(302)
-                .header(
-                    "Location",
-                    format!("http://127.0.0.1:{port}/?{param}={value}&state={state}"),
-                )
-                .header("Cache-Control", "no-store")
-                .header("Referrer-Policy", "no-referrer")
-        };
-        let grant = format!("g-{}", self.next());
-        self.grants.insert(
-            grant.clone(),
-            Grant {
-                challenge: login.challenge,
-                email: self.login_email.clone(),
-                issued: since,
-                expired: false,
-                used: false,
-            },
-        );
-        match &login.loopback {
-            Some((port, state)) => {
-                let state = if std::mem::take(&mut self.tamper_state_once) {
-                    "tampered-state-0000000".to_string()
-                } else {
-                    state.clone()
-                };
-                to_device("code", &grant, &state, *port)
-            }
-            None => Resp::page(
-                200,
-                "Almost done",
-                &format!(
-                    "<p>Paste this code into the terminal where <code>gclone login</code> is waiting, right away: it \
-                     stops working 2 minutes after the previous page appeared.</p>\n\
-                     <textarea readonly autofocus spellcheck=\"false\">{}</textarea>\n\
-                     <p class=\"warn\">Never send it — or the address of this page — to anyone.</p>",
-                    escape_html(&format!("{PASTE_PREFIX}{grant}"))
-                ),
-            ),
-        }
-    }
-
-    fn auth_token(&mut self, body: &serde_json::Map<String, Value>) -> Resp {
+    /// `/device/poll`: the state of the login, or — once — its tokens, after the checks of §2.3.
+    fn auth_poll(&mut self, body: &serde_json::Map<String, Value>) -> Resp {
         let code = body
-            .get("code")
+            .get("device_code")
             .and_then(Value::as_str)
-            .filter(|c| c.chars().count() <= 1024);
-        let verifier = body
-            .get("verifier")
-            .and_then(Value::as_str)
-            .filter(|v| (43..=128).contains(&v.len()) && all_chars(v, "._~-"));
-        let (Some(code), Some(verifier)) = (code, verifier) else {
+            .filter(|c| all_chars(c, "_/.~+=-") && (16..=512).contains(&c.len()));
+        let Some(code) = code else {
             return Resp::auth_error(
                 400,
                 "invalid_request",
-                "The request needs a code and a verifier.",
+                "The request needs a well-formed device_code.",
             );
         };
-        let challenge = b64url(&sha256(&[verifier.as_bytes()]));
-        // A grant opens only under the verifier it was sealed for; a failed attempt leaves it intact.
-        let usable = self.grants.get(code).is_some_and(|g| {
-            g.challenge == challenge && !g.used && !g.expired && g.issued.elapsed() < GRANT_TTL
-        });
-        if !usable {
-            return Resp::auth_error(
+        if self.client_broken {
+            return State::client_invalid();
+        }
+        let invalid_grant = || {
+            Resp::auth_error(
                 400,
                 "invalid_grant",
-                "The sign-in code is invalid, expired or already used.",
-            );
-        }
-        if self.client_broken {
-            return Resp::auth_error(
-                500,
-                "client_invalid",
-                "Google rejected the OAuth client (invalid_client).",
-            );
-        }
-        // From here on "Google" has consumed its code.
-        let email = match self.grants.get_mut(code) {
-            Some(grant) => {
-                grant.used = true;
-                grant.email.clone()
-            }
-            None => unreachable!("checked above"),
+                "Google rejected the sign-in code or refresh token: it is expired, revoked or already used.",
+            )
         };
-        if !self
-            .allowed_emails
-            .iter()
-            .any(|a| a.trim().eq_ignore_ascii_case(&email))
+        let Some(login) = self.devices.get_mut(code) else {
+            return invalid_grant();
+        };
+        let slow_down = || {
+            Resp::auth_error(
+                400,
+                "slow_down",
+                "Polling too fast: wait 5 seconds longer between requests.",
+            )
+        };
+        // "Google's" two timing rules, for a code that is still open: it runs out by itself,
+        // and a poll that comes sooner than `interval` after the previous one is refused —
+        // without a look at whether the code was entered. The first poll has no previous one.
+        if matches!(login.state, DeviceState::Pending | DeviceState::Approved(_)) {
+            let now = Instant::now();
+            if now.duration_since(login.started) >= login.lifetime {
+                login.state = DeviceState::Expired;
+            } else {
+                let early = login
+                    .last_poll
+                    .is_some_and(|last| now.duration_since(last) < login.interval);
+                login.last_poll = Some(now);
+                if early {
+                    self.early_polls += 1;
+                    return slow_down();
+                }
+            }
+        }
+        let email = match &login.state {
+            DeviceState::Pending if self.slow_down > 0 => {
+                self.slow_down -= 1;
+                return slow_down();
+            }
+            DeviceState::Pending => {
+                return Resp::auth_error(
+                    400,
+                    "authorization_pending",
+                    "Nobody has entered the code at Google yet.",
+                );
+            }
+            DeviceState::Denied => {
+                return Resp::auth_error(
+                    403,
+                    "access_denied",
+                    "Google denied access (access_denied).",
+                );
+            }
+            DeviceState::Expired => {
+                return Resp::auth_error(
+                    400,
+                    "expired_token",
+                    "The code expired before it was entered at Google. Run `gclone login` again.",
+                );
+            }
+            DeviceState::Used => return invalid_grant(),
+            DeviceState::Approved(email) => email.clone(),
+        };
+        // From here on "Google" has consumed the device code: every refusal below is final,
+        // and none of them is a 5xx (which a device polls again on).
+        login.state = DeviceState::Used;
+        if self.no_id_token {
+            return Resp::auth_error(
+                403,
+                "grant_unusable",
+                "Google approved the sign-in, but its answer carried no ID token (the account cannot be checked without one), so nothing was handed out and the code is used up. If this happens on every login, see \"Troubleshooting\" in worker/README.md.",
+            );
+        }
+        // Byte for byte but for the case of ASCII letters; an address outside printable ASCII
+        // matches nothing. The answer shows the address masked: the caller is anonymous.
+        let printable = |s: &str| s.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if !(printable(&email)
+            && self
+                .allowed_emails
+                .iter()
+                .any(|a| a.trim().eq_ignore_ascii_case(&email)))
         {
+            let who = match masked_email(&email) {
+                Some(masked) => format!("The Google account {masked}"),
+                None => "This Google account".to_string(),
+            };
             return Resp::auth_error(
                 403,
                 "email_not_allowed",
-                &format!("The Google account {email} is not allowed to sign in here."),
+                &format!("{who} is not allowed to sign in here."),
             );
         }
         if let Some(refused) = self.scope_not_allowed() {
@@ -1478,7 +1340,13 @@ impl State {
         }
         let refresh_token = format!("rt-{}", self.issued_refresh_tokens.len() + 1);
         self.issued_refresh_tokens.push(refresh_token.clone());
-        self.refresh_tokens.insert(refresh_token.clone(), true);
+        self.refresh_tokens.insert(
+            refresh_token.clone(),
+            Issued {
+                valid: true,
+                legacy: false,
+            },
+        );
         let access_token = self.issue_access_token();
         let mut answer = json!({ "refresh_token": refresh_token, "access_token": access_token,
                                  "expires_in": 3599, "scope": self.granted_scope, "email": email });
@@ -1504,18 +1372,46 @@ impl State {
                 "The request needs a well-formed refresh_token.",
             );
         };
-        if self.client_broken {
+        // Which client: "device", or — no field — the legacy client of the browser sign-in.
+        let legacy = match body.get("client") {
+            None => true,
+            Some(Value::String(c)) if c == "device" => false,
+            Some(_) => {
+                return Resp::auth_error(
+                    400,
+                    "invalid_request",
+                    "The \"client\" of a refresh request is \"device\" or absent.",
+                );
+            }
+        };
+        if legacy && self.legacy_client == LegacyClient::HalfSet {
             return Resp::auth_error(
                 500,
-                "client_invalid",
-                "Google rejected the OAuth client (invalid_client).",
+                "server_misconfigured",
+                "Only one of GOOGLE_LEGACY_CLIENT_ID and GOOGLE_LEGACY_CLIENT_SECRET is set on this sign-in helper, so it cannot refresh a login made before gclone 0.2.0: set both, or delete both.",
             );
         }
-        if self.refresh_tokens.get(token) != Some(&true) {
+        if legacy && self.legacy_client == LegacyClient::Absent {
             return Resp::auth_error(
                 400,
                 "invalid_grant",
-                "Google no longer accepts this refresh token.",
+                "This login was made with gclone's earlier browser sign-in, which this sign-in helper no longer serves. Run `gclone login` again.",
+            );
+        }
+        if self.client_broken {
+            return State::client_invalid();
+        }
+        // A token presented with the other client's credentials: what Google really answers is
+        // unverified; the fake refuses it like a token it does not know.
+        let usable = self
+            .refresh_tokens
+            .get(token)
+            .is_some_and(|t| t.valid && t.legacy == legacy);
+        if !usable {
+            return Resp::auth_error(
+                400,
+                "invalid_grant",
+                "Google rejected the sign-in code or refresh token: it is expired, revoked or already used.",
             );
         }
         if let Some(refused) = self.scope_not_allowed() {
@@ -1529,7 +1425,7 @@ impl State {
     }
 
     /// `403 scope_not_allowed` when "Google" granted anything beyond the Worker's own scopes
-    /// (§2.3): no token leaves the Worker then, on `/token` or on `/refresh`.
+    /// (§2.3): no token leaves the Worker then, on `/device/poll` or on `/refresh`.
     fn scope_not_allowed(&self) -> Option<Resp> {
         let excess: Vec<&str> = self
             .granted_scope
@@ -1561,7 +1457,7 @@ impl State {
     fn revoke_everything(&mut self) {
         self.refresh_tokens
             .values_mut()
-            .for_each(|valid| *valid = false);
+            .for_each(|t| t.valid = false);
         self.access_tokens.clear();
     }
 
@@ -1577,8 +1473,8 @@ impl State {
             .find(|(k, _)| k == "token")
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default();
-        let live =
-            self.refresh_tokens.get(&token) == Some(&true) || self.access_tokens.contains(&token);
+        let live = self.refresh_tokens.get(&token).is_some_and(|t| t.valid)
+            || self.access_tokens.contains(&token);
         if !live {
             return Resp::auth_json(
                 400,
@@ -1791,7 +1687,7 @@ impl FakeDrive {
         }
     }
 
-    /// Pre-issued refresh token "rt-ok"; memory-only cache.
+    /// Pre-issued refresh token "rt-ok" (of the device client); memory-only cache.
     pub fn token_provider(&self) -> Arc<TokenProvider> {
         self.token_provider_for("rt-ok")
     }
@@ -1802,101 +1698,104 @@ impl FakeDrive {
             http,
             self.auth(),
             refresh_token.to_string(),
+            AuthClient::Device,
             None,
         ))
     }
 
-    // --- the fake auth Worker (§2.3) and the fake "user in a browser"
+    // --- the fake auth Worker (§2.3) and the fake user at google.com/device
 
-    /// Plays the user in a browser for one login: GET `login_url` (as printed/opened by
-    /// login_interactive) → the confirmation page (200 in BOTH flows, never a redirect) →
-    /// follows its "Continue" link to "Google" → when access was granted, the second
-    /// confirmation page (200 with the same check code — never a redirect, never the paste
-    /// code) → follows its link. Browser flow: then follows the fake's 302 to
-    /// http://127.0.0.1:<port>/ and returns the body the device's loopback listener answered.
-    /// Headless flow: returns the "gclone-code1_…" string from the fake's final page (or, when
-    /// consent was denied, that page's text).
-    pub async fn browse(&self, login_url: &str) -> String {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("http client");
-        let get = |url: String| {
-            let http = http.clone();
-            async move {
-                let resp = http
-                    .get(&url)
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| panic!("GET {url}: {e}"));
-                let location = resp
-                    .headers()
-                    .get("location")
-                    .map(|v| v.to_str().expect("Location is text").to_string());
-                (
-                    resp.status().as_u16(),
-                    location,
-                    resp.text().await.expect("body"),
-                )
-            }
-        };
-        let (status, location, page) = get(login_url.to_string()).await;
-        assert_eq!(
-            status, 200,
-            "/login must answer the confirmation page, not {status}: {page}"
-        );
-        assert!(location.is_none(), "/login must not redirect");
-        let links = page_links(&page);
-        assert_eq!(
-            links.len(),
-            1,
-            "the confirmation page has exactly one link: {links:?}"
-        );
-        let first_code = self.last_check_code();
-        let (mut status, mut location, mut page) = get(links[0].clone()).await;
-        // Back from "Google" with access granted: the Worker hands out nothing before the user
-        // confirmed the check code a second time.
-        let finish = page_links(&page);
-        if status == 200 && finish.len() == 1 {
-            assert!(location.is_none(), "/callback must not redirect yet");
-            assert!(
-                !page.contains(PASTE_PREFIX),
-                "no paste code before the confirmation: {page}"
-            );
-            let code = first_code.expect("the /login page showed a check code");
-            assert!(
-                page.contains(&code),
-                "the second confirmation page shows the check code {code}: {page}"
-            );
-            (status, location, page) = get(finish[0].clone()).await;
-        }
-        match (status, location) {
-            (302, Some(loopback)) => {
-                assert!(
-                    loopback.starts_with("http://127.0.0.1:"),
-                    "the only redirect target is the loopback address, not {loopback}"
-                );
-                get(loopback).await.2
-            }
-            (200, None) => match page.find(PASTE_PREFIX) {
-                Some(at) => {
-                    let code = &page[at..];
-                    let end = code
-                        .find(|c: char| c == '<' || c.is_whitespace())
-                        .unwrap_or(code.len());
-                    unescape_html(&code[..end])
-                }
-                None => page,
-            },
-            (status, location) => {
-                panic!("unexpected answer after the confirmation page: {status} {location:?}")
+    /// Plays the user: enters `user_code` at "Google" and approves, signed in as the account of
+    /// `set_login_email`. The device's next poll then gets its answer. Panics on a code no
+    /// `/device/start` handed out, or one that is not pending any more.
+    pub fn approve(&self, user_code: &str) {
+        let mut st = self.st();
+        let email = st.login_email.clone();
+        st.pending(user_code).state = DeviceState::Approved(email);
+    }
+
+    /// The user enters `user_code` and refuses: the next poll → 403 access_denied.
+    pub fn deny(&self, user_code: &str) {
+        self.st().pending(user_code).state = DeviceState::Denied;
+    }
+
+    /// Every login that is still pending runs out: its next poll → 400 expired_token.
+    pub fn expire_codes(&self) {
+        for login in self.st().devices.values_mut() {
+            if matches!(login.state, DeviceState::Pending) {
+                login.state = DeviceState::Expired;
             }
         }
     }
 
-    /// The check code shown on the confirmation page the fake served last.
-    pub fn last_check_code(&self) -> Option<String> {
-        self.st().last_check_code.clone()
+    /// The next `times` polls of a pending login → 400 slow_down, whatever their timing.
+    pub fn slow_down(&self, times: u32) {
+        self.st().slow_down = times;
+    }
+
+    /// How often a poll was answered 400 slow_down because it came less than the login's
+    /// `interval` after the previous one (the injected `slow_down(n)` answers do not count).
+    pub fn early_polls(&self) -> u32 {
+        self.st().early_polls
+    }
+
+    /// `interval` of later /device/start answers, in seconds (default 0.02 — Google: 5). A
+    /// login started afterwards is held to it: a poll that comes sooner after the previous
+    /// one is answered 400 slow_down.
+    pub fn set_poll_interval(&self, secs: f64) {
+        self.st().poll_interval = secs;
+    }
+
+    /// `expires_in` of later /device/start answers, in seconds (default 1800, as Google). A
+    /// login started afterwards runs out by itself after that time: 400 expired_token.
+    pub fn set_code_lifetime(&self, secs: f64) {
+        self.st().code_lifetime = secs;
+    }
+
+    /// `verification_url` of later /device/start answers (default: Google's page).
+    pub fn set_verification_url(&self, url: &str) {
+        self.st().verification_url = url.to_string();
+    }
+
+    /// "Google's" token answer for an approved login carries no ID token: the poll that
+    /// redeems the code is answered 403 grant_unusable — and the code is used up by it.
+    pub fn omit_id_token(&self) {
+        self.st().no_id_token = true;
+    }
+
+    /// The user code of the newest /device/start answer.
+    pub fn last_user_code(&self) -> Option<String> {
+        self.st().last_user_code.clone()
+    }
+
+    /// The Worker has (or lacks, the default) the GOOGLE_LEGACY_CLIENT_* secrets: whether
+    /// /auth/refresh serves a request without `"client": "device"`.
+    pub fn set_legacy_client(&self, configured: bool) {
+        self.st().legacy_client = if configured {
+            LegacyClient::Configured
+        } else {
+            LegacyClient::Absent
+        };
+    }
+
+    /// The Worker has exactly one of its two GOOGLE_LEGACY_CLIENT_* secrets: /auth/refresh
+    /// without `"client": "device"` → 500 server_misconfigured; nothing else changes.
+    pub fn set_legacy_client_half_set(&self) {
+        self.st().legacy_client = LegacyClient::HalfSet;
+    }
+
+    /// A live refresh token of the legacy client, as a device that logged in before 0.2.0 holds.
+    pub fn add_legacy_token(&self) -> String {
+        let mut st = self.st();
+        let token = format!("rt-legacy-{}", st.next());
+        st.refresh_tokens.insert(
+            token.clone(),
+            Issued {
+                valid: true,
+                legacy: true,
+            },
+        );
+        token
     }
 
     /// The account the fake user signs in with (default "me@example.com").
@@ -1914,22 +1813,7 @@ impl FakeDrive {
         self.st().granted_scope = scope.to_string();
     }
 
-    /// The next /auth/login ends in error=access_denied instead of a grant.
-    pub fn deny_consent_once(&self) {
-        self.st().deny_consent_once = true;
-    }
-
-    /// Every grant issued so far → 400 invalid_grant at /auth/token.
-    pub fn expire_grants(&self) {
-        self.st().grants.values_mut().for_each(|g| g.expired = true);
-    }
-
-    /// The next loopback redirect carries a wrong `state`.
-    pub fn tamper_loopback_state_once(&self) {
-        self.st().tamper_state_once = true;
-    }
-
-    /// /auth/token and /auth/refresh → 500 client_invalid.
+    /// /auth/device/start, /auth/device/poll and /auth/refresh → 500 client_invalid.
     pub fn break_client(&self) {
         self.st().client_broken = true;
     }
@@ -1950,7 +1834,7 @@ impl FakeDrive {
         self.st().revoked.clone()
     }
 
-    /// /auth/token answers carry refresh_token_expires_in.
+    /// /auth/device/poll answers carry refresh_token_expires_in.
     pub fn set_refresh_expires_in(&self, secs: Option<u64>) {
         self.st().refresh_expires_in = secs;
     }
@@ -2125,22 +2009,4 @@ pub fn fast_pacer() -> PacerConfig {
         units_per_min: u32::MAX,
         ..PacerConfig::default()
     }
-}
-
-/// The `href` of every `<a>` on a page.
-pub fn page_links(html: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    let mut rest = html;
-    while let Some(at) = rest.find("<a ") {
-        rest = &rest[at + 3..];
-        let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
-        if let Some(href) = tag
-            .split("href=\"")
-            .nth(1)
-            .and_then(|h| h.split('"').next())
-        {
-            links.push(unescape_html(href));
-        }
-    }
-    links
 }

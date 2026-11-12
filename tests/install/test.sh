@@ -48,7 +48,8 @@ sha256_of() {
     fi
 }
 
-targets="x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin"
+# What a release holds (.github/workflows/release.yml): no build for Intel Macs.
+targets="x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin"
 
 # make_release DIR VERSION: one archive per target; each fake binary names its target.
 make_release() {
@@ -254,8 +255,18 @@ detects Linux amd64 x86_64-unknown-linux-musl
 detects Linux aarch64 aarch64-unknown-linux-musl
 detects Linux arm64 aarch64-unknown-linux-musl
 detects Darwin arm64 aarch64-apple-darwin
-detects Darwin x86_64 x86_64-apple-darwin
+# Apple silicon, from a shell that runs under Rosetta
 detects Darwin x86_64 aarch64-apple-darwin 1
+
+# An Intel Mac: the releases have no build for it, and the script says so before it downloads
+# anything — not "cannot download gclone-x86_64-apple-darwin.tar.gz".
+run "an Intel Mac" 1 FAKE_UNAME_S=Darwin FAKE_UNAME_M=x86_64 FAKE_PROC_TRANSLATED=0 -- --base-url "$v9" --dir "$work/none"
+has "install.sh: error: no prebuilt gclone for Intel Macs"
+has "Apple silicon (arm64) only"
+has "Build from source instead (README, \"Building from source\")"
+lacks "cannot"
+run "an Intel Mac, from GitHub" 1 FAKE_UNAME_S=Darwin FAKE_UNAME_M=x86_64 FAKE_PROC_TRANSLATED=0 GCLONE_REPO=acme/gclone -- --dir "$work/none"
+has "no prebuilt gclone for Intel Macs"
 
 run "32-bit ARM" 1 FAKE_UNAME_S=Linux FAKE_UNAME_M=armv7l -- --base-url "$v9" --dir "$work/none"
 has "no prebuilt gclone for the CPU architecture 'armv7l'"
@@ -270,8 +281,13 @@ run "Termux (TERMUX_VERSION)" 1 FAKE_UNAME_S=Linux FAKE_UNAME_M=aarch64 FAKE_UNA
 has "no prebuilt gclone for Android/Termux"
 run "--target overrides on Android" 0 FAKE_UNAME_S=Linux FAKE_UNAME_O=Android -- --base-url "$v9" --dir "$work/forced-android" --target aarch64-unknown-linux-musl
 has "(aarch64-unknown-linux-musl, "
-run "--target overrides" 0 FAKE_UNAME_S=FreeBSD -- --base-url "$v9" --dir "$work/forced" --target x86_64-apple-darwin
-has "(x86_64-apple-darwin, "
+run "--target overrides" 0 FAKE_UNAME_S=FreeBSD -- --base-url "$v9" --dir "$work/forced" --target aarch64-apple-darwin
+has "(aarch64-apple-darwin, "
+# Asked for by name, the Intel build is looked for (a release of one's own may have it); the
+# releases here do not.
+run "--target x86_64-apple-darwin on an Intel Mac" 1 FAKE_UNAME_S=Darwin FAKE_UNAME_M=x86_64 -- --base-url "$v9" --dir "$work/none" --target x86_64-apple-darwin
+has "gclone-x86_64-apple-darwin.tar.gz"
+lacks "no prebuilt gclone for Intel Macs"
 [ ! -e "$work/none" ] || fail "a refused install created its directory"
 
 # --- refusals ----------------------------------------------------------------------------------

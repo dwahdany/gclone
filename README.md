@@ -18,7 +18,8 @@ rsync-style sync tool (`copy`, `sync`, `ls`, `cat`, …), not a mount.
   `gclone gc --purge`.
 - You set up OAuth **once in your life**: one Google OAuth client and one small stateless
   Cloudflare Worker (`worker/`) that holds the client's secret. Every device — the first or the
-  tenth — is then connected with one command and one browser approval. File data flows
+  tenth, with or without a browser of its own — is then connected with one command and one
+  short code entered at Google. File data flows
   device ↔ Google directly and never through the Worker.
 
 The design contract is the implementation spec, [`docs/SPEC.md`](docs/SPEC.md); section
@@ -37,11 +38,14 @@ Windows is not supported; inside WSL2 the Linux binary applies.
 
 ## Install
 
-Prebuilt binaries for Linux (x86_64 and aarch64) and macOS (Apple silicon and Intel) are
-attached to this repository's GitHub Releases. The Linux ones are static: they need no
-particular distribution or libc, and run inside WSL2 as well. `install.sh` picks the build for
-the machine, checks it against the release's `SHA256SUMS` and puts it into `~/.local/bin` —
-no sudo, nothing else is touched.
+Prebuilt binaries for Linux (x86_64 and aarch64) and macOS on Apple silicon are attached to
+this repository's GitHub Releases. The Linux ones are static: they need no particular
+distribution or libc, and run inside WSL2 as well. `install.sh` picks the build for the
+machine, checks it against the release's `SHA256SUMS` and puts it into `~/.local/bin` — no
+sudo, nothing else is touched.
+
+There is **no prebuilt binary for Intel Macs**: `install.sh` says so there and stops.
+[Build from source](#building-from-source) instead — gclone itself runs on them.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dwahdany/gclone/main/install.sh | sh
@@ -53,7 +57,7 @@ it). To use your own auth Worker, pass its URL once: `gclone login https://<your
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.1.0` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.2.0` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`). If `~/.local/bin` is not on your `PATH`, the script says
 so and names the line to add and the file it goes into (on Debian and Ubuntu, logging in again
@@ -68,15 +72,15 @@ Without GitHub — release archives copied to the machine, or built by hand —
 `sh install.sh --base-url DIR` installs from a directory (a path, `file:///…` or `https://…`)
 that holds `gclone-<target>.tar.gz` and `SHA256SUMS`.
 
-Android/Termux has no prebuilt binary (the script refuses there): build from source inside
-Termux.
+Android/Termux and Intel Macs have no prebuilt binary (the script refuses there): build from
+source — on Android, inside Termux.
 
 `gclone --version` names the build and the auth URL that is compiled in — release binaries
 carry the one from the repository variable `GCLONE_DEFAULT_AUTH_URL`, so that `gclone login`
 needs no argument:
 
 ```
-gclone 0.1.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.2.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
 ```
 
 On Linux gclone uses the system's CA certificates (the `ca-certificates` package — present on
@@ -93,8 +97,8 @@ updated (see [Limitations](#limitations)).
 
 ### Building from source
 
-Unix only (macOS, Linux). Rust edition 2024, MSRV 1.89, and a C compiler (bundled SQLite and
-the TLS crypto provider). With rustup, `rust-toolchain.toml` selects the compiler that CI and
+Unix only (macOS — Apple silicon and Intel — and Linux). Rust edition 2024, MSRV 1.89, and a C
+compiler (bundled SQLite and the TLS crypto provider). With rustup, `rust-toolchain.toml` selects the compiler that CI and
 the releases use; a Rust from the system's packages or from nix ignores that file.
 
 ```sh
@@ -125,8 +129,9 @@ On a machine where `cargo` is a rustup shim without a toolchain, use nix:
 
 `.github/workflows/release.yml` builds, tests and publishes the binaries when a tag `v<version>`
 is pushed (the tag must match `version` in `Cargo.toml`): `gclone-<target>.tar.gz` for
-`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and
-`x86_64-apple-darwin`, plus `SHA256SUMS`. Set the repository variable `GCLONE_DEFAULT_AUTH_URL`
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`, plus
+`SHA256SUMS` (no `x86_64-apple-darwin`: Intel Macs build from source). Set the repository
+variable `GCLONE_DEFAULT_AUTH_URL`
 (Settings → Secrets and variables → Actions → Variables) to your auth URL first; it is not a
 secret — it is readable in the binary — and without it the binaries simply have no built-in
 URL. `SHA256SUMS` guards against a damaged or swapped download, not against someone who can
@@ -135,13 +140,13 @@ publish releases in the repository.
 ## One-time setup
 
 Done **once per person, never per device**. You need a Google account, a Cloudflare account
-(the free plan is enough), Node 20 or newer, `openssl` and `curl`. Nothing in this repository
+(the free plan is enough), Node 20 or newer and `curl`. Nothing in this repository
 deploys anything by itself.
 
 `worker/setup.sh` walks through steps 1, 3 and 4 interactively and prints the checklist of
 step 2 with your URLs filled in. It asks first whether the Worker is to be served on its
 `workers.dev` host or on a host name of your own. **Decide that before step 1**: the URL goes
-into the Google client and into every device's login, so starting with the custom domain of
+into the Google app's branding and into every device's login, so starting with the custom domain of
 step 5 saves doing the Google configuration twice and signing in again on every device. [`worker/README.md`](worker/README.md) is the authoritative
 version of this list, with troubleshooting by error code. The steps by hand:
 
@@ -158,7 +163,7 @@ Note the URL it prints, `https://gclone-auth.<acct>.workers.dev`. This is your *
 `<host>` below is its host name. (With a custom domain from the start — step 1 of the custom
 domain section of `worker/README.md` instead of this plain deploy — the auth URL is your own
 `https://auth.example.org`.) Until step 3 is done its home page says
-`Status: not configured` — expected: the Google client of step 2 needs the Worker's host name,
+`Status: not configured` — expected: the branding of step 2 needs the Worker's host name,
 so the Worker has to exist first.
 
 ### 2. Create the Google OAuth client
@@ -179,26 +184,30 @@ In the Google Cloud console (labels drift now and then; the items stay the same)
    "Submit for verification" — `openid`, `email` and `drive.file` are non-sensitive scopes.
    If you skip publishing, Google ends every login after 7 days; `gclone login` detects that
    and refuses.
-5. **Clients** → **Create client** → Application type **Web application** → Authorized
-   redirect URI `https://<host>/callback` — exactly that, and no JavaScript origins. Copy the
-   client ID and the client secret **now**: the secret is shown only once.
+5. **Clients** → **Create client** → Application type **TVs and Limited Input devices** (any
+   name). Nothing else to fill in: this client type has no redirect URI. Copy the client ID
+   and the client secret **now**: the secret is shown only once.
 
 Workspace accounts may choose Audience **Internal** instead of External + Publish. Console
 changes can take from five minutes to a few hours to apply.
 
-### 3. Give the Worker its four secrets
+### 3. Give the Worker its three secrets
 
 ```sh
 cd worker
 npx wrangler secret put GOOGLE_CLIENT_ID        # the client ID from step 2.5
 npx wrangler secret put GOOGLE_CLIENT_SECRET    # its secret
-openssl rand -base64 32 | npx wrangler secret put SEAL_KEY
 npx wrangler secret put ALLOWED_EMAILS          # your Google address; several: comma-separated
 ```
 
 Each `wrangler secret put` deploys a new version at once; no further `wrangler deploy` is
 needed. `ALLOWED_EMAILS` decides who may sign in — empty or missing means **nobody**. It must
 stay a secret and never become a `vars` entry in `wrangler.jsonc` (see `worker/README.md`).
+
+(Coming from gclone before 0.2.0, which signed in through a browser redirect and a "Web
+application" client? [`worker/README.md`, "Moving from the browser
+sign-in"](worker/README.md#moving-from-the-browser-sign-in-gclone-before-020) has the five
+steps; devices that are signed in keep working meanwhile.)
 
 ### 4. Check
 
@@ -221,12 +230,19 @@ If you chose your own host name in step 1, only the rule is left to do.
 gclone login https://<host>
 ```
 
-A browser opens on the Worker's confirmation page. It shows a **check code**; continue only if
-the terminal shows the same code. After Google's consent screen the Worker shows the check code
-once more — follow that page's link (within 2 minutes) only if the code still matches; nothing
-is signed in before you do. gclone then finds no vault, asks for
-a new passphrase (leave it empty and it generates a strong one — recommended) and creates the
-vault, a folder named `gclone` in your Drive.
+The terminal shows an address and a code:
+
+```
+To sign in, open  https://www.google.com/device
+and enter the code  ABCD-EFGH
+(enter only a code shown in this terminal; waiting…)
+```
+
+Open the address in any browser — this machine's (gclone opens it for you when it can), your
+phone's — enter the code, choose your Google account and approve. The terminal continues by
+itself a few seconds later; a code is good for 30 minutes, and Ctrl-C stops the login. gclone
+then finds no vault, asks for a new passphrase (leave it empty and it generates a strong one —
+recommended) and creates the vault, a folder named `gclone` in your Drive.
 
 **Store the passphrase in your password manager.** It is needed once on every new device and
 cannot be recovered. It is also the only thing that protects the vault against Google and
@@ -239,16 +255,25 @@ command as on the first device. A release binary knows the auth URL (`gclone --v
 it), so there is nothing to type; a binary without one takes the URL as an argument, once:
 
 ```sh
-gclone login                                # with a browser on this machine
-gclone login --no-browser                   # headless: open the printed URL anywhere, paste the code back
+gclone login                                # shows a code; enter it at google.com/device in any browser
+gclone login --no-browser                   # the same, without trying to open a browser on this machine
 gclone login https://<host>                 # a binary without a built-in auth URL
 ```
 
-Over SSH, and on Linux without a graphical session, gclone takes the `--no-browser` way by
-itself; it does the same when no browser can be started.
+The sign-in is the same everywhere — a laptop, an SSH session, a headless server: the terminal
+shows `https://www.google.com/device` and a short code, you enter the code in a browser on
+whatever device is at hand, and the terminal continues. On a machine with a graphical session
+gclone also opens that page in the local browser (not over SSH, and not with `--no-browser`).
+It opens a `google.com` address only: should the auth Worker ever name another one, gclone
+prints it with a warning and leaves the decision to you.
 
 gclone finds the existing vault and asks for the passphrase — once; the device caches the key
-afterwards. At the end it prints a **head fingerprint**:
+afterwards. (If the vault was created with gclone before 0.2.0, first run `gclone login` on a
+device that is already attached and wait for `Vault unchanged.`: it is not yet verified that a
+new sign-in sees such a vault, and a new device that sees none would offer to create a second
+one. Do not run `gclone logout` on a device from before 0.2.0 until then — its old login cannot
+be issued again. See [`worker/README.md`](worker/README.md), "Moving from the browser
+sign-in".) At the end it prints a **head fingerprint**:
 
 ```
 Connected to vault "gclone" (38,201 files). This device: "nas".
@@ -266,8 +291,11 @@ is missing (an expired login, an interrupted attach) and changes nothing else. I
 index is incomplete at that moment (a gap or a rollback), the login still completes and tells
 you to run `gclone repair`; until then nothing can be changed in the vault. It keeps a
 login that still works without asking; to sign in with a different Google account run
-`gclone logout` first. A sign-in that cannot see the vault the device is attached to (the
-wrong account) is not kept.
+`gclone logout` first. (The exception is a login made by gclone before 0.2.0: `gclone login`
+always replaces it with a new sign-in — but only once that sign-in has seen a vault; a device
+from before 0.2.0 that is attached to none does not create one unless asked with
+`--new-vault`.) A sign-in that cannot see the vault the device is attached to (the wrong
+account) is not kept, and nothing on the device changes.
 
 Nothing is ever copied between devices: each has its own Google login (refresh token), and the
 vault key is unlocked on each device with the passphrase. Never copy `secrets.json` from one
@@ -456,20 +484,22 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   deletion. It never sees the passphrase, the master key or any file data. It is stateless and
   only lets the Google accounts in `ALLOWED_EMAILS` sign in. The app's Google scope is
   `drive.file`: it can only touch files it created itself, not the rest of your Drive. The
-  Worker enforces that: it hands out no token for a grant that carries any other scope, so a
-  tampered sign-in link cannot obtain wider access through it.
+  Worker enforces that: it asks Google for nothing else, and it hands out no token for a grant
+  that carries any other scope.
 - **On the device** the refresh token and the cached master key sit in plaintext in
   `secrets.json` (mode 0600; gclone refuses to use it if it or its directory is accessible to
   others). Anyone who can read that file as you has the vault. At-rest protection is disk
   encryption. Treat the file like an SSH private key: never copy it to another machine, and
   exclude the state directory from backups that leave the machine (gclone itself never
   uploads its configuration or state directory, even when you sync your whole home).
-- **Login phishing.** Someone can send you a sign-in link for a login *they* started — also a
-  link that leads straight to Google's consent screen. After the consent screen the Worker
-  always shows a confirmation page with a check code that must match the one in your own
-  terminal, and nothing is signed in until you follow its link: never continue when the code
-  does not match or when you did not just run `gclone login` yourself, and never send the
-  final code or the address of any of these pages to anyone.
+- **Login phishing.** The sign-in is Google's device-code flow, and starting one needs no
+  credentials. Someone can therefore start a login of *their own* and try to talk you into
+  entering *their* code at `google.com/device`; the allowlist does not help, because the
+  account that approves is yours. **Enter only a code that your own terminal shows right
+  now** — nobody ever has a reason to send you one. If it happens anyway, the attacker's login
+  reaches what every gclone login reaches: ciphertext, which it could trash (restorable for 30
+  days) but not read. Remove the app at <https://myaccount.google.com/permissions> and sign
+  in again. Details: [`docs/AUTH.md`](docs/AUTH.md).
 
 ### Lost or stolen device
 
@@ -604,11 +634,11 @@ verified by any automated test (§2.9). After the one-time setup:
 
 | ✓ | # | Check | If the answer is bad |
 |---|---|---|---|
-| ☐ | 1 | Publish the *Web application* client with `openid email drive.file`: no verification, no warning screen; the Worker-hosted home and privacy pages are accepted; once published, `gclone login` does **not** report a time-limited login (in Testing it does). | Setup text changes; a login that expires weekly is not an acceptable resting state. `login` detects the Testing case itself. |
+| ☐ | 1 | Publish the app (client of type *TVs and Limited Input devices*) with `openid email drive.file`: no verification, no warning screen; the Worker-hosted home and privacy pages are accepted; once published, `gclone login` does **not** report a time-limited login (in Testing it does). | Setup text changes; a login that expires weekly is not an acceptable resting state. `login` detects the Testing case itself. |
 | ☐ | 2 | Two devices, two logins of the same account: both keep working side by side, and device 2 discovers and reads the vault device 1 created. | The design depends on it. No fallback short of sharing one token. |
 | ☐ | 3 | `gclone logout --revoke` on device 2: is device 1 signed out too (documented: yes)? After a new `gclone login`: is the vault listed again? **Keep a web download of the vault folder before trying.** | Revoke is per token after all → make it the default of `logout`. Files not visible after re-consent → the lost-device procedure must go through web download + `--vault-dir`. |
-| ☐ | 4 | A second Web client in the same Cloud project (after the first was deleted) sees the files. | The "Worker cannot authenticate" recovery must use a web download. |
-| ☐ | 5 | `https://<name>.<acct>.workers.dev/callback` is accepted as redirect URI; the first real `gclone login` succeeds (the ID token carries the `nonce`, and the `scope` Google reports holds nothing but `openid`, `email` / `…/auth/userinfo.email` and `…/auth/drive.file`); an exchange with a wrong `code_verifier` fails (Google enforces PKCE for a Web client). After that login, the stored Workers Logs event of its `/callback` request shows the URL **without** `?code=…` (dashboard → the Worker → Observability). | Redirect URI refused → custom domain route. PKCE not enforced or rejected → harmless (the nonce binds the code). Nonce not echoed → every login fails closed; the design needs a cookie binding instead. Login refused with `scope_not_allowed` naming a harmless scope → Google spells a granted scope differently; add it to `ALLOWED_SCOPES` in `worker/src/google.ts`. Query string visible in the log → switch Workers Logs off (`worker/README.md`, "Configuration"). |
+| ☐ | 4 | A second OAuth client in the same Cloud project sees the files the first one created — in particular the device-flow client of 0.2.0 after a vault was created through the "Web application" client of 0.1.0 (`gclone login` on such a device: "Signed in again … Vault unchanged."). | `gclone login` reports it and changes nothing; the legacy secrets stay on the Worker, or the vault is moved (`worker/README.md`, "Moving from the browser sign-in"). The "Worker cannot authenticate" recovery must use a web download. |
+| ☐ | 5 | The first real `gclone login` succeeds: Google's device-code endpoint accepts the client with `openid email drive.file` (verified 2026-11-12), and the token answer after the consent carries an **ID token** with the verified e-mail address and a refresh token, with a `scope` that holds nothing but `openid`, `email` / `…/auth/userinfo.email` and `…/auth/drive.file`. | No ID token → every login ends right after the approval with "Sign-in was not completed (Google approved the sign-in, but its answer carried no ID token …)" — the Worker's `403 grant_unusable`; it fails closed, because it cannot apply the allowlist. The Worker then has to ask Google's userinfo endpoint instead. Login refused with `scope_not_allowed` naming a harmless scope → Google spells a granted scope differently; add it to `ALLOWED_SCOPES` in `worker/src/google.ts`. |
 | ☐ | 7 | Sustained create rate; does session initiation count against it? | Tune the pack size and the pacer's start rate. |
 | ☐ | 11 | A trashed file is still downloadable by ID. | Affects self-heal wording only. |
 

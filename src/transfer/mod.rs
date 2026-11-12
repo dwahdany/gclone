@@ -167,7 +167,6 @@ fn replicate_auth(e: &AuthError) -> AuthError {
         A::NotAllowed(m) => A::NotAllowed(m.clone()),
         A::Denied(m) => A::Denied(m.clone()),
         A::ScopeMissing => A::ScopeMissing,
-        A::StateMismatch => A::StateMismatch,
         A::Timeout => A::Timeout,
         A::LoginFailed(m) => A::LoginFailed(m.clone()),
         A::BadAuthUrl(m) => A::BadAuthUrl(m.clone()),

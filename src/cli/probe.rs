@@ -28,7 +28,14 @@ pub async fn run(g: &GlobalOpts, _args: ProbeArgs) -> anyhow::Result<i32> {
         .as_deref()
         .filter(|t| !t.is_empty())
         .ok_or(ConfigError::NotLoggedIn)?;
-    let (_, tokens) = drive_backend(secrets.endpoints()?, token, &paths, TRANSFERS_DEFAULT, true)?;
+    let (_, tokens) = drive_backend(
+        secrets.endpoints()?,
+        token,
+        secrets.client,
+        &paths,
+        TRANSFERS_DEFAULT,
+        true,
+    )?;
     let mut cfg = DriveConfig::default();
     if let Some(api) = test_env("GCLONE_TEST_DRIVE_API") {
         cfg.endpoints.api = api;

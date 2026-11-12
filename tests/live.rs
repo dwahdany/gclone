@@ -86,6 +86,7 @@ async fn open_backend(target: Target) -> anyhow::Result<AnyBackend> {
             let (backend, _tokens) = gclone::cli::drive_backend(
                 secrets.endpoints()?,
                 &token,
+                secrets.client,
                 &paths,
                 gclone::consts::TRANSFERS_DEFAULT,
                 false,

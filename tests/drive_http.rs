@@ -1431,7 +1431,10 @@ async fn a_401_costs_one_refresh_and_one_retry() {
         (refresh.method.as_str(), refresh.path.as_str()),
         ("POST", "/auth/refresh")
     );
-    assert_eq!(refresh.json, Some(json!({ "refresh_token": "rt-ok" })));
+    assert_eq!(
+        refresh.json,
+        Some(json!({ "refresh_token": "rt-ok", "client": "device" }))
+    );
 
     // twice in a row: Auth(Expired), after exactly one more refresh
     fake.fail_next(Route::Stat, 2, 401, "authError");

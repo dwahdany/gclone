@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use zeroize::Zeroizing;
 
 use super::GlobalOpts;
-use crate::auth::{AuthEndpoints, TokenProvider};
+use crate::auth::{AuthClient, AuthEndpoints, TokenProvider};
 use crate::backend::drive::{DriveBackend, DriveConfig};
 use crate::backend::{AnyBackend, DirBackend};
 use crate::config::{BackendCfg, Config, Paths, Secrets, secret_store};
@@ -169,6 +169,8 @@ pub(crate) struct Hints {
     pub vault_dir: Option<std::path::PathBuf>,
     pub refresh_expires_at_ms: Option<u64>,
     pub secrets_file: Option<std::path::PathBuf>,
+    /// The login on file was made through the Worker's legacy client (gclone before 0.2.0).
+    pub legacy_login: bool,
 }
 
 fn hints_cell() -> &'static Mutex<Hints> {
@@ -205,6 +207,7 @@ pub(crate) fn note_secrets(secrets: &Secrets) {
             h.auth_url = secrets.auth_url.clone();
         }
         h.refresh_expires_at_ms = secrets.refresh_expires_at_ms;
+        h.legacy_login = secrets.has_login() && secrets.client.is_legacy();
     });
 }
 
@@ -365,7 +368,7 @@ async fn settle(vault: &Vault<AnyBackend>) -> Result<(), IndexError> {
     Ok(())
 }
 
-/// Drive vaults: `drive_backend(secrets.endpoints()?, .., cache = true)`.
+/// Drive vaults: `drive_backend(secrets.endpoints()?, .., secrets.client, .., cache = true)`.
 pub fn build_backend(
     cfg: &Config,
     secrets: &Secrets,
@@ -384,8 +387,14 @@ pub fn build_backend(
                 .as_deref()
                 .filter(|t| !t.is_empty())
                 .ok_or(ConfigError::NotLoggedIn)?;
-            let (backend, tokens) =
-                drive_backend(secrets.endpoints()?, token, paths, transfers, true)?;
+            let (backend, tokens) = drive_backend(
+                secrets.endpoints()?,
+                token,
+                secrets.client,
+                paths,
+                transfers,
+                true,
+            )?;
             Ok((AnyBackend::Drive(backend), Some(tokens)))
         }
     }
@@ -395,10 +404,12 @@ pub fn build_backend(
 /// vault creation). `cache`: true = the TokenProvider uses `paths.token_file()`; false = no
 /// cache file at all. `login` ALWAYS passes false (§2.6: an access token obtained while signing
 /// in must never reach token.json); every other command passes true. Honours the debug-only
-/// `GCLONE_TEST_DRIVE_*` switches of §7.1 (as `build_backend` does).
+/// `GCLONE_TEST_DRIVE_*` switches of §7.1 (as `build_backend` does). `client`: the OAuth client
+/// `refresh_token` belongs to (`Secrets::client`).
 pub fn drive_backend(
     ep: AuthEndpoints,
     refresh_token: &str,
+    client: AuthClient,
     paths: &Paths,
     transfers: usize,
     cache: bool,
@@ -408,6 +419,7 @@ pub fn drive_backend(
         http,
         ep,
         refresh_token.to_string(),
+        client,
         cache.then(|| paths.token_file()),
     ));
     let mut cfg = DriveConfig {

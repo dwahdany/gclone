@@ -91,11 +91,19 @@ detect_target() {
             ;;
         Darwin)
             os_part="apple-darwin"
-            # A shell that runs under Rosetta reports x86_64 on Apple silicon.
-            if [ "$arch" = "x86_64" ] &&
-                [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
-                arch="arm64"
-            fi
+            case "$arch" in
+                x86_64 | amd64)
+                    # A shell that runs under Rosetta reports x86_64 on Apple silicon.
+                    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+                        arch="arm64"
+                    else
+                        # The releases carry one macOS build, for Apple silicon.
+                        die "no prebuilt gclone for Intel Macs" \
+                            "The macOS build of a release is for Apple silicon (arm64) only." \
+                            "Build from source instead (README, \"Building from source\")."
+                    fi
+                    ;;
+            esac
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
             die "gclone does not run on Windows itself" \

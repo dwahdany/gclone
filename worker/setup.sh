@@ -1,7 +1,7 @@
 #!/bin/sh
 # One-time setup of the gclone auth Worker (README.md, "One-time setup"): deploy, the Google console checklist,
-# the four secrets, a final check. Interactive; run it yourself, once. Secrets go from your keyboard (or from
-# openssl) straight into `wrangler secret put` and into no file. The one file it can change is wrangler.jsonc, and
+# the three secrets, a final check. Interactive; run it yourself, once. Secrets go from your keyboard straight
+# into `wrangler secret put` and into no file. The one file it can change is wrangler.jsonc, and
 # only when you choose to serve the Worker from a host name of your own (scripts/custom-domain.mjs writes the
 # `routes` entry and turns the workers.dev host off - keep that change, every later deploy needs it).
 set -eu
@@ -65,7 +65,7 @@ if [ "${1:-}" = "--authorized-domain" ]; then
   exit 0
 fi
 
-for tool in node npm npx openssl curl; do
+for tool in node npm npx curl; do
   command -v "$tool" >/dev/null 2>&1 || die "'$tool' is needed but was not found"
 done
 
@@ -74,8 +74,8 @@ answers() { curl -fsS "$1/" 2>/dev/null | grep -q 'Status: '; }
 
 say "== 1/4  Deploy the Worker =="
 cat <<EOF
-Where will your devices reach the Worker? The URL goes into the Google client and into every device's login, so
-choosing now saves doing both twice.
+Where will your devices reach the Worker? The URL goes into the Google app's branding and into every device's
+login, so choosing now saves doing both twice.
   1) https://gclone-auth.<acct>.workers.dev - works at once. No rate-limiting rule can be put in front of it:
      anyone can use up the free plan's daily request quota and stop your logins until midnight UTC (README.md).
   2) A host name of your own, for example auth.example.org. Its domain (example.org) must already be a zone in
@@ -147,8 +147,8 @@ cat <<EOF
        Privacy policy:         $auth_url/privacy
   4. Audience -> Publish app.  The status must read "In production".
        Do NOT click "Submit for verification".
-  5. Clients -> Create client -> Application type: Web application
-       Authorized redirect URI:  $auth_url/callback      (exactly; no JavaScript origins)
+  5. Clients -> Create client -> Application type: TVs and Limited Input devices      (any name)
+       Nothing else to fill in: this client type has no redirect URI and no JavaScript origin.
        Copy the client ID and the client secret NOW - the secret is shown only once.
 
   (Workspace accounts may choose Audience "Internal" instead of External + Publish.)
@@ -157,14 +157,13 @@ say
 pause
 
 say
-say "== 3/4  The Worker's four secrets =="
+say "== 3/4  The Worker's three secrets =="
 ask client_id "Client ID: "
 ask_hidden client_secret "Client secret (not shown while you type): "
 say "Which Google accounts may sign in? Usually just yours. Several addresses: comma-separated."
 ask allowed_emails "Allowed e-mail address(es): "
 put_secret GOOGLE_CLIENT_ID "$client_id"
 put_secret GOOGLE_CLIENT_SECRET "$client_secret"
-put_secret SEAL_KEY "$(openssl rand -base64 32)"
 put_secret ALLOWED_EMAILS "$allowed_emails"
 unset client_secret
 

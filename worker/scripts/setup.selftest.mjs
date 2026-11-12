@@ -34,8 +34,20 @@ test("setup.sh is valid shell and settles the host name before the first deploy"
   // the host name is asked for, and written into wrangler.jsonc, before anything is deployed or registered at Google
   const asked = text.indexOf("node scripts/custom-domain.mjs");
   const deployed = text.indexOf("npx wrangler deploy");
-  const checklist = text.indexOf("Authorized redirect URI");
+  const checklist = text.indexOf("Application type: TVs and Limited Input devices");
   assert.ok(asked > 0 && asked < deployed && deployed < checklist, "order: choose the host, deploy, then the Google checklist");
   // with a host of one's own, that host is the auth URL of the checklist and of the final `gclone login` line
   assert.ok(text.includes('auth_url="https://$custom_host"'));
+});
+
+test("the checklist asks for a device-flow client and the script puts exactly the three secrets", () => {
+  const text = readFileSync(setup, "utf8");
+  // the device authorization grant: no redirect URI to register, no "Web application" client
+  assert.ok(!/Web application|Authorized redirect URI|\/callback/.test(text));
+  assert.deepEqual(
+    [...text.matchAll(/^put_secret ([A-Z_]+) /gm)].map((m) => m[1]),
+    ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "ALLOWED_EMAILS"],
+  );
+  // no sealing key any more, so nothing has to generate one
+  assert.ok(!/SEAL_KEY|openssl/.test(text));
 });

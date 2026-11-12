@@ -1,6 +1,8 @@
 //! Client of the auth Worker (SPEC §2.2–§2.4, §9.6) — owned by WP3. No Google OAuth endpoint
 //! is called from Rust except revoke.
 
+use serde::{Deserialize, Serialize};
+
 use crate::consts::{AUTH_HTTP_READ_TIMEOUT, HTTP_CONNECT_TIMEOUT};
 use crate::error::AuthError;
 
@@ -12,12 +14,30 @@ pub use token::TokenProvider;
 
 pub const SCOPE_DRIVE_FILE: &str = "https://www.googleapis.com/auth/drive.file";
 pub const GOOGLE_REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
-pub const PASTE_PREFIX: &str = "gclone-code1_";
 /// Compile-time default for the auth Worker URL (set when building one's own binary).
 pub const DEFAULT_AUTH_URL: Option<&str> = option_env!("GCLONE_DEFAULT_AUTH_URL");
 
+/// Which of the Worker's OAuth clients a refresh token belongs to (§2.3): the device says so on
+/// every `/refresh`. In `secrets.json` it is the `client` field, and a file without it — written
+/// by gclone before 0.2.0, whose login went through the Worker's "Web application" client — is
+/// `Legacy`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthClient {
+    #[default]
+    Legacy,
+    /// Every login since 0.2.0: Google's device authorization grant.
+    Device,
+}
+
+impl AuthClient {
+    pub fn is_legacy(&self) -> bool {
+        *self == AuthClient::Legacy
+    }
+}
+
 /// `base` = the validated auth Worker URL without a trailing slash; routes are appended
-/// (`/login`, `/token`, `/refresh`).
+/// (`/device/start`, `/device/poll`, `/refresh`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthEndpoints {
     pub base: String,
