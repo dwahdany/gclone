@@ -1,0 +1,13 @@
+# Rust build output (Cargo.lock IS committed)
+target/
+
+# auth Worker (worker/ has its own .gitignore for generated files)
+node_modules/
+.wrangler/
+
+# local state databases
+*.db
+*.db-wal
+*.db-shm
+
+.DS_Store

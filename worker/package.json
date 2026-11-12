@@ -1,0 +1,22 @@
+{
+  "name": "gclone-auth",
+  "version": "1.0.0",
+  "private": true,
+  "description": "gclone's auth Worker: the one OAuth client of one person's gclone devices",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node scripts/check-config.mjs && node --test scripts/check-config.selftest.mjs scripts/setup.selftest.mjs scripts/custom-domain.selftest.mjs && vitest run",
+    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.0.0",
+    "typescript": "^7.0.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.160.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

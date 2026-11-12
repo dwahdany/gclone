@@ -1,0 +1,7 @@
+# The compiler CI and the release binaries are built with (rustup reads this file; other
+# toolchains, e.g. from nix, ignore it). clippy runs with -D warnings, so a new compiler is a
+# deliberate change: bump the version here and fix what it finds in the same commit.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

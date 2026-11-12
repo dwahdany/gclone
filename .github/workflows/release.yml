@@ -1,0 +1,160 @@
+name: Release
+
+# A tag v<version> builds the binaries and publishes them as a GitHub Release:
+#   gclone-<target>.tar.gz (one file inside: gclone) for each target, and SHA256SUMS.
+# install.sh installs from exactly these names.
+#
+# The auth Worker URL is compiled in from the repository variable GCLONE_DEFAULT_AUTH_URL
+# (Settings → Secrets and variables → Actions → Variables). It is not a secret: it is readable
+# in the binary and printed by `gclone --version`. Unset or empty = binaries without a built-in
+# URL (`gclone login <AUTH_URL>`).
+#
+# Run by hand (workflow_dispatch) it builds and tests the same way and keeps the archives as
+# workflow artifacts, without publishing anything (also when the run is started on a tag).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: static musl binaries, each built and tested natively.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          # macOS: the runner is Apple silicon; the Intel build is a cross build.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The tag is the version in Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says version $version"
+            exit 1
+          fi
+
+      - name: Rust toolchain
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            # Every hosted image ships rustup today; this keeps the job alive if one stops.
+            curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          # The version comes from rust-toolchain.toml: the compiler CI tested with.
+          rustup toolchain install --no-self-update
+          rustup target add "$TARGET"
+          rustc --version
+          cargo --version
+
+      - name: musl C compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      # The test suite on the libc that ships (CI tests the glibc build). Not for the Intel
+      # macOS build, which this runner cannot be relied on to execute.
+      - name: Test
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo test --locked --target "$TARGET"
+
+      # profile.release strips the symbols (Cargo.toml: strip = "symbols").
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          GCLONE_DEFAULT_AUTH_URL: ${{ vars.GCLONE_DEFAULT_AUTH_URL }}
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Check and pack
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          bin="target/$TARGET/release/gclone"
+          file "$bin"
+          case "$TARGET" in
+            *-linux-musl)
+              # Static: it must not ask for a dynamic loader or a shared libc.
+              if file "$bin" | grep -q 'dynamically linked'; then
+                echo "::error::$bin is dynamically linked"
+                exit 1
+              fi
+              ;;
+          esac
+          if [ "$TARGET" != "x86_64-apple-darwin" ]; then
+            "$bin" --version
+            "$bin" --version | grep -F "($TARGET, "
+          fi
+          mkdir dist
+          tar -czf "dist/gclone-$TARGET.tar.gz" -C "target/$TARGET/release" gclone
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gclone-${{ matrix.target }}
+          path: dist/gclone-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish
+    # Only the push of a tag publishes; a run by hand never does, also not with a tag as its ref.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: gclone-*
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum gclone-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      # gh uploads to a draft and publishes it when every file is there: install.sh never sees
+      # a release without its files.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes dist/gclone-*.tar.gz dist/SHA256SUMS

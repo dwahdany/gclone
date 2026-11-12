@@ -1,0 +1,8 @@
+# For `wrangler dev` only: copy to .dev.vars (git-ignored) and fill in. The deployed Worker gets the same four
+# names with `wrangler secret put` — never from a file, and never as "vars" in wrangler.jsonc.
+GOOGLE_CLIENT_ID="000000000000-placeholder.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET="placeholder-client-secret"
+# 32 random bytes in base64: openssl rand -base64 32
+SEAL_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+# comma-separated Google account addresses; empty = nobody may sign in
+ALLOWED_EMAILS="you@example.com"
