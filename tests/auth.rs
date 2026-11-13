@@ -1039,7 +1039,11 @@ async fn refresh_maps_the_workers_answers() {
 }
 
 /// The transition of 0.2.0: a login made before it belongs to the Worker's legacy client, and
-/// the device says so by sending no `client` field.
+/// the device says so by sending no `client` field. An auth Worker of 0.2.0–0.3.x served such a
+/// login while it had the legacy secrets (the first two parts below). The Worker of 0.4.0
+/// never does — `/refresh` is the device client's alone, the old client is the hosted
+/// viewer's — and always answers as in the last part: "run `gclone login`" (the fixture cases
+/// `refresh_no_client` and `refresh_legacy_gone`).
 #[tokio::test]
 async fn a_legacy_login_refreshes_only_while_the_worker_keeps_the_legacy_client() {
     let fake = FakeDrive::start().await;
@@ -1563,7 +1567,7 @@ async fn concurrent_callers_share_one_refresh() {
 // The contract fixture worker/test/contract.json (§16.5)
 // ---------------------------------------------------------------------------------------------
 
-const GIVEN: [&str; 23] = [
+const GIVEN: [&str; 21] = [
     "none",
     "pending",
     "slow_down",
@@ -1580,8 +1584,6 @@ const GIVEN: [&str; 23] = [
     "refresh_revoked",
     "refresh_wide_scope",
     "legacy_token",
-    "legacy_unconfigured",
-    "legacy_half_set",
     "legacy_half_set_device_token",
     "client_broken",
     "google_down",
@@ -1589,7 +1591,41 @@ const GIVEN: [&str; 23] = [
     "unconfigured",
 ];
 
-const REQUIRED_CASES: [&str; 48] = [
+/// The states of the hosted viewer's cases (`/`, `/callback`, `/web/*`): the browser's part of
+/// the fixture. No device calls those routes and the fake auth Worker does not serve them, so
+/// this side only checks that such a case is well-formed; the Worker's own tests reproduce it.
+const WEB_GIVEN: [&str; 14] = [
+    "web",
+    "web_consented",
+    "web_other_verifier",
+    "web_foreign_code",
+    "web_consented_other_account",
+    "web_consented_wide_scope",
+    "web_consented_no_drive_scope",
+    "web_session",
+    "web_session_remembered",
+    "web_session_expired",
+    "web_session_other_key",
+    "web_session_revoked",
+    "web_session_removed",
+    "web_session_google_down",
+];
+
+/// A case of the hosted viewer — its page, or a route of its sign-in — or a request that a
+/// web page sends to a device route (it names where it comes from, which the gclone command
+/// never does; the Worker refuses it before its rate limiter counts it).
+fn browser_case(request: &Value) -> bool {
+    let path = request["path"].as_str().unwrap_or("");
+    let path = path.split('?').next().unwrap_or("");
+    let from_a_page = request["headers"].as_object().is_some_and(|headers| {
+        headers
+            .keys()
+            .any(|name| name == "origin" || name == "sec-fetch-site")
+    });
+    path == "/" || path == "/callback" || path.starts_with("/web/") || from_a_page
+}
+
+const REQUIRED_CASES: [&str; 46] = [
     "start_ok",
     "start_client_invalid",
     "start_upstream",
@@ -1619,9 +1655,10 @@ const REQUIRED_CASES: [&str; 48] = [
     "poll_malformed_code",
     "poll_get",
     "refresh_ok",
-    "refresh_legacy_ok",
-    "refresh_legacy_unconfigured",
-    "refresh_legacy_half_set",
+    // /refresh serves the device client only: a request without `"client": "device"` — a
+    // login from before 0.2.0 — is told to log in again, whatever the Worker has configured
+    "refresh_no_client",
+    "refresh_legacy_gone",
     "refresh_half_set_device_ok",
     "refresh_bad_client",
     "refresh_invalid_grant",
@@ -1633,9 +1670,9 @@ const REQUIRED_CASES: [&str; 48] = [
     "refresh_unconfigured",
     "refresh_get",
     "not_found",
-    // the routes of the browser sign-in before 0.2.0 are gone
+    // the routes of the browser sign-in before 0.2.0 are gone (`/callback` is the hosted
+    // viewer's page now: a browser case)
     "login_gone",
-    "callback_gone",
     "token_gone",
     // delivered beyond the required list
     "start_not_json",
@@ -1772,14 +1809,9 @@ async fn run_case(case: &Case) -> Result<Answered, String> {
     }
     if request_text.contains("<refresh_token>") {
         let token = match given {
-            "legacy_token" | "legacy_unconfigured" => {
-                fake.set_legacy_client(given == "legacy_token");
-                fake.add_legacy_token()
-            }
-            "legacy_half_set" => {
-                fake.set_legacy_client_half_set();
-                fake.add_legacy_token()
-            }
+            // A login from before 0.2.0. The Worker of 0.4.0 has the client that issued it (it
+            // is the hosted viewer's) and still does not serve it here: the fake as it starts.
+            "legacy_token" => fake.add_legacy_token(),
             _ => {
                 if given == "legacy_half_set_device_token" {
                     fake.set_legacy_client_half_set();
@@ -2033,7 +2065,7 @@ async fn check_client_mapping(name: String, route: Route, answered: Answered) {
 #[tokio::test]
 async fn contract_fixture_matches_the_fake_and_the_client() {
     let contract = contract();
-    assert_eq!(contract.version, 2);
+    assert_eq!(contract.version, 3);
 
     let names: Vec<&str> = contract.cases.iter().map(|c| c.name.as_str()).collect();
     let unique: std::collections::HashSet<&&str> = names.iter().collect();
@@ -2044,9 +2076,30 @@ async fn contract_fixture_matches_the_fake_and_the_client() {
         .collect();
     assert!(missing.is_empty(), "the fixture lacks {missing:?}");
 
-    // Every case against the fake's routes; every answer of a route through the client.
+    // Every device case against the fake's routes; every answer of a route through the client.
+    // The hosted viewer's cases are the browser's: checked for their shape only.
     let mut replays = Vec::new();
+    let mut browser_cases = 0;
     for case in &contract.cases {
+        if browser_case(&case.request) {
+            assert!(
+                GIVEN.contains(&case.given.as_str()) || WEB_GIVEN.contains(&case.given.as_str()),
+                "case {}: unknown given {:?}",
+                case.name,
+                case.given
+            );
+            serde_json::from_value::<WantedRequest>(case.request.clone())
+                .unwrap_or_else(|e| panic!("case {}: request: {e}", case.name));
+            serde_json::from_value::<WantedResponse>(case.response.clone())
+                .unwrap_or_else(|e| panic!("case {}: response: {e}", case.name));
+            browser_cases += 1;
+            continue;
+        }
+        assert!(
+            !WEB_GIVEN.contains(&case.given.as_str()),
+            "case {}: a state of the hosted viewer on a device route",
+            case.name
+        );
         let answered = run_case(case)
             .await
             .unwrap_or_else(|why| panic!("case {} (given {}): {why}", case.name, case.given));
@@ -2058,7 +2111,11 @@ async fn contract_fixture_matches_the_fake_and_the_client() {
         };
         replays.push(check_client_mapping(case.name.clone(), route, answered));
     }
-    assert!(replays.len() >= 44, "every case of a route is replayed");
+    assert!(replays.len() >= 43, "every case of a route is replayed");
+    assert!(
+        browser_cases >= 30,
+        "the hosted viewer's cases are in the fixture"
+    );
     futures_util::future::join_all(replays).await;
 }
 
@@ -2113,7 +2170,7 @@ async fn contract_runner_refuses_what_it_does_not_know_and_notices_wrong_answers
         .is_err()
     );
     assert!(
-        serde_json::from_value::<Contract>(json!({ "version": 2, "cases": [], "vector": {} }))
+        serde_json::from_value::<Contract>(json!({ "version": 3, "cases": [], "vector": {} }))
             .is_err()
     );
 

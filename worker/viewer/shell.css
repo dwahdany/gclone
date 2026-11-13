@@ -1,0 +1,172 @@
+/* gclone viewer — the screens around the file list: sign in, unlock, loading, signed out.
+   Loaded after app.css (the shared sheet of `gclone web`) and built on its variables and
+   controls, so that both viewers look like one. */
+
+.shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+  padding: 24px 16px 40px;
+  background: var(--panel);
+}
+/* The sheet sits a little above the middle, and scrolls when it is taller than the window. */
+.shell::before { content: ""; flex: 0 1 12vh; }
+
+.sheet {
+  flex: none;
+  width: min(460px, 100%);
+  padding: 28px 28px 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--bg);
+}
+
+.mark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 22px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.mark .i { width: 24px; height: 24px; color: var(--accent); }
+
+/* One screen at a time: the one the shell names. (In the markup every screen but the first
+   is `hidden`, and the shell keeps that attribute in step: without this sheet the page still
+   shows one screen, and never a passphrase field that nothing listens to.) */
+.screen { display: none; }
+.shell[data-screen="boot"] .screen[data-screen="boot"],
+.shell[data-screen="signin"] .screen[data-screen="signin"],
+.shell[data-screen="unlock"] .screen[data-screen="unlock"],
+.shell[data-screen="work"] .screen[data-screen="work"],
+.shell[data-screen="ask"] .screen[data-screen="ask"],
+.shell[data-screen="stop"] .screen[data-screen="stop"],
+.shell[data-screen="out"] .screen[data-screen="out"] { display: block; }
+
+/* The first screen says so when the page's script never took over: after ten seconds. */
+.late { margin: 14px 0 0; color: var(--muted); font-size: 12.5px; visibility: hidden; animation: late 0s linear 10s forwards; }
+@keyframes late { to { visibility: visible; } }
+
+.shell h1 { margin: 0 0 10px; font-size: 20px; font-weight: 600; line-height: 1.25; letter-spacing: -0.01em; }
+.shell .lead { margin: 0 0 18px; color: var(--muted); overflow-wrap: anywhere; }
+.shell a { color: var(--accent); text-underline-offset: 2px; }
+
+.shell .btn { width: auto; height: 40px; padding: 0 16px; justify-content: center; }
+.shell .btn.wide { width: 100%; }
+.shell .btn:disabled { opacity: 0.55; cursor: progress; filter: none; }
+
+.plain {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--muted);
+}
+.plain:hover { background: var(--hover); color: var(--text); }
+.plain .i { width: 18px; height: 18px; }
+
+.check { display: flex; align-items: flex-start; gap: 10px; margin: 14px 0 0; cursor: pointer; }
+.check input { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent); }
+.check .aside { color: var(--muted); }
+
+.notes {
+  margin: 22px 0 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--line);
+  list-style: none;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.notes li { position: relative; padding-left: 14px; overflow-wrap: anywhere; }
+.notes li + li { margin-top: 8px; }
+.notes li::before { content: ""; position: absolute; left: 2px; top: 0.62em; width: 4px; height: 4px; border-radius: 50%; background: var(--line); }
+@media (prefers-color-scheme: dark) { .notes li::before { background: #46505c; } }
+
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.foot .state { text-align: right; overflow-wrap: anywhere; }
+.foot .plain { margin-left: -10px; font-size: 14px; }
+
+.problem {
+  margin: 0 0 16px;
+  padding: 9px 14px;
+  border-radius: 10px;
+  background: var(--error-bg);
+  color: var(--error);
+  overflow-wrap: anywhere;
+}
+
+.facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 16px; margin: 0 0 18px; }
+.facts dt { color: var(--muted); white-space: nowrap; }
+.facts dd { overflow: hidden; text-overflow: ellipsis; white-space: pre; unicode-bidi: isolate; }
+
+.shell form, .shell fieldset { display: flex; flex-direction: column; }
+.shell fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.shell form .check { margin: -2px 0 14px; color: var(--muted); font-size: 12.5px; }
+.shell label[for] { margin: 0 0 5px; color: var(--muted); font-size: 12.5px; }
+.field {
+  width: 100%;
+  height: 40px;
+  margin: 0 0 14px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  outline: none;
+  font-size: 16px; /* a phone does not zoom into a field of this size */
+  -webkit-appearance: none;
+  appearance: none;
+}
+.field:hover { border-color: var(--muted); }
+.field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--selected); }
+/* The name a password manager files the passphrase under: shown, not edited. */
+.field.quiet { border-color: transparent; background: var(--panel); color: var(--muted); font: 13px var(--mono); }
+.field.quiet:hover, .field.quiet:focus { border-color: transparent; box-shadow: none; }
+.shell form .problem { margin: -2px 0 14px; }
+
+.cost { margin: 12px 0 0; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.cost:empty { display: none; }
+
+.waiting { display: flex; align-items: center; gap: 12px; margin: 6px 0; color: var(--muted); }
+.waiting span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.meter { height: 4px; margin: 16px 0 0; border-radius: 2px; background: var(--line); overflow: hidden; }
+.meter div { width: 0; height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.15s linear; }
+
+.choices { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+/* A choice may name an object: it wraps inside the sheet instead of running out of it. */
+.shell .choices .btn { max-width: 100%; height: auto; min-height: 40px; padding: 8px 16px; text-align: left; }
+.shell .choices .btn span { min-width: 0; overflow-wrap: anywhere; }
+.choices .btn.quiet { background: var(--panel); color: var(--text); border: 1px solid var(--line); }
+.choices.column { flex-direction: column; align-items: stretch; }
+.choices.column .btn { justify-content: flex-start; height: auto; min-height: 44px; padding: 8px 14px; text-align: left; font-weight: 500; }
+.choices .btn small { display: block; color: inherit; opacity: 0.75; font-weight: 400; }
+
+/* ---- what the shell adds to the file list ---------------------------------------------------- */
+
+.session { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.session .hint { margin-top: 10px; padding-top: 0; border-top: 0; }
+.session code { white-space: normal; overflow-wrap: anywhere; }
+.session-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.session-actions .btn { width: auto; padding: 0 14px; }
+.session-actions .btn span, .session-actions .plain span { display: inline; }
+
+@media (max-width: 719px) {
+  .shell { padding: 12px 12px 32px; }
+  .shell::before { flex-basis: 2vh; }
+  .sheet { padding: 22px 18px 20px; }
+  .shell .btn span { display: inline; }
+}

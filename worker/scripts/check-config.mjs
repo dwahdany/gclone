@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 // forbidden keys would have to know every binding type Cloudflare has or will have (`unsafe.bindings` alone can attach
 // any of them), and it is the unknown key that gives the Worker storage, another service to talk to, or a second
 // place where requests end up.
-const TOP_LEVEL = ["$schema", "name", "main", "compatibility_date", "compatibility_flags", "workers_dev", "preview_urls", "routes", "observability", "ratelimits"];
+const TOP_LEVEL = ["$schema", "name", "main", "compatibility_date", "compatibility_flags", "workers_dev", "preview_urls", "routes", "observability", "ratelimits", "assets"];
 const OBSERVABILITY = {
   "": ["enabled", "head_sampling_rate", "redact_query_string", "logs", "traces"],
   logs: ["enabled", "head_sampling_rate", "invocation_logs"],
@@ -16,10 +16,26 @@ const OBSERVABILITY = {
 };
 const ROUTE = ["pattern", "custom_domain", "zone_id", "zone_name"];
 const RATE_LIMIT = ["name", "namespace_id", "simple"];
+// The module the runtime loads: it exports the handler and nothing else.
+const MAIN = "src/entry.ts";
+// The hosted viewer's static files: read-only, uploaded with the Worker, changed only by a deploy. Not storage. The
+// whole object is fixed, key by key and value by value:
+//   - `/a/*` and `/sw.js` are answered by the asset layer and never run the Worker (they cost no Worker request and
+//     meet no rate limit); every other path runs the Worker first, which alone decides what it means — `/index.html`,
+//     `/_headers` and anything else in the directory are not reachable as files;
+//   - no HTML path rewriting and no single-page fallback: the asset layer does no routing of its own.
+export const ASSETS = {
+  directory: "./dist",
+  binding: "ASSETS",
+  run_worker_first: ["/*", "!/a/*", "!/sw.js"],
+  html_handling: "none",
+  not_found_handling: "none",
+};
 
-// Why the keys someone is most likely to add are refused. (No route carries a secret in its URL — device codes and
-// tokens travel in POST bodies — so the URL rules are a second line: nothing of a request is kept beyond the Worker's
-// own log line.) A key that is neither allowed nor listed here gets the general reason.
+// Why the keys someone is most likely to add are refused. (Device codes and tokens travel in POST bodies. One URL does
+// carry a secret: Google's redirect to /callback has the authorization code in its query — single-use, and useless
+// without the verifier in the browser tab — which is what the query-string rule is for. Nothing of a request is kept
+// beyond the Worker's own log line.) A key that is neither allowed nor listed here gets the general reason.
 const FORBIDDEN = {
   vars: "ALLOWED_EMAILS must be a secret only: a var of that name blocks `wrangler secret put` and is reset by every deploy",
   env: "wrangler environments are not used: an environment does not inherit bindings, so `wrangler deploy --env <name>` would deploy a Worker without the rate limiter",
@@ -36,7 +52,6 @@ const FORBIDDEN = {
   secrets_store_secrets: "the Worker's secrets are plain Worker secrets",
   pipelines: "the Worker has no storage",
   workflows: "the Worker has no storage",
-  assets: "the Worker serves no files",
   services: "the Worker has no service binding",
   dispatch_namespaces: "the Worker has no service binding",
   triggers: "the Worker has no cron trigger",
@@ -45,7 +60,7 @@ const FORBIDDEN = {
   logpush: "Logpush exports every request's metadata out of the account",
   destinations: "an observability destination exports logs or traces, with the request metadata attached to them, out of the account",
 };
-const NOT_ALLOWED = "only the keys the Worker needs are allowed; RATE_LIMIT is its only binding";
+const NOT_ALLOWED = "only the keys the Worker needs are allowed; RATE_LIMIT and the read-only ASSETS (the viewer's static files) are its only bindings";
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
@@ -88,6 +103,20 @@ export function problems(config) {
     found.push('"preview_urls" must be false: versioned preview hosts would keep old versions of the Worker reachable, outside any zone rule');
   }
 
+  if (config.main !== MAIN) {
+    found.push(`"main" must be ${JSON.stringify(MAIN)}: the module that exports the handler and nothing else`);
+  }
+
+  // Exactly the object above: nothing missing, nothing added, nothing changed.
+  if (!isObject(config.assets)) {
+    found.push(`"assets" must be ${JSON.stringify(ASSETS)}`);
+  } else {
+    only(config.assets, Object.keys(ASSETS), "assets");
+    for (const [key, value] of Object.entries(ASSETS)) {
+      if (JSON.stringify(config.assets[key]) !== JSON.stringify(value)) found.push(`"assets.${key}" must be ${JSON.stringify(value)}`);
+    }
+  }
+
   const limits = config.ratelimits;
   if (!Array.isArray(limits) || limits.length !== 1) {
     found.push('"ratelimits" must hold exactly one entry, the RATE_LIMIT binding');
@@ -105,8 +134,22 @@ export function problems(config) {
   return found;
 }
 
-/** wrangler.jsonc as this project writes it: JSON plus whole-line `//` comments. */
+/** wrangler.jsonc as this project writes it: JSON plus whole-line `//` comments, lines ending in a line feed.
+ *
+ *  What this reader drops as a comment must be what wrangler drops, or a key could sit where only wrangler sees it.
+ *  wrangler's reader ends a `//` comment at a line feed, at a carriage return, and at U+2028 and U+2029; a line here
+ *  ends at a line feed only. So a file with a carriage return that no line feed follows, or with one of the two
+ *  separators, is refused outright: `// note\r"kv_namespaces": […]` would be one comment line to this check and a
+ *  binding to wrangler — and most diff views draw it as one line too. */
 export function parseJsonc(text) {
+  const stray = /\r(?!\n)|[\u2028\u2029]/.exec(text);
+  if (stray !== null) {
+    const code = stray[0].codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+    const line = text.slice(0, stray.index).split("\n").length;
+    throw new Error(
+      `line ${line} holds U+${code} (${code === "000D" ? "a carriage return without a line feed" : "a Unicode line separator"}): wrangler ends a // comment there and this check does not, so the file must use plain line feeds`,
+    );
+  }
   return JSON.parse(
     text
       .split("\n")
@@ -128,5 +171,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     for (const p of found) console.error(`  - ${p}`);
     process.exit(1);
   }
-  console.log("check-config: wrangler.jsonc ok (only allowed keys; no URL query string in logs or traces, no export, no vars, no environments, RATE_LIMIT 30/60 s as the only binding, no preview hosts)");
+  console.log(
+    "check-config: wrangler.jsonc ok (only allowed keys; no URL query string in logs or traces, no export, no vars, no environments, RATE_LIMIT 30/60 s and the read-only ASSETS as the only bindings, the fixed asset routing, no preview hosts)",
+  );
 }

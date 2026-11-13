@@ -5,7 +5,9 @@
 //! dates go through `httpdate`, local time through `libc::localtime_r`.
 
 use base64::Engine as _;
+#[cfg(unix)]
 use std::io::{self, Write as _};
+#[cfg(unix)]
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,6 +140,7 @@ pub fn now_ns() -> i64 {
 /// Writes `bytes` to `path` atomically: a temp file in the same directory, opened
 /// `O_CREAT | O_EXCL | O_NOFOLLOW` and created with `mode` (never chmod-ed afterwards), then
 /// `fsync`, `rename`, `fsync` of the directory (§8.1).
+#[cfg(unix)]
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let name = path.file_name().ok_or_else(|| {
@@ -175,6 +178,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 
 /// `.<name>.tmp-`: what the temp files of `write_atomic` for a file called `name` start with;
 /// 16 lowercase hex digits follow.
+#[cfg(unix)]
 fn atomic_temp_prefix(name: &std::ffi::OsStr) -> std::ffi::OsString {
     let mut prefix = std::ffi::OsString::from(".");
     prefix.push(name);
@@ -187,6 +191,7 @@ fn atomic_temp_prefix(name: &std::ffi::OsStr) -> std::ffi::OsString {
 /// what was being written. Returns how many were removed; a missing directory is `Ok(0)`.
 /// The caller must know that no other process is writing `path` at this moment, or accept that
 /// such a write fails.
+#[cfg(unix)]
 pub fn remove_atomic_leftovers(path: &Path) -> io::Result<usize> {
     let Some(name) = path.file_name() else {
         return Ok(0);
@@ -229,6 +234,7 @@ pub fn remove_atomic_leftovers(path: &Path) -> io::Result<usize> {
 
 /// `mkdir -p` where every level this call creates gets mode 0700 **at creation**
 /// (`DirBuilder::mode`), not created and then tightened. Existing directories are left alone.
+#[cfg(unix)]
 pub fn create_dir_private(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -239,6 +245,7 @@ pub fn create_dir_private(path: &Path) -> io::Result<()> {
 
 /// §8.1 strict loading (used by `config::FileSecretStore` and `auth::TokenProvider`): true iff
 /// `md` is owned by the effective uid and has no group/other permission bits.
+#[cfg(unix)]
 pub fn is_private(md: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -308,6 +315,7 @@ pub fn group_thousands(n: u64) -> String {
 
 /// The short host name (up to the first `.`), `"unknown"` if it cannot be read. Default device
 /// name and the `host` field of segments.
+#[cfg(unix)]
 pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for `buf.len()` bytes; gethostname writes at most that many.
@@ -328,6 +336,7 @@ pub fn hostname() -> String {
 /// A stable machine identifier for the machine fingerprint (§5.3): `gethostuuid(2)` on macOS
 /// (16 bytes), the trimmed contents of `/etc/machine-id` on Linux, empty if unavailable. The
 /// hostname is deliberately not part of it.
+#[cfg(unix)]
 pub fn host_id() -> Vec<u8> {
     #[cfg(target_os = "macos")]
     {
@@ -505,6 +514,7 @@ pub fn format_utc_compact(ms: u64) -> String {
 
 /// `2026-11-11 10:14` in the local time zone (`ls -l`, `restore --list`). Falls back to UTC if
 /// the C library cannot convert the time.
+#[cfg(unix)]
 pub fn format_local_minute(ms: u64) -> String {
     // The type is `time_t`, taken from `localtime_r`'s signature instead of being named: the
     // libc crate marks the name deprecated on musl targets (its width there is to change on

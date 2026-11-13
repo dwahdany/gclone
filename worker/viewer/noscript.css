@@ -1,0 +1,5 @@
+/* gclone viewer — without script the page is its sign-in screen's text: what this site is,
+   and what it never asks for. Linked from a <noscript> element only. */
+.shell .screen { display: none !important; }
+.shell .screen[data-screen="signin"] { display: block !important; }
+.needs-script { display: none !important; }

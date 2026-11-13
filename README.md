@@ -21,6 +21,9 @@ rsync-style sync tool (`copy`, `sync`, `ls`, `cat`, …), not a mount.
   tenth, with or without a browser of its own — is then connected with one command and one
   short code entered at Google. File data flows
   device ↔ Google directly and never through the Worker.
+- The vault in a browser, two ways, both read-only: `gclone web` on a device that has gclone,
+  and — optional — a page served by your Worker that decrypts in the browser, for a phone or
+  a computer without gclone ([Browse from any browser](#browse-from-any-browser-the-hosted-viewer)).
 
 The design contract is the implementation spec, [`docs/SPEC.md`](docs/SPEC.md); section
 numbers such as "§2.9" below refer to it.
@@ -35,6 +38,11 @@ trusting it with data, work through the [day-0 checklist](#day-0-checklist-befor
 Tested on macOS (Apple silicon) and on Linux — the whole test suite and a two-device run of the
 release binary, on aarch64 and x86_64, in containers; not yet on a Linux machine of its own.
 Windows is not supported; inside WSL2 the Linux binary applies.
+
+The hosted viewer (0.4.0) is in the same state: built, and tested in desktop Chrome, WebKit
+and Firefox against a fake Google Drive and a fake of the Worker's sign-in — **never deployed,
+never run against the real Drive, never run on a phone**. Its own checklist for the first
+deployment is in [`worker/README.md`](worker/README.md#first-deployment-what-to-check).
 
 ## Install
 
@@ -57,7 +65,7 @@ it). To use your own auth Worker, pass its URL once: `gclone login https://<your
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.3.0` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.4.0` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`). If `~/.local/bin` is not on your `PATH`, the script says
 so and names the line to add and the file it goes into (on Debian and Ubuntu, logging in again
@@ -80,7 +88,7 @@ carry the one from the repository variable `GCLONE_DEFAULT_AUTH_URL`, so that `g
 needs no argument:
 
 ```
-gclone 0.3.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.4.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
 ```
 
 On Linux gclone uses the system's CA certificates (the `ca-certificates` package — present on
@@ -137,6 +145,15 @@ secret — it is readable in the binary — and without it the binaries simply h
 URL. `SHA256SUMS` guards against a damaged or swapped download, not against someone who can
 publish releases in the repository.
 
+The same run builds the hosted viewer's files, `gclone-viewer-<version>.tar.gz` (what the auth
+Worker serves as static files), in a job of its own that installs no npm package, and signs
+that tarball with a GitHub **build-provenance attestation**. The Worker's deploy scripts verify
+the attestation — not `SHA256SUMS` — before they use the bundle
+([`worker/README.md`, "Deploying the viewer"](worker/README.md#deploying-the-viewer)). The
+bundle is then tested in three browsers before anything is published; a failure there stops
+the whole release. Turn on the repository setting "immutable releases", so that a published
+file cannot be replaced.
+
 ## One-time setup
 
 Done **once per person, never per device**. You need a Google account, a Cloudflare account
@@ -156,6 +173,7 @@ version of this list, with troubleshooting by error code. The steps by hand:
 cd worker
 npm install
 npx wrangler login          # opens a browser: sign in to Cloudflare
+node scripts/stub-dist.mjs  # a placeholder for the web viewer's files, which wrangler uploads with the Worker
 npx wrangler deploy
 ```
 
@@ -205,9 +223,13 @@ needed. `ALLOWED_EMAILS` decides who may sign in — empty or missing means **no
 stay a secret and never become a `vars` entry in `wrangler.jsonc` (see `worker/README.md`).
 
 (Coming from gclone before 0.2.0, which signed in through a browser redirect and a "Web
-application" client? [`worker/README.md`, "Moving from the browser
-sign-in"](worker/README.md#moving-from-the-browser-sign-in-gclone-before-020) has the five
-steps; devices that are signed in keep working meanwhile.)
+application" client? A device that has not run `gclone login` since then has to do it once:
+the Worker of 0.4.0 no longer serves those logins. [`worker/README.md`, "Moving from the
+browser sign-in"](worker/README.md#moving-from-the-browser-sign-in-gclone-before-020) has the
+order to do it in — before the new Worker is deployed.)
+
+The hosted viewer needs three more secrets and a second OAuth client; it is optional and set
+up separately ([`worker/README.md`, "The hosted viewer: setup"](worker/README.md#the-hosted-viewer-setup)).
 
 ### 4. Check
 
@@ -499,6 +521,116 @@ ssh -t -L 8377:127.0.0.1:8377 nas gclone web --port 8377
 (`-t` gives the remote gclone a terminal, so that Ctrl-C and a closed connection end it; under
 SSH it prints the link and does not look for a browser.)
 
+### Browse from any browser (the hosted viewer)
+
+`gclone web` needs a device that is attached to the vault. The **hosted viewer** needs only a
+browser: a read-only page at your Worker's address, `https://<host>/`, for a phone or a
+computer without gclone. You sign in with Google, the password manager fills in the vault
+passphrase, and you get the same file browser as `gclone web` — folders, sorting, search over
+every name, previews (images, audio and video with seeking, text; a PDF opens in a tab of its
+own) and downloads of any size.
+
+It is optional and off until you set it up:
+[`worker/README.md`, "The hosted viewer: setup"](worker/README.md#the-hosted-viewer-setup).
+
+**How it works.** The page signs your browser in to Google with a redirect; the Worker keeps
+that sign-in sealed in a cookie that scripts cannot read, and hands the page a short-lived
+access token. With it the browser fetches **ciphertext** straight from Google Drive and
+decrypts it itself, with gclone's own read path compiled to WebAssembly. The Worker never
+sees a file, a name, the passphrase or a key. Nothing derived from the passphrase is stored
+anywhere: it is asked for on every page load, and the keys live in the tab's memory until you
+lock, reload or close it.
+
+**What you trust when you use it.** Without the hosted viewer, the Worker and Cloudflare
+reach ciphertext only. With it, **whoever serves the page — your Cloudflare account, the
+Worker's secrets, the domain — can serve a page that takes the passphrase, and with it every
+file.** No header, hash or integrity attribute changes that, because the same party serves
+them. What limits it:
+
+- The viewer's files are built by the release workflow, signed with a build-provenance
+  attestation, and the deploy scripts verify that before they upload anything. Afterwards
+  `verify-deployed` compares what the host serves with the release, from any machine, at any
+  time. That finds an accident, a stale deployment or a changed file — not a Worker that
+  answers one visitor differently.
+- A device that never opens the hosted viewer is exposed exactly as before.
+
+If you would rather not extend that trust, do not set the viewer up; `gclone web` over SSH
+([above](#browse-the-vault-in-your-browser)) covers a machine you can reach.
+
+The second thing you trust is the browser you use it in: an extension or anything else that
+runs script in the page can read every file while the vault is unlocked.
+
+**Three habits against phishing.** The viewer gives a web page a reason to ask for the vault
+passphrase, and that is new: a page that only *looks* like the viewer can get a Google token
+out of you with a device code (see "Login phishing" below) and then ask for the passphrase —
+which is everything. Three habits make that fail:
+
+1. **A web page never shows a code.** The viewer signs in with a redirect to Google and
+   nothing else. It never shows a code and never asks you to enter one at
+   `google.com/device`. Codes belong to a terminal in which you started `gclone login`; a web
+   page with a code is not gclone.
+2. **Let the password manager fill the passphrase — never type it into a web page.** The
+   passphrase field is a login field, so a password manager offers the passphrase on the real
+   address and not on a look-alike. If it stays silent, check the address.
+3. **Open the viewer from a bookmark or the home-screen icon**, with `https://`, never from a
+   link in a message.
+
+**Where to save the passphrase.** In a password manager that Google cannot read: iCloud
+Keychain, a separate manager, or Google Password Manager with on-device encryption turned
+on. If the browser offers to save it into a Google account with standard encryption (Chrome
+signed in to the same account that holds the vault), decline — Google would then hold the
+ciphertext, the keyfile and the passphrase, and "Google learns no names and no contents"
+would no longer be true. The viewer cannot see or stop that offer; its unlock screen says the
+same.
+
+**Locking and signing out.** The Lock button forgets the keys, in every tab of the viewer
+that is open in that browser; so do, for each tab by itself, 15 minutes without input and 5
+minutes in the background (by the clock, so a phone that was put away comes back at the
+passphrase screen), and any reload. A session lasts 12 hours, or 30 days with "Stay signed
+in" — tick that on your own devices only. "Sign out" ends the viewer's session, clears what
+the page kept and takes every other tab of the viewer to the sign-in screen; it does **not**
+sign the browser out of Google, so on a computer that is not yours sign out of Google as
+well (the signed-out screen links to it). **A file that you opened in a tab of its own** —
+a PDF (the only way the viewer shows one), or an image or text through "Open in a new tab" —
+**has left the viewer: it stays on the screen after Lock and after Sign out. Close that tab
+yourself.** To end
+every browser session at once — a lost phone — put a new `SEAL_KEY` on the Worker
+(`worker/README.md`, "Operating it"); devices are not affected.
+
+**Limits.**
+
+- Read-only, like `gclone web`: no upload, rename, delete or restore. (The Google token the
+  page holds *could* overwrite or trash ciphertext — Google has no read-only form of
+  `drive.file`; that the viewer never does is a property of its code.)
+- Every visit is a fresh device: the viewer trusts the vault state it is served and cannot
+  notice a rollback between visits. The info panel shows the **head fingerprint**; compare
+  it with `gclone status` on a device when it matters.
+- The index is downloaded on every unlock and kept in memory: measured to 100,000 files
+  (15 MB per visit, about 100 MiB of memory). Above 64 MiB of index the viewer asks before
+  it loads; much larger vaults may not open on a phone.
+- The unlock itself needs 256 MiB of memory for a moment (the keyfile's Argon2id). Whether
+  your phone can do that repeatedly is what
+  [the phone test](worker/README.md#the-phone-test-15-minutes) answers — it has not been
+  run yet.
+- A download streams through the tab: it needs the viewer's tab to stay open, and on a phone
+  in the foreground. Whole-file hashes are not checked for streamed downloads; every chunk
+  is authenticated, so a wrong, missing or reordered byte still fails the download (as with
+  `gclone cat` into a pipe).
+- A PDF is not shown inside the viewer's page but in a tab of its own, behind an "Open"
+  button: a link in a PDF would otherwise take the unlocked viewer's tab to an address of the
+  file's choosing with one click. Audio and video have no "Open in a new tab".
+- No file name goes into the browser's history: the address and the title never carry one,
+  and a file in a tab of its own is titled by a random id. A file you **download** is in the
+  browser's download list under its name, as any download.
+- A refresh downloads at most 64 MiB of new index without asking; beyond that it says so,
+  and the next unlock asks.
+- It needs a browser with Service Workers (current Chrome, Firefox, Safari, also on iOS; not
+  some private-browsing modes). Without one the viewer says so and stops.
+- The viewer signs in through a second OAuth client. Whether Google shows that login the
+  vault that `gclone login` created is not verified yet — the first deployment tells.
+- Devices that signed in before gclone 0.2.0 must run `gclone login` once (see the one-time
+  setup).
+
 ### Using a vault without Google
 
 `gclone login --vault-dir DIR` uses a local directory as the store — no Google account, no
@@ -541,7 +673,8 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   comparison at `login` is for. Deletion is a denial of service: detected, not prevented.
 - **The auth Worker / Cloudflare** sees the OAuth client secret and the refresh and access
   tokens that pass through it, so it has the same reach as Google and no more: ciphertext and
-  deletion. It never sees the passphrase, the master key or any file data. It is stateless and
+  deletion. It never sees the passphrase, the master key or any file data — **as long as you
+  do not use the hosted viewer**, whose page it serves (the hosted-viewer bullet below). It is stateless and
   only lets the Google accounts in `ALLOWED_EMAILS` sign in. The app's Google scope is
   `drive.file`: it can only touch files it created itself, not the rest of your Drive. The
   Worker enforces that: it asks Google for nothing else, and it hands out no token for a grant
@@ -559,7 +692,19 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   now** — nobody ever has a reason to send you one. If it happens anyway, the attacker's login
   reaches what every gclone login reaches: ciphertext, which it could trash (restorable for 30
   days) but not read. Remove the app at <https://myaccount.google.com/permissions> and sign
-  in again. Details: [`docs/AUTH.md`](docs/AUTH.md).
+  in again. Details: [`docs/AUTH.md`](docs/AUTH.md). With the hosted viewer set up the stakes
+  are higher — a fake page can ask for the passphrase as well — and the rule gains a second
+  half: **a web page never shows a code, and the passphrase is filled by the password
+  manager, not typed** ([the three habits](#browse-from-any-browser-the-hosted-viewer)).
+- **The hosted viewer** moves the decryption into a browser, and the page that does it is
+  served by the Worker: whoever controls the Worker, its secrets or the domain can take the
+  passphrase from anyone who uses it. That is accepted, optional, and limited by a signed
+  release bundle that the deployed files can be compared with. In the browser the keys exist
+  in memory only; the long-lived Google credential is sealed in a cookie that scripts cannot
+  read; file names stay out of the address, the title and the history; vault files are
+  served as untrusted content exactly as in `gclone web`. See
+  [Browse from any browser](#browse-from-any-browser-the-hosted-viewer) and §1.3 and §7.5 of
+  the spec.
 - **The browser view** (`gclone web`) serves plaintext, so it is locked down: loopback only,
   every request needs the session that a one-time link hands out (the link never appears on
   a command line, the cookie is not sent to other local servers), foreign `Host` names and
@@ -578,6 +723,12 @@ stays visible to the app after a revoke and a new sign-in is unverified (day-0 r
 web download of the vault folder first. The thief still holds the master key the device had
 cached: data it could already download stays exposed, because re-keying is not implemented.
 
+A lost phone or laptop that was only **signed in to the hosted viewer** holds no key — the
+viewer stores none, and it locks by the clock. What it holds is a session: ciphertext and the
+keyfile, until the session's end. Put a new `SEAL_KEY` on the Worker to end every browser
+session at once. If that browser's password manager had the passphrase saved and the device
+can be unlocked, treat it like the stolen device above.
+
 ## Limitations
 
 - **Never run against the real services** (see Status). The Drive wire format, quota
@@ -589,9 +740,12 @@ cached: data it could already download stays exposed, because re-keying is not i
 - `gclone web` is a viewer, not a file manager: read-only, no thumbnails, no list of deleted
   files (`gclone restore --list` has it), and what the browser cannot show (HEIC outside
   Safari, most video containers) is a download. A folder cannot be bookmarked or opened in a
-  second tab (the address is always the same, on purpose). Its page was checked in Chrome
-  only; on Linux, a browser installed as a snap or flatpak may not be able to read the file
+  second tab (the address is always the same, on purpose). Its page is tested in Chrome,
+  WebKit and Firefox on macOS; on Linux, a browser installed as a snap or flatpak may not be able to read the file
   gclone hands it — press Enter (or use `--no-browser`) and paste the link.
+- The hosted viewer has limits of its own — vault size, memory on a phone, downloads that
+  need the tab, no rollback detection between visits:
+  [Browse from any browser](#browse-from-any-browser-the-hosted-viewer).
 - `copy` / `sync` work on **directories** — a single file cannot be the source or the
   destination (use `cat` to fetch one file). There is no two-way sync in one command: run
   `sync` up and then down, or use `copy` in both directions. A `sync` in one direction only
@@ -711,13 +865,15 @@ verified by any automated test (§2.9). After the one-time setup:
 | ☐ | 1 | Publish the app (client of type *TVs and Limited Input devices*) with `openid email drive.file`: no verification, no warning screen; the Worker-hosted home and privacy pages are accepted; once published, `gclone login` does **not** report a time-limited login (in Testing it does). | Setup text changes; a login that expires weekly is not an acceptable resting state. `login` detects the Testing case itself. |
 | ☐ | 2 | Two devices, two logins of the same account: both keep working side by side, and device 2 discovers and reads the vault device 1 created. | The design depends on it. No fallback short of sharing one token. |
 | ☐ | 3 | `gclone logout --revoke` on device 2: is device 1 signed out too (documented: yes)? After a new `gclone login`: is the vault listed again? **Keep a web download of the vault folder before trying.** | Revoke is per token after all → make it the default of `logout`. Files not visible after re-consent → the lost-device procedure must go through web download + `--vault-dir`. |
-| ☐ | 4 | A second OAuth client in the same Cloud project sees the files the first one created — in particular the device-flow client of 0.2.0 after a vault was created through the "Web application" client of 0.1.0 (`gclone login` on such a device: "Signed in again … Vault unchanged."). | `gclone login` reports it and changes nothing; the legacy secrets stay on the Worker, or the vault is moved (`worker/README.md`, "Moving from the browser sign-in"). The "Worker cannot authenticate" recovery must use a web download. |
+| ☐ | 4 | A second OAuth client in the same Cloud project sees the files the first one created — the hosted viewer's "Web application" client after a vault was created through the device client (the viewer finds the vault), and the device client after a vault was created through the "Web application" client of 0.1.0 (`gclone login` on such a device: "Signed in again … Vault unchanged."). | The hosted viewer cannot be used with that vault. For a login from before 0.2.0: `gclone login` reports it and changes nothing; the vault is moved while a Worker older than 0.4.0 is still deployed (`worker/README.md`, "Moving from the browser sign-in"). The "Worker cannot authenticate" recovery must use a web download. |
 | ☐ | 5 | The first real `gclone login` succeeds: Google's device-code endpoint accepts the client with `openid email drive.file` (verified 2026-11-12), and the token answer after the consent carries an **ID token** with the verified e-mail address and a refresh token, with a `scope` that holds nothing but `openid`, `email` / `…/auth/userinfo.email` and `…/auth/drive.file`. | No ID token → every login ends right after the approval with "Sign-in was not completed (Google approved the sign-in, but its answer carried no ID token …)" — the Worker's `403 grant_unusable`; it fails closed, because it cannot apply the allowlist. The Worker then has to ask Google's userinfo endpoint instead. Login refused with `scope_not_allowed` naming a harmless scope → Google spells a granted scope differently; add it to `ALLOWED_SCOPES` in `worker/src/google.ts`. |
 | ☐ | 7 | Sustained create rate; does session initiation count against it? | Tune the pack size and the pacer's start rate. |
 | ☐ | 11 | A trashed file is still downloadable by ID. | Affects self-heal wording only. |
 
 The first real `gclone login` on two devices answers rows 1, 2 and 5. Repeat the checklist
-after any Google policy change.
+after any Google policy change. The hosted viewer has a checklist of its own for its first
+deployment, and a fifteen-minute test for the phone:
+[`worker/README.md`](worker/README.md#first-deployment-what-to-check).
 
 ## Development
 
@@ -727,15 +883,26 @@ cargo clippy --locked --all-targets
 cargo fmt --check
 cd worker && npm ci && npm run typecheck && npm test
 sh tests/install/test.sh             # install.sh against a fake release and a fake GitHub (python3, curl)
+
+# the hosted viewer (needs the wasm target and wasm-bindgen: web-core/README.md)
+sh web-core/build.sh                 # the read path as WebAssembly → web-core/pkg/
+sh web-core/test/run.sh              # … against vaults written by the native binary (cargo build --release first)
+cd worker && npm run viewer:build && npm run smoke && npm run test:viewer
+cd worker && npm run test:browser    # Chrome, WebKit, Firefox (worker/viewer/README.md)
 ```
 
 `.github/workflows/ci.yml` runs all of it on every push to `main` and on pull requests, the
 Rust part on Linux and on macOS, with the Rust version pinned in `rust-toolchain.toml` (clippy
-runs with `-D warnings`: bump the version deliberately). The workflows pin every action to a
+runs with `-D warnings`: bump the version deliberately). The browser suite runs on macOS only
+(Playwright's WebKit there is the one whose media stack matches Safari), with the installed
+Google Chrome, on the bundle that the Linux job built. The workflows pin every action to a
 commit; `.github/dependabot.yml` proposes the updates.
 
 (With nix: `nix-shell -p cargo rustc clippy rustfmt --run '…'` and
-`nix-shell -p nodejs --run '…'`.)
+`nix-shell -p nodejs --run '…'`; for the wasm build
+`nix-shell -p cargo rustc lld wasm-bindgen-cli nodejs --run 'sh web-core/build.sh'` — a
+development build: nixpkgs' compiler is not the pinned one, and the bundle's manifest says
+so.)
 
 - `Cargo.lock` is committed; build with `--locked`. Dependencies are compiled with
   `opt-level = 3` in dev and test builds too: the keyfile KDF is Argon2id at 256 MiB.
@@ -752,6 +919,13 @@ commit; `.github/dependabot.yml` proposes the updates.
   `GCLONE_LIVE=mem` rehearses the same code against an in-memory backend (no network).
 - The Worker's tests need no account, no secrets and no network; see `worker/README.md`,
   "Development".
+- `web-core/` is a crate of its own (own workspace, own lockfile) that compiles the main
+  crate's source files a second time, for `wasm32-unknown-unknown`. The CLI's `Cargo.toml`,
+  `Cargo.lock` and release build do not know it. After a version bump or a dependency change
+  in the root, regenerate `web-core/Cargo.lock` (`cargo check` in `web-core/`);
+  `web-core/build.sh` fails when the two lockfiles disagree.
+- The viewer's browser tests use `playwright-core`, pinned in `worker/test/e2e/package.json`
+  — kept out of `worker/package.json`, which is the Worker's deploy toolchain.
 
 ### Repository layout
 
@@ -760,7 +934,9 @@ Cargo.toml, Cargo.lock      manifest and committed lock file
 build.rs                    hands the target triple to `gclone --version`
 install.sh                  installer of the released binaries (tests: tests/install/)
 rust-toolchain.toml         the Rust version of CI and of the release binaries (for rustup)
-.github/workflows/          ci.yml (fmt, clippy, tests, Worker, install.sh), release.yml (binaries on a tag)
+.github/workflows/          ci.yml (fmt, clippy, tests, Worker, install.sh, the wasm core, the viewer and its
+                            browser suite), release.yml (binaries and the attested viewer bundle on a tag)
+.github/scripts/            install-wasm-bindgen.sh: the command in the lockfile's version
 .github/dependabot.yml      keeps the pinned actions current
 docs/SPEC.md                the implementation spec (design contract, errata in §17)
 src/lib.rs, src/main.rs     module declarations; main → cli::run
@@ -772,11 +948,18 @@ src/auth/                   client of the auth Worker (login, token refresh)
 src/state/, src/index/      SQLite replica; journal, merge, refresh, commit, repair
 src/transfer/               upload pipeline (packing), downloads, ranged reads
 src/sync/                   scan, planner, executor, remote-only commands, gc, check
-src/web/                    `gclone web`: the loopback HTTP server, and its page in assets/ (no build step)
+src/web/                    `gclone web`: the loopback HTTP server, and its page in assets/ (no build step);
+                            rules.rs: what both viewers answer identically (order, search, JSON shapes, ranges)
+web-core/                   the read path for the hosted viewer: a crate of its own that includes src/ files by
+                            path and builds to WebAssembly (build.sh → pkg/); tests against the native binary
 src/config.rs, src/cli/     local configuration; one file per command
 tests/                      integration tests; cli_e2e.rs and web.rs drive the binary, live.rs is opt-in
 tests/support/              seeded PRNG for property tests, the fake Google Drive + auth Worker
 worker/                     the auth Worker (TypeScript); see worker/README.md
+worker/viewer/              the hosted viewer's browser app (plain scripts) and build.mjs → worker/dist/
+worker/scripts/             check-config, check-dist, the release tooling (release-bundle, fetch-viewer,
+                            check-release, verify-deployed), smoke
+worker/test/e2e/            the viewer in three browsers: fake Drive, fixture vault, media fixtures
 ```
 
 ## Licence and warranty

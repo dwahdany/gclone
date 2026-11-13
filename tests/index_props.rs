@@ -3719,6 +3719,74 @@ async fn devices_are_listed_with_their_names_and_times() {
     assert_eq!(s.last_change_by.as_deref(), Some("c"));
 }
 
+/// A snapshot carries only when each device joined (`first_ms`). A replica that takes one for
+/// its base — by writing it, by adopting it, or by starting from it — records that the
+/// snapshot's writer was alive at the snapshot's time; otherwise a replica that starts from a
+/// snapshot would name the device that joined last, at the time it joined, as the last change.
+#[tokio::test]
+async fn the_last_change_survives_a_snapshot_on_every_replica() {
+    let (w, a) = world().await;
+    a.commit_ops(vec![put("one", 1)]).await.unwrap();
+    w.mem.advance_ms(60_000);
+    // `b` joins — the device that joined last — and never writes again.
+    let b = w.join("b").await;
+    b.commit_ops(vec![put("from-b", 2)]).await.unwrap();
+    let b_joined = b.backend().now_ms();
+    w.mem.advance_ms(120_000);
+    // The last change is `a`'s, later; then `a` writes a snapshot that covers everything.
+    a.refresh().await.unwrap();
+    a.commit_ops(vec![put("two", 3)]).await.unwrap();
+    w.mem.advance_ms(60_000);
+    a.write_snapshot().await.unwrap();
+    let written = a.backend().now_ms();
+    assert!(written > b_joined);
+    w.mem.advance_ms(60_000);
+
+    // `b` applied the segments itself and adopts the snapshot; `c` starts from it (the
+    // segments it covers are gone, as they are a week after a compaction).
+    assert!(b.refresh().await.unwrap().adopted.is_some());
+    for s in w.listed("s-") {
+        w.net.trash(&s.handle).await.unwrap();
+    }
+    let c = w.device("c").await;
+    assert!(c.refresh().await.unwrap().rebuilt_from.is_some());
+    for (v, what) in [
+        (&a, "wrote it"),
+        (&b, "adopted it"),
+        (&c, "started from it"),
+    ] {
+        let s = v.stats(0).unwrap();
+        assert_eq!(
+            (s.last_change_by.as_deref(), s.last_change_ms),
+            (Some("a"), Some(written)),
+            "{what}"
+        );
+        let seen: Vec<(String, u64)> = v
+            .devices()
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.last_ms))
+            .collect();
+        assert!(
+            seen.contains(&("a".to_owned(), written)),
+            "{what}: {seen:?}"
+        );
+    }
+    // A snapshot written by a device that is not registered (it never committed anything)
+    // has no device to raise: a replica that starts from it knows the join times only.
+    let d = w.device("d").await;
+    d.refresh().await.unwrap();
+    w.mem.advance_ms(60_000);
+    d.write_snapshot().await.unwrap();
+    let e = w.device("e").await;
+    assert!(e.refresh().await.unwrap().rebuilt_from.is_some());
+    let s = e.stats(0).unwrap();
+    assert_eq!(
+        (s.last_change_by.as_deref(), s.last_change_ms),
+        (Some("b"), Some(b_joined))
+    );
+}
+
 #[tokio::test]
 async fn a_state_directory_of_another_vault_is_refused() {
     let (w, a) = world().await;

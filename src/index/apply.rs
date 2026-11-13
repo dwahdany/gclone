@@ -326,6 +326,18 @@ impl HeadStore for MemIndex {
     }
 }
 
+/// The format gate of a snapshot (§3.3 "unknown version anywhere → fail closed"): a snapshot
+/// that carries the state of a vault of a newer format is refused before anything of it is
+/// used. The one copy of that comparison: the replica (`refresh::load_snapshot`) and the hosted
+/// viewer's core both ask here. The gate of a segment — a `VaultInit` of a newer format — is in
+/// [`apply_segment`].
+pub fn check_snapshot_format(snap: &SnapshotV1) -> Result<(), IndexError> {
+    if snap.vault_format > SUPPORTED_FORMAT {
+        return Err(IndexError::NeedsNewerGclone);
+    }
+    Ok(())
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct ApplyStats {
     pub puts: u64,
@@ -447,4 +459,74 @@ pub fn causal_order(
     }
     let blocked = (0..segs.len()).filter(|&i| !applicable[i]).collect();
     (order, blocked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(vault_format: u16) -> SnapshotV1 {
+        SnapshotV1 {
+            vault_id: [1; 16],
+            device: DeviceId([2; 8]),
+            lamport: 3,
+            created_ms: 4,
+            vault_format,
+            vault_name: "vault".into(),
+            covers: Vec::new(),
+            covered: Vec::new(),
+            devices: Vec::new(),
+            blobs: Vec::new(),
+            heads: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_of_a_newer_vault_format_is_refused() {
+        // 0: a snapshot written before any `VaultInit` was applied.
+        for readable in [0, SUPPORTED_FORMAT] {
+            assert!(check_snapshot_format(&snapshot(readable)).is_ok());
+        }
+        // Format 2 and everything after it: fail closed.
+        for newer in [SUPPORTED_FORMAT + 1, 2, u16::MAX] {
+            assert!(matches!(
+                check_snapshot_format(&snapshot(newer)),
+                Err(IndexError::NeedsNewerGclone)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_segment_with_a_newer_vault_init_is_refused_before_anything_is_written() {
+        let segment = |format: u16| SegmentV1 {
+            vault_id: [1; 16],
+            device: DeviceId([2; 8]),
+            seq: 1,
+            lamport: 1,
+            created_ms: 5,
+            host: "host".into(),
+            prev: None,
+            seen: Vec::new(),
+            ops: vec![
+                Op::Device {
+                    id: DeviceId([2; 8]),
+                    name: "laptop".into(),
+                },
+                Op::VaultInit {
+                    format,
+                    name: "vault".into(),
+                },
+            ],
+        };
+        let mut index = MemIndex::default();
+        assert!(matches!(
+            apply_segment(&mut index, &segment(SUPPORTED_FORMAT + 1), 9),
+            Err(IndexError::NeedsNewerGclone)
+        ));
+        assert_eq!(index, MemIndex::default());
+        apply_segment(&mut index, &segment(SUPPORTED_FORMAT), 9).unwrap();
+        assert_eq!(index.vault(), (SUPPORTED_FORMAT, "vault"));
+        assert_eq!(index.devices().len(), 1);
+    }
 }

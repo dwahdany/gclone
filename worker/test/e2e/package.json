@@ -1,0 +1,8 @@
+{
+  "name": "gclone-viewer-e2e",
+  "private": true,
+  "description": "The browser driver of the hosted viewer's end-to-end tests. Kept out of ../../package.json on purpose: that one is the Worker's build and deploy toolchain, and nothing a deployment does not need belongs in it.",
+  "devDependencies": {
+    "playwright-core": "1.65.0"
+  }
+}

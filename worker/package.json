@@ -2,12 +2,19 @@
   "name": "gclone-auth",
   "version": "1.0.0",
   "private": true,
-  "description": "gclone's auth Worker: the Google sign-in of one person's gclone devices",
+  "description": "gclone's auth Worker: the Google sign-in of one person's gclone devices and of the hosted viewer",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "test": "node scripts/check-config.mjs && node --test scripts/check-config.selftest.mjs scripts/setup.selftest.mjs scripts/custom-domain.selftest.mjs && vitest run",
+    "dist": "node scripts/stub-dist.mjs",
+    "dev": "node scripts/stub-dist.mjs && wrangler dev --upstream-protocol https",
+    "viewer:build": "sh ../web-core/build.sh && node viewer/build.mjs && node scripts/check-dist.mjs",
+    "viewer:check": "node scripts/check-dist.mjs",
+    "deploy": "node scripts/check-config.mjs && node scripts/check-release.mjs && wrangler deploy",
+    "deploy:dev": "node scripts/check-config.mjs && node scripts/stub-dist.mjs && node scripts/check-dist.mjs --not-a-release && wrangler deploy",
+    "test": "node scripts/check-config.mjs && node scripts/stub-dist.mjs && node --test scripts/check-config.selftest.mjs scripts/stub-dist.selftest.mjs scripts/check-dist.selftest.mjs scripts/release-bundle.selftest.mjs scripts/setup.selftest.mjs scripts/custom-domain.selftest.mjs && vitest run",
+    "test:viewer": "node --test test/viewer/token.node.mjs test/viewer/drive.node.mjs test/viewer/loader.node.mjs",
+    "test:browser": "node test/e2e/run.mjs chrome webkit firefox && node test/e2e/signin.mjs && node test/e2e/local.mjs chrome webkit firefox",
+    "smoke": "node scripts/smoke.mjs",
     "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
   },
   "devDependencies": {

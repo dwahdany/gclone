@@ -559,8 +559,8 @@ fn not_visible_hint(e: anyhow::Error, login: Option<&Login>) -> anyhow::Error {
     } else {
         let kept = if login.replaces_legacy {
             "Nothing was changed: this device keeps its previous login, which goes on working \
-             as long as the auth Worker has its GOOGLE_LEGACY_CLIENT_ID and \
-             GOOGLE_LEGACY_CLIENT_SECRET secrets."
+             only while the deployed auth Worker is older than gclone 0.4.0 and has its \
+             GOOGLE_LEGACY_CLIENT_ID and GOOGLE_LEGACY_CLIENT_SECRET secrets."
         } else {
             "Nothing was changed on this device, and the new sign-in was not kept."
         };
@@ -571,8 +571,8 @@ fn not_visible_hint(e: anyhow::Error, login: Option<&Login>) -> anyhow::Error {
              vault's files to this login — they were created through another OAuth client \
              (the browser sign-in of gclone before 0.2.0, or another Cloud project), or the \
              app was removed and approved again. See \"Moving from the browser sign-in\" in \
-             worker/README.md for the ways out (keep the legacy secrets on the Worker, or move \
-             the vault); the last resort is to download the vault folder from \
+             worker/README.md for the ways out (move the vault while an auth Worker older than \
+             0.4.0 is still deployed); the last resort is to download the vault folder from \
              drive.google.com, unzip it, and run `gclone logout --forget`, then `gclone login \
              --vault-dir DIR`."
         )

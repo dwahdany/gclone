@@ -38,6 +38,9 @@ test("setup.sh is valid shell and settles the host name before the first deploy"
   assert.ok(asked > 0 && asked < deployed && deployed < checklist, "order: choose the host, deploy, then the Google checklist");
   // with a host of one's own, that host is the auth URL of the checklist and of the final `gclone login` line
   assert.ok(text.includes('auth_url="https://$custom_host"'));
+  // wrangler refuses to deploy without the assets directory: the placeholder is written right before the deploy
+  const placeholder = text.indexOf("node scripts/stub-dist.mjs");
+  assert.ok(placeholder > asked && placeholder < deployed, "order: the placeholder dist/, then the deploy");
 });
 
 test("the checklist asks for a device-flow client and the script puts exactly the three secrets", () => {

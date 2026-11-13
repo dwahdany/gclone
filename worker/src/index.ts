@@ -1,6 +1,10 @@
-// gclone's auth Worker: the OAuth clients of one person's gclone devices, and the only holder of their secrets.
-// Stateless: a login is Google's device authorization grant (RFC 8628) — Google keeps the pending login, the device
-// carries its device code from /device/start to /device/poll, and nothing is stored here.
+// gclone's auth Worker: the OAuth clients of one person's gclone, and the only holder of their secrets. Stateless.
+//   - A device logs in with Google's device authorization grant (RFC 8628): Google keeps the pending login, the device
+//     carries its device code from /device/start to /device/poll, and /refresh turns its refresh token into access tokens.
+//   - The hosted viewer's page signs in with the authorization-code flow and PKCE (web.ts): the browser keeps the
+//     refresh token, sealed, in an HttpOnly cookie.
+// Nothing is stored here. The viewer's static files (/a/<build>/*, /sw.js) are served by the asset layer and never
+// reach this code (wrangler.jsonc, "assets").
 
 import {
   DEVICE_CODE_RE,
@@ -12,80 +16,110 @@ import {
   excessScopes,
   grantUnusable,
   idTokenClaims,
-  maskedEmail,
   pollDeviceCode,
   refreshAccessToken,
   requestDeviceCode,
   revokeToken,
   type Clients,
-  type GoogleFailure,
 } from "./google";
-import { homePage, privacyPage, type Status } from "./pages";
+import { homePage, privacyPage, viewerPage, type Status } from "./pages";
+import { fail, googleFailure, json, notAllowed, scopeNotAllowed, type Reply } from "./reply";
+import { decodeSealKey } from "./seal";
+import { fromOwnPage, webLogout, webRefresh, webStart, webToken, type WebConfig, type WebCtx } from "./web";
 
 /** The shape of a Workers rate-limit binding. */
 export interface RateLimiter {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
+/** The shape of the static-assets binding: read-only, part of the deployment. */
+export interface AssetFetcher {
+  fetch(request: Request): Promise<Response>;
+}
+
 export interface Env {
-  /** The "TVs and Limited Input devices" client: every login, and the refresh tokens those logins issue. */
+  /** The "TVs and Limited Input devices" client: every `gclone login`, and the refresh tokens those logins issue. */
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
-  /** Optional: the "Web application" client of the browser sign-in before gclone 0.2.0. Only /refresh uses it, for
-   *  refresh tokens that client issued, and only when both are set; delete both once every device has run
-   *  `gclone login` again. */
+  /** Optional: the "Web application" client, the hosted viewer's sign-in (`/web/*`). The names date from the time this
+   *  client served the browser sign-in of gclone before 0.2.0. No other route uses it: `/refresh` serves the device
+   *  client only. */
   GOOGLE_LEGACY_CLIENT_ID?: string;
   GOOGLE_LEGACY_CLIENT_SECRET?: string;
+  /** Optional: 32 random bytes in base64 (`openssl rand -base64 32`), the key of the viewer's session cookie. With the
+   *  web client pair it switches the viewer's sign-in on; replacing it ends every browser session and no device login. */
+  SEAL_KEY?: string;
   /** A secret; undefined (not yet put) = empty = nobody. */
   ALLOWED_EMAILS?: string;
   /** Absent in unit tests and outside Workers: then nothing is limited. */
   RATE_LIMIT?: RateLimiter;
+  /** The viewer's files (`dist/`). The Worker reads `index.html` from it and nothing else. Absent: no viewer page. */
+  ASSETS?: AssetFetcher;
 }
 
 export interface Deps {
   /** Every request to Google goes through this. */
   fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-  google: { deviceCodeUrl: string; tokenUrl: string; revokeUrl: string };
+  /** The time in milliseconds: when a web session starts and when it has run out. */
+  now: () => number;
+  google: { deviceCodeUrl: string; tokenUrl: string; revokeUrl: string; authUrl: string };
 }
 
 export const GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code",
   GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token",
-  GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
+  GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke",
+  GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 
 /** The production wiring. `fetch` MUST be a wrapper: under workerd a bare `fetch` stored in an object is later called
  *  with `this = deps` and throws "TypeError: Illegal invocation" — every route that asks Google would answer 502. */
 export const defaultDeps: Deps = {
   fetch: (input, init) => fetch(input, init),
-  google: { deviceCodeUrl: GOOGLE_DEVICE_CODE_URL, tokenUrl: GOOGLE_TOKEN_URL, revokeUrl: GOOGLE_REVOKE_URL },
+  now: () => Date.now(),
+  google: { deviceCodeUrl: GOOGLE_DEVICE_CODE_URL, tokenUrl: GOOGLE_TOKEN_URL, revokeUrl: GOOGLE_REVOKE_URL, authUrl: GOOGLE_AUTH_URL },
 };
 
 export const BODY_MAX = 8192,
   RATE_LIMIT_RETRY_AFTER_S = 60;
 
-/** What a JSON route works with once the configuration has been checked. */
+/** Hosts that are served over plain http: development only. A network attacker cannot make a browser reach the
+ *  deployed page under one of these names. */
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+/** `index.html` of the assets binding. The host is never contacted; nothing of the request goes into this URL. */
+const VIEWER_INDEX_URL = "https://assets.invalid/index.html";
+
+/** What a device route works with once the configuration has been checked. */
 interface Ctx {
   env: Env;
   deps: Deps;
   clients: Clients;
 }
 
-/** A route is either one of the two HTML pages (GET; never limited, served without secrets) or a JSON route (POST;
- *  rate-limited, refused while the Worker's secrets are missing). Every error answer is JSON. */
-type Route = { page: (status: Status) => Response } | { post: (ctx: Ctx, body: Record<string, unknown>) => Promise<Reply> };
+/** A route is one of:
+ *  - `page`: an HTML page (GET; never limited, served without secrets);
+ *  - `device`: a JSON route of the devices (POST; never a browser's request; rate-limited; refused while the device
+ *    client's secrets are missing);
+ *  - `web`: a JSON route of the viewer's own page (POST; same-origin only; rate-limited; refused while the viewer's
+ *    three secrets are missing) — `logout` needs no secret, is never refused for a missing one and is not limited.
+ *  Every error answer is JSON. */
+type Route =
+  | { page: "viewer" | "privacy" }
+  | { device: (ctx: Ctx, body: Record<string, unknown>) => Promise<Reply> }
+  | { web: (ctx: WebCtx, body: Record<string, unknown>) => Promise<Reply> }
+  | { logout: true };
 
 const ROUTES = new Map<string, Route>([
-  ["/", { page: homePage }],
-  ["/privacy", { page: privacyPage }],
-  ["/device/start", { post: deviceStart }],
-  ["/device/poll", { post: devicePoll }],
-  ["/refresh", { post: refresh }],
+  ["/", { page: "viewer" }],
+  // The redirect URI registered at Google. The same bytes as `/`: the page reads `code` and `state` from its own address.
+  ["/callback", { page: "viewer" }],
+  ["/privacy", { page: "privacy" }],
+  ["/device/start", { device: deviceStart }],
+  ["/device/poll", { device: devicePoll }],
+  ["/refresh", { device: refresh }],
+  ["/web/start", { web: webStart }],
+  ["/web/token", { web: webToken }],
+  ["/web/refresh", { web: webRefresh }],
+  ["/web/logout", { logout: true }],
 ]);
-
-/** An answer plus the error code that goes into the log line. */
-interface Reply {
-  response: Response;
-  error?: string;
-}
 
 /** The whole Worker. Pure in (request, env, deps): no globals, no storage. Never throws. */
 export async function handle(request: Request, env: Env, deps: Deps): Promise<Response> {
@@ -95,39 +129,108 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
     const url = new URL(request.url);
     const route = ROUTES.get(url.pathname);
     if (route !== undefined) path = url.pathname;
-    reply = await dispatch(request, route, env, deps);
+    reply = await dispatch(request, url, route, env, deps);
   } catch {
     reply = fail(500, "internal_error", "The sign-in helper failed unexpectedly.");
   }
-  // The only log line: never a body, a query string, a header or a secret.
+  // The only log line: never a body, a query string, a header, a cookie or a secret.
   console.log(JSON.stringify({ route: path, status: reply.response.status, error: reply.error }));
   return reply.response;
 }
 
-export default { fetch: (request: Request, env: Env) => handle(request, env, defaultDeps) } satisfies ExportedHandler<Env>;
-
-async function dispatch(request: Request, route: Route | undefined, env: Env, deps: Deps): Promise<Reply> {
+async function dispatch(request: Request, url: URL, route: Route | undefined, env: Env, deps: Deps): Promise<Reply> {
+  // Before anything else: nothing is served over plain http. (The zone's "Always Use HTTPS" does the same one layer
+  // earlier; this is for when it is off.)
+  if (url.protocol !== "https:" && !LOOPBACK_HOSTS.includes(url.hostname)) return httpsOnly(request, url);
   if (route === undefined) return fail(404, "not_found", "There is nothing at this address.");
   const method = "page" in route ? "GET" : "POST";
   if (request.method !== method) {
     return fail(405, "method_not_allowed", `This address only answers ${method} requests.`, { Allow: method });
   }
   const clients = configuredClients(env);
+  const web = viewerConfig(env, clients);
   if ("page" in route) {
-    return { response: route.page(clients === null ? "not_configured" : clients.legacyIncomplete ? "legacy_incomplete" : "ready") };
+    if (route.page === "privacy") return { response: privacyPage() };
+    return { response: await viewer(env, clients === null ? "not_configured" : web === null ? "viewer_not_configured" : "ready") };
   }
 
-  if (await overLimit(request, env)) {
-    return fail(429, "rate_limited", "Too many requests from this address. Wait a minute, then try again.", {
-      "Retry-After": String(RATE_LIMIT_RETRY_AFTER_S),
-    });
+  // What is refused below this line without being counted are requests that do no work — no secret is used, Google is
+  // not asked — and that a web page somewhere else can send without anyone's permission (a "no-cors" POST). Counted,
+  // any page open in the owner's browser could keep the budget of the owner's address used up: no access token for
+  // the viewer, no refresh for the devices behind the same address, and a sign-out that never arrives.
+  if ("device" in route) {
+    // A device is the gclone command. It is never a web page, and a browser says of every request a page makes
+    // where it came from.
+    if (request.headers.has("origin") || request.headers.has("sec-fetch-site")) {
+      return fail(403, "cross_origin", "This address answers the gclone command on a device, not a web page.");
+    }
+    if (await overLimit(request, env)) return rateLimited();
+    if (clients === null) {
+      return fail(500, "server_misconfigured", "This sign-in helper is not configured yet: its secrets are missing or incomplete.");
+    }
+    const body = await readJsonObject(request);
+    return "reply" in body ? body.reply : route.device({ env, deps, clients }, body.json);
   }
-  if (clients === null) {
-    return fail(500, "server_misconfigured", "This sign-in helper is not configured yet: its secrets are missing or incomplete.");
+
+  // The viewer's own page, and nothing else, calls these. No CORS header is ever answered.
+  if (!fromOwnPage(request, url.origin)) {
+    return fail(403, "cross_origin", "This address only answers the gclone viewer's own page.");
   }
+  if ("web" in route) {
+    if (await overLimit(request, env)) return rateLimited();
+    if (web === null) {
+      return fail(
+        500,
+        "server_misconfigured",
+        "The web viewer's sign-in is not configured on this sign-in helper: it needs GOOGLE_LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET and SEAL_KEY (32 random bytes in base64).",
+      );
+    }
+  }
+  // Sign-out is not limited: it uses no secret, asks nobody and answers a constant — and a sign-out that is turned
+  // away leaves the session cookie in a browser its owner believes signed out.
   const body = await readJsonObject(request);
   if ("reply" in body) return body.reply;
-  return route.post({ env, deps, clients }, body.json);
+  if ("web" in route) return route.web({ request, origin: url.origin, env, deps, web: web! }, body.json);
+  return webLogout();
+}
+
+function rateLimited(): Reply {
+  return fail(429, "rate_limited", "Too many requests from this address. Wait a minute, then try again.", {
+    "Retry-After": String(RATE_LIMIT_RETRY_AFTER_S),
+  });
+}
+
+/** `GET` and `HEAD` are sent to the same address under https. Anything else is refused and not redirected: a POST
+ *  has sent its body in the clear already, and a redirect would only make the client do so again. (The session
+ *  cookie is `Secure`: a browser does not send it here.) */
+function httpsOnly(request: Request, url: URL): Reply {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return fail(400, "https_required", "This address is served over https only.");
+  }
+  const secure = new URL(url);
+  secure.protocol = "https:";
+  return { response: new Response(null, { status: 308, headers: { Location: secure.toString(), "Cache-Control": "no-store" } }) };
+}
+
+/** What the viewer's sign-in needs: the web client's pair and a SEAL_KEY of 32 bytes. Null: `/web/*` is switched off. */
+function viewerConfig(env: Env, clients: Clients | null): WebConfig | null {
+  if (clients === null || clients.web === null) return null;
+  const sealKey = decodeSealKey(env.SEAL_KEY);
+  return sealKey === null ? null : { client: clients.web, sealKey };
+}
+
+/** The page of `/` and `/callback`. */
+async function viewer(env: Env, status: Status): Promise<Response> {
+  if (env.ASSETS !== undefined) {
+    try {
+      const file = await env.ASSETS.fetch(new Request(VIEWER_INDEX_URL));
+      if (file.status === 200) return viewerPage(await file.text(), status);
+      await file.body?.cancel();
+    } catch {
+      // the home page below
+    }
+  }
+  return homePage(status);
 }
 
 async function overLimit(request: Request, env: Env): Promise<boolean> {
@@ -247,24 +350,17 @@ async function refresh({ env, deps, clients }: Ctx, body: Record<string, unknown
   if (typeof refreshToken !== "string" || !REFRESH_TOKEN_RE.test(refreshToken)) {
     return fail(400, "invalid_request", "The request needs a well-formed refresh_token.");
   }
-  // Which client issued the token: a device that signed in through /device/poll says "device"; one that says nothing
-  // signed in before gclone 0.2.0, through the legacy client.
-  if (body.client !== undefined && body.client !== "device") {
-    return fail(400, "invalid_request", 'The "client" of a refresh request is "device" or absent.');
-  }
-  const client = body.client === "device" ? clients.device : clients.legacy;
-  if (client === null) {
-    if (clients.legacyIncomplete) {
-      // Not "log in again": the owner is in the middle of setting or removing the pair, and the login may be fine.
-      return fail(
-        500,
-        "server_misconfigured",
-        "Only one of GOOGLE_LEGACY_CLIENT_ID and GOOGLE_LEGACY_CLIENT_SECRET is set on this sign-in helper, so it cannot refresh a login made before gclone 0.2.0: set both, or delete both.",
-      );
-    }
-    // Google is not asked: with the device client's credentials it could only refuse a token of another client.
+  // Which client issued the token: a device that signed in through /device/poll says "device", and that is the only
+  // client this route serves. One that says nothing signed in before gclone 0.2.0, through the Web application client
+  // — whose refresh tokens are honoured in the viewer's sealed cookie only (/web/refresh): there they have an end, the
+  // allowlist is applied on every use, and replacing SEAL_KEY cuts them all off. Google is not asked.
+  if (body.client === undefined) {
     return fail(400, "invalid_grant", "This login was made with gclone's earlier browser sign-in, which this sign-in helper no longer serves. Run `gclone login` again.");
   }
+  if (body.client !== "device") {
+    return fail(400, "invalid_request", 'The "client" of a refresh request is "device".');
+  }
+  const client = clients.device;
   const refreshed = await refreshAccessToken(client, deps, refreshToken);
   if (!refreshed.ok) return googleFailure(refreshed);
   const { access_token, expires_in, scope, id_token } = refreshed.value;
@@ -280,50 +376,6 @@ async function refresh({ env, deps, clients }: Ctx, body: Record<string, unknown
   const excess = excessScopes(scope);
   if (excess.length > 0) return scopeNotAllowed(excess);
   return json(200, { access_token, expires_in, scope });
-}
-
-// ---------- answers ----------
-
-function json(status: number, body: unknown, headers: Record<string, string> = {}): Reply {
-  return {
-    response: new Response(JSON.stringify(body), {
-      status,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-        ...headers,
-      },
-    }),
-  };
-}
-
-function fail(status: number, error: string, message: string, headers: Record<string, string> = {}): Reply {
-  return { ...json(status, { error, message }, headers), error };
-}
-
-/** The address is masked (`s***@example.net`): `/device/poll` is open to anyone, and whoever entered a caller's user
- *  code at Google agreed to show the address to the app, not to that caller. */
-function notAllowed(email: string | undefined): Reply {
-  const masked = maskedEmail(email);
-  const who = masked === null ? "This Google account" : `The Google account ${masked}`;
-  return fail(403, "email_not_allowed", `${who} is not allowed to sign in here.`);
-}
-
-function scopeNotAllowed(excess: string[]): Reply {
-  // Scope names are not secrets, but they are Google's text: only plain ones are echoed, and only a few. They come last,
-  // so a client that shortens the message keeps the remedy.
-  const named = excess.filter((entry) => /^[A-Za-z0-9:\/._-]{1,100}$/.test(entry)).slice(0, 3);
-  const what = named.length > 0 ? ` Not asked for: ${named.join(", ")}${named.length < excess.length ? ", ..." : ""}` : "";
-  return fail(
-    403,
-    "scope_not_allowed",
-    `Google granted more access than gclone asks for, so nothing was handed out. If you did not expect this, remove gclone at https://myaccount.google.com/permissions; then run \`gclone login\` again.${what}`,
-  );
-}
-
-function googleFailure(r: GoogleFailure): Reply {
-  return fail(r.status, r.error, r.message);
 }
 
 // ---------- request bodies ----------

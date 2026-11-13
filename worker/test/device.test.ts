@@ -19,7 +19,7 @@ import {
   EMAIL,
   GOOGLE,
   GRANTED_SCOPE,
-  LEGACY_CLIENT_ID,
+  WEB_CLIENT_ID,
   SCOPES,
   VERIFICATION_URL,
   WIDE_SCOPE,
@@ -30,7 +30,7 @@ import {
   startLogin,
   testEnv,
   useHarness,
-  withLegacy,
+  withWeb,
   type Consent,
 } from "./helpers";
 
@@ -64,8 +64,8 @@ describe("POST /device/start", () => {
     expect(DEVICE_CODE_RE.test(a.device_code)).toBe(true);
   });
 
-  it("the legacy client is never used to start a login", async () => {
-    h.env = withLegacy();
+  it("the web client is never used to start a login", async () => {
+    h.env = withWeb();
     await startLogin(h);
     expect(h.google.calls[0]!.form.client_id).toBe(CLIENT_ID);
   });
@@ -358,7 +358,7 @@ describe("POST /device/poll", () => {
     it("a grant Google issued but the Worker cannot use → 403 grant_unusable that says what was missing; no revoke, and the code is spent", async () => {
       const cases: Array<[Consent, string]> = [
         [{ aud: "someone-else.apps.googleusercontent.com" }, "not issued by Google for this Worker's OAuth client"],
-        [{ aud: LEGACY_CLIENT_ID }, "not issued by Google for this Worker's OAuth client"],
+        [{ aud: WEB_CLIENT_ID }, "not issued by Google for this Worker's OAuth client"],
         [{ iss: "https://accounts.evil.example" }, "not issued by Google for this Worker's OAuth client"],
         [{ omit: ["id_token"] }, "no ID token"],
         [{ omit: ["refresh_token"] }, "no refresh token"],
@@ -534,8 +534,8 @@ describe("POST /device/poll", () => {
 describe("ID-token and configuration helpers", () => {
   it("idTokenClaims reads the payload only and keeps well-typed claims", () => {
     const claims = idTokenClaims(makeIdToken({ iss: "https://accounts.google.com", aud: CLIENT_ID, email: EMAIL, email_verified: true, nonce: "n", sub: "1", hd: "x" }));
-    expect(claims).toEqual({ iss: "https://accounts.google.com", aud: CLIENT_ID, email: EMAIL, email_verified: true });
-    expect(idTokenClaims(makeIdToken({ aud: 5, iss: null, email: ["a"], email_verified: "true" }))).toEqual({});
+    expect(claims).toEqual({ iss: "https://accounts.google.com", aud: CLIENT_ID, email: EMAIL, email_verified: true, nonce: "n" });
+    expect(idTokenClaims(makeIdToken({ aud: 5, iss: null, email: ["a"], email_verified: "true", nonce: 7 }))).toEqual({});
     for (const bad of ["", "a", "a.b", "a.b.c.d", "a.%%%.c", `a.${btoa("5")}.c`, `a.${btoa("null")}.c`]) {
       expect(idTokenClaims(bad), bad).toBeNull();
     }
@@ -563,26 +563,25 @@ describe("ID-token and configuration helpers", () => {
     expect(emailAllowed(testEnv({ ALLOWED_EMAILS: "ma\u212a@example.com" }), { email: "mak@example.com", email_verified: true })).toBe(false);
   });
 
-  it("configuredClients: the device pair is required; a half-set legacy pair only takes the legacy client away", () => {
-    expect(configuredClients(testEnv())).toEqual({ device: { id: CLIENT_ID, secret: CLIENT_SECRET }, legacy: null, legacyIncomplete: false });
-    expect(configuredClients(withLegacy())).toEqual({
+  it("configuredClients: the device pair is required; the web client is there when both of its secrets are, and its absence takes nothing else away", () => {
+    expect(configuredClients(testEnv())).toEqual({ device: { id: CLIENT_ID, secret: CLIENT_SECRET }, web: null });
+    expect(configuredClients(withWeb())).toEqual({
       device: { id: CLIENT_ID, secret: CLIENT_SECRET },
-      legacy: { id: LEGACY_CLIENT_ID, secret: "test-legacy-secret" },
-      legacyIncomplete: false,
+      web: { id: WEB_CLIENT_ID, secret: "test-web-secret" },
     });
-    expect(configuredClients(testEnv({ GOOGLE_LEGACY_CLIENT_ID: "", GOOGLE_LEGACY_CLIENT_SECRET: "" }))).toMatchObject({ legacy: null, legacyIncomplete: false });
     for (const halfSet of [
-      testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID }),
+      testEnv({ GOOGLE_LEGACY_CLIENT_ID: "", GOOGLE_LEGACY_CLIENT_SECRET: "" }),
+      testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID }),
       testEnv({ GOOGLE_LEGACY_CLIENT_SECRET: "only-the-secret" }),
-      testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: "" }),
+      testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: "" }),
     ]) {
-      expect(configuredClients(halfSet)).toEqual({ device: { id: CLIENT_ID, secret: CLIENT_SECRET }, legacy: null, legacyIncomplete: true });
+      expect(configuredClients(halfSet)).toEqual({ device: { id: CLIENT_ID, secret: CLIENT_SECRET }, web: null });
     }
     for (const broken of [
       testEnv({ GOOGLE_CLIENT_ID: "" }),
       testEnv({ GOOGLE_CLIENT_SECRET: "" }),
       testEnv({ GOOGLE_CLIENT_ID: undefined as unknown as string }),
-      withLegacy({ GOOGLE_CLIENT_SECRET: "" }),
+      withWeb({ GOOGLE_CLIENT_SECRET: "" }),
     ]) {
       expect(configuredClients(broken)).toBeNull();
     }

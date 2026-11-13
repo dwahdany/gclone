@@ -2,15 +2,17 @@ import { describe, expect, it } from "vitest";
 import fixture from "./contract.json";
 import { GIVEN, REQUIRED_CASES, runContractCase, useHarness, type Contract, type ContractCase } from "./helpers";
 
-// worker/test/contract.json is the device ↔ Worker boundary as data. The Rust side (tests/auth.rs) holds its fake
-// auth Worker and its client to the same file; here every case is reproduced by the real handle().
+// worker/test/contract.json is the Worker's boundary as data: the device ↔ Worker routes, and the routes of the hosted
+// viewer's page (`/`, `/callback`, `/web/*`). The Rust side (tests/auth.rs) holds its fake auth Worker and its client
+// to the device cases of the same file; the viewer's tests hold their fake `/web/*` routes to the web cases. Here
+// every case is reproduced by the real handle().
 const contract = fixture as unknown as Contract;
 const h = useHarness();
 
 describe("contract.json", () => {
-  it("is version 2: the device-code login", () => {
+  it("is version 3: the device-code login, /refresh for the device client only, and the hosted viewer's routes", () => {
     expect(Object.keys(contract).sort()).toEqual(["cases", "version"]);
-    expect(contract.version).toBe(2);
+    expect(contract.version).toBe(3);
   });
 
   it("contains every required case, each name once", () => {
@@ -30,6 +32,9 @@ describe("contract.json", () => {
     await expect(runContractCase(h, { ...base, request: { method: "GET", path: "/", cookies: {} } as never })).rejects.toThrow(/unknown key/);
     await expect(runContractCase(h, { ...base, note: "x" } as never)).rejects.toThrow(/unknown key/);
     await expect(runContractCase(h, { ...base, request: { method: "POST", path: "/refresh", json: { refresh_token: "<grant>" } } })).rejects.toThrow(/unknown placeholder/);
+    // a placeholder of the browser sign-in needs the state that produces it
+    await expect(runContractCase(h, { ...base, request: { method: "POST", path: "/web/token", json: { code: "<code>", verifier: "<verifier>" } } })).rejects.toThrow(/needs a web_consented/);
+    await expect(runContractCase(h, { ...base, request: { method: "POST", path: "/web/refresh", headers: { cookie: "<cookie>" }, json: {} } })).rejects.toThrow(/needs a web_session/);
     await runContractCase(h, base);
   });
 

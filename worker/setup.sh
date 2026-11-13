@@ -103,6 +103,9 @@ say "This installs the build tools, signs in to Cloudflare (a browser opens) and
 pause
 npm install
 npx wrangler login
+# wrangler uploads ./dist as the Worker's static files. Without a built web viewer in it, this writes a placeholder
+# page: the Worker is then the plain sign-in helper (README.md, "The viewer's files").
+node scripts/stub-dist.mjs
 npx wrangler deploy
 
 say

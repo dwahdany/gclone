@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex">
+<title>gclone: can this device unlock a vault?</title>
+<link rel="stylesheet" href="bench.css">
+<script src="bench.js" defer></script>
+</head>
+<body>
+<main>
+<h1>Can this device unlock a vault?</h1>
+<p>This page runs what the hosted viewer does when it unlocks — the key derivation (Argon2id, 256 MiB, 3 passes) in a
+worker, then an index in memory — the way the viewer really does it: with a reload between rounds, with a reused
+worker for wrong passphrases, and without reloads. It takes about a minute, reloads itself several times and needs no
+input after "Start". Nothing leaves this page except the result, which goes to the computer that serves it.</p>
+<p><button id="start" type="button">Start</button> <button id="again" type="button" hidden>Run it again</button></p>
+<p id="state" role="status"></p>
+<pre id="out"></pre>
+</main>
+</body>
+</html>

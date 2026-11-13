@@ -1768,8 +1768,9 @@ impl FakeDrive {
         self.st().last_user_code.clone()
     }
 
-    /// The Worker has (or lacks, the default) the GOOGLE_LEGACY_CLIENT_* secrets: whether
-    /// /auth/refresh serves a request without `"client": "device"`.
+    /// An auth Worker before 0.4.0 that has (or lacks, the default) the GOOGLE_LEGACY_CLIENT_*
+    /// secrets: whether /auth/refresh serves a request without `"client": "device"`. The
+    /// Worker of 0.4.0 never serves one, whatever it has configured: that is the default here.
     pub fn set_legacy_client(&self, configured: bool) {
         self.st().legacy_client = if configured {
             LegacyClient::Configured
@@ -1778,8 +1779,9 @@ impl FakeDrive {
         };
     }
 
-    /// The Worker has exactly one of its two GOOGLE_LEGACY_CLIENT_* secrets: /auth/refresh
-    /// without `"client": "device"` → 500 server_misconfigured; nothing else changes.
+    /// An auth Worker before 0.4.0 with exactly one of its two GOOGLE_LEGACY_CLIENT_* secrets:
+    /// /auth/refresh without `"client": "device"` → 500 server_misconfigured; nothing else
+    /// changes. (The Worker of 0.4.0 answers such a request 400 invalid_grant in every state.)
     pub fn set_legacy_client_half_set(&self) {
         self.st().legacy_client = LegacyClient::HalfSet;
     }

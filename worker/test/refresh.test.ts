@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import worker, { BODY_MAX, GOOGLE_DEVICE_CODE_URL, GOOGLE_REVOKE_URL, GOOGLE_TOKEN_URL, RATE_LIMIT_RETRY_AFTER_S, defaultDeps, handle, rateLimitKey, type Env } from "../src/index";
+import worker from "../src/entry";
+import { BODY_MAX, GOOGLE_AUTH_URL, GOOGLE_DEVICE_CODE_URL, GOOGLE_REVOKE_URL, GOOGLE_TOKEN_URL, RATE_LIMIT_RETRY_AFTER_S, defaultDeps, handle, rateLimitKey, type Env } from "../src/index";
 import { REFRESH_TOKEN_RE, revokeToken } from "../src/google";
 import {
   CLIENT_ID,
@@ -8,8 +9,6 @@ import {
   FakeRateLimiter,
   GOOGLE,
   GRANTED_SCOPE,
-  LEGACY_CLIENT_ID,
-  LEGACY_CLIENT_SECRET,
   ORIGIN,
   ROUTES,
   WIDE_SCOPE,
@@ -20,7 +19,9 @@ import {
   startLogin,
   testEnv,
   useHarness,
-  withLegacy,
+  WEB_CLIENT_ID,
+  WEB_CLIENT_SECRET,
+  withWeb,
 } from "./helpers";
 
 const h = useHarness();
@@ -86,7 +87,7 @@ describe("POST /refresh", () => {
       [403, { error: "access_denied" }, 403, "access_denied"],
       [400, { error: "admin_policy_enforced" }, 403, "access_denied"],
       [403, { error: "org_internal" }, 403, "access_denied"],
-      [400, { error: "redirect_uri_mismatch" }, 502, "upstream_error"],
+      [400, { error: "redirect_uri_mismatch" }, 500, "client_invalid"],
       [503, { error: "backend_error" }, 502, "upstream_error"],
       [500, "Internal Server Error", 502, "upstream_error"],
       [200, "<html></html>", 502, "upstream_error"],
@@ -230,7 +231,7 @@ describe("POST /refresh", () => {
     it("an id_token that is not Google's for the client that refreshed is ignored", async () => {
       for (const idToken of [
         idTokenFor("removed@example.net", { aud: "another-client" }),
-        idTokenFor("removed@example.net", { aud: LEGACY_CLIENT_ID }),
+        idTokenFor("removed@example.net", { aud: WEB_CLIENT_ID }),
         idTokenFor("removed@example.net", { iss: "https://evil.example" }),
         "garbage",
       ]) {
@@ -240,57 +241,71 @@ describe("POST /refresh", () => {
     });
   });
 
-  describe("which client: the device client, or the legacy client of the browser sign-in before 0.2.0", () => {
-    const legacyToken = (idToken?: string) => h.google.addRefreshToken(idToken, LEGACY_CLIENT_ID);
+  describe("which client: the device client and no other", () => {
+    /** A refresh token of the Web application client: what a device that signed in before gclone 0.2.0 holds, and what
+     *  the hosted viewer's sealed cookie holds. */
+    const webToken = (idToken?: string) => h.google.addRefreshToken(idToken, WEB_CLIENT_ID);
 
-    it("no `client` field + legacy secrets → the legacy client's credentials go to Google", async () => {
-      h.env = withLegacy();
-      const refreshToken = legacyToken();
-      const res = await h.post("/refresh", { refresh_token: refreshToken });
-      expect(res.status).toBe(200);
-      expect(Object.keys((await res.json()) as object).sort()).toEqual(["access_token", "expires_in", "scope"]);
-      expect(h.google.calls[0]!.form).toEqual({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: LEGACY_CLIENT_ID, client_secret: LEGACY_CLIENT_SECRET });
-    });
-
-    it('`client: "device"` → the device client, with or without legacy secrets', async () => {
-      h.env = withLegacy();
+    it('`client: "device"` → the device client, with or without the web client\'s secrets', async () => {
+      h.env = withWeb();
       const refreshToken = await obtainRefreshToken(h);
       expect((await refresh(refreshToken)).status).toBe(200);
       expect(h.google.calls.at(-1)!.form).toMatchObject({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET });
     });
 
-    it("no `client` field and no legacy secrets → 400 invalid_grant that says to log in again; Google is not asked", async () => {
-      const refreshToken = legacyToken();
-      const res = await h.post("/refresh", { refresh_token: refreshToken });
-      expect(await errorOf(res)).toEqual({ status: 400, error: "invalid_grant" });
-      expect(((await res.json()) as { message: string }).message).toContain("Run `gclone login` again.");
-      // also for a token that is not a legacy one at all: nothing says which client issued it
-      expect(await errorOf(await h.post("/refresh", { refresh_token: h.google.addRefreshToken() }))).toEqual({ status: 400, error: "invalid_grant" });
-      expect(h.google.calls).toEqual([]);
+    it("no `client` field → 400 invalid_grant that says to log in again; Google is not asked — whatever the token is and whatever is configured", async () => {
+      const halfSet = testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID });
+      for (const env of [testEnv(), withWeb(), halfSet, testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: WEB_CLIENT_SECRET })]) {
+        h.reset();
+        h.env = env;
+        // a token of the web client (a login from before gclone 0.2.0), and one of the device client
+        for (const refreshToken of [webToken(), h.google.addRefreshToken()]) {
+          const res = await h.post("/refresh", { refresh_token: refreshToken });
+          expect(await errorOf(res)).toEqual({ status: 400, error: "invalid_grant" });
+          const { message } = (await res.json()) as { message: string };
+          expect(message).toContain("Run `gclone login` again.");
+          expect(message).not.toContain("GOOGLE_LEGACY");
+        }
+        expect(h.google.calls).toEqual([]);
+      }
+    });
+
+    it("the web client's credentials never go to Google from /refresh: its refresh tokens are honoured in the sealed cookie only", async () => {
+      h.env = withWeb();
+      const refreshToken = webToken();
+      // Said to be the device client's: Google is asked with the device client's credentials — and refuses another client's token.
+      h.google.nextAnswer(400, { error: "invalid_grant", error_description: "Bad Request" });
+      expect(await errorOf(await refresh(refreshToken))).toEqual({ status: 400, error: "invalid_grant" });
+      expect(h.google.calls).toHaveLength(1);
+      expect(h.google.calls[0]!.form).toEqual({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLIENT_ID, client_secret: CLIENT_SECRET });
+      for (const client of [undefined, "web", "legacy"]) {
+        await h.post("/refresh", { refresh_token: refreshToken, ...(client === undefined ? {} : { client }) });
+      }
+      expect(h.google.calls).toHaveLength(1);
     });
 
     it("any other `client` value → 400 invalid_request with zero calls to Google", async () => {
-      h.env = withLegacy();
-      const refreshToken = legacyToken();
+      h.env = withWeb();
+      const refreshToken = webToken();
       for (const client of ["legacy", "web", "", "Device", null, 1, true, ["device"], {}]) {
         const res = await h.post("/refresh", { refresh_token: refreshToken, client });
         expect(await errorOf(res), JSON.stringify(client)).toEqual({ status: 400, error: "invalid_request" });
       }
+      // the pre-filter comes first: a malformed token is a malformed request, with or without the field
+      expect((await errorOf(await h.post("/refresh", { refresh_token: "malformed" }))).error).toBe("invalid_request");
+      expect((await errorOf(await h.post("/refresh", {}))).error).toBe("invalid_request");
       expect(h.google.calls).toEqual([]);
     });
 
-    it("the allowlist re-check reads an ID token issued for the legacy client", async () => {
-      h.env = withLegacy();
-      const removed = legacyToken(idTokenFor("removed@example.net", { aud: LEGACY_CLIENT_ID }));
-      expect(await errorOf(await h.post("/refresh", { refresh_token: removed }))).toEqual({ status: 403, error: "email_not_allowed" });
-      expect(h.google.kinds()).toEqual(["token", "revoke"]);
-      // … and ignores one issued for the device client
-      const other = legacyToken(idTokenFor("removed@example.net"));
-      expect((await h.post("/refresh", { refresh_token: other })).status).toBe(200);
+    it("an ID token issued for the web client is not this route's business", async () => {
+      h.env = withWeb();
+      const refreshToken = h.google.addRefreshToken(idTokenFor("removed@example.net", { aud: WEB_CLIENT_ID }));
+      expect((await refresh(refreshToken)).status).toBe(200);
+      expect(h.google.revokes()).toEqual([]);
     });
 
-    it("a login never uses the legacy client", async () => {
-      h.env = withLegacy();
+    it("a login never uses the web client", async () => {
+      h.env = withWeb();
       await obtainRefreshToken(h);
       for (const call of h.google.calls) expect(call.form.client_id).toBe(CLIENT_ID);
     });
@@ -422,7 +437,7 @@ describe("transport rules", () => {
         if (method !== "HEAD") expect((await errorOf(res)).error).toBe("method_not_allowed");
       }
     }
-    for (const path of ["/", "/privacy"]) {
+    for (const path of ["/", "/callback", "/privacy"]) {
       for (const method of ["POST", "PUT", "DELETE", "OPTIONS"]) {
         const res = await h.call(path, { method, headers: { "content-type": "application/json" }, ...(method === "OPTIONS" ? {} : { body: "{}" }) });
         expect(res.status, `${method} ${path}`).toBe(405);
@@ -431,14 +446,21 @@ describe("transport rules", () => {
       }
     }
     expect(h.google.calls).toEqual([]);
-    expect(ROUTES).toEqual(["/", "/privacy", "/device/start", "/device/poll", "/refresh"]);
+    expect(ROUTES).toEqual(["/", "/callback", "/privacy", "/device/start", "/device/poll", "/refresh", "/web/start", "/web/token", "/web/refresh", "/web/logout"]);
   });
 
-  it("unknown path → 404 not_found — the routes of the browser sign-in included", async () => {
+  it("unknown path → 404 not_found — the routes of the browser sign-in before 0.2.0 included, and every file of the viewer's directory", async () => {
     for (const path of ["/nowhere", "/refresh/", "/device", "/device/", "/device/start/", "/Device/Start", "/device/poll.php", "//", "/favicon.ico", "/.well-known/openid-configuration"]) {
       expect(await errorOf(await h.get(path)), path).toEqual({ status: 404, error: "not_found" });
     }
-    for (const path of ["/login", "/login?challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "/callback", "/callback?code=4/0Ajunk&state=x", "/callback?confirmed=x"]) {
+    for (const path of ["/login", "/login?challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "/callback/", "/callback/x", "/Callback"]) {
+      expect(await errorOf(await h.get(path)), path).toEqual({ status: 404, error: "not_found" });
+    }
+    // The viewer's files are the asset layer's to serve (/a/*, /sw.js: such a request never reaches the Worker); the
+    // Worker itself hands out no file, whatever the directory holds — and a decrypted file's address (/v/<id>) exists
+    // in the browser's Service Worker only.
+    h.env = withWeb();
+    for (const path of ["/index.html", "/_headers", "/sw.js", "/a/0123456789abcdef/shell.js", "/a/", "/v/AAAAAAAAAAAAAAAAAAAAAA", "/web", "/web/", "/web/start/", "/web/revoke"]) {
       expect(await errorOf(await h.get(path)), path).toEqual({ status: 404, error: "not_found" });
     }
     expect(await errorOf(await h.post("/token", { code: "x", verifier: "y" }))).toEqual({ status: 404, error: "not_found" });
@@ -505,15 +527,15 @@ describe("transport rules", () => {
     expect(h.google.calls).toEqual([]);
   });
 
-  it("missing secrets of the device client → 500 server_misconfigured on every route except / and /privacy", async () => {
+  it("missing secrets of the device client → 500 server_misconfigured on every device route; the pages still answer", async () => {
     const broken: Env[] = [
       testEnv({ GOOGLE_CLIENT_ID: "" }),
       testEnv({ GOOGLE_CLIENT_SECRET: "" }),
       testEnv({ GOOGLE_CLIENT_ID: undefined as unknown as string }),
       testEnv({ GOOGLE_CLIENT_SECRET: undefined as unknown as string }),
-      // the legacy pair does not stand in for the device client
-      withLegacy({ GOOGLE_CLIENT_ID: "", GOOGLE_CLIENT_SECRET: "" }),
-      withLegacy({ GOOGLE_CLIENT_SECRET: "" }),
+      // the web client's pair does not stand in for the device client
+      withWeb({ GOOGLE_CLIENT_ID: "", GOOGLE_CLIENT_SECRET: "" }),
+      withWeb({ GOOGLE_CLIENT_SECRET: "" }),
     ];
     for (const env of broken) {
       h.env = env;
@@ -523,33 +545,44 @@ describe("transport rules", () => {
       expect(await errorOf(await h.post("/refresh", { refresh_token: WELL_FORMED }))).toEqual({ status: 500, error: "server_misconfigured" });
       // the configuration is checked before the body: also for a request that would be refused anyway
       expect((await errorOf(await h.call("/device/poll", { method: "POST", headers: { "content-type": "text/plain" }, body: "x" }))).error).toBe("server_misconfigured");
-      const home = await h.get("/");
-      expect(home.status).toBe(200);
-      const page = await home.text();
-      expect(page).toContain("Status: not configured");
-      expect(page).not.toContain("Status: ready");
+      for (const path of ["/", "/callback"]) {
+        const home = await h.get(path);
+        expect(home.status).toBe(200);
+        const page = await home.text();
+        expect(page).toContain("Status: not configured");
+        expect(page).not.toContain("Status: ready");
+      }
       expect((await h.get("/privacy")).status).toBe(200);
       // path and method still come first
       expect((await errorOf(await h.get("/nowhere"))).error).toBe("not_found");
       expect((await errorOf(await h.get("/device/poll"))).error).toBe("method_not_allowed");
     }
     expect(h.google.calls).toEqual([]);
-    // ALLOWED_EMAILS is not part of "configured", and a SEAL_KEY of an older deployment is simply ignored
-    h.env = { ...testEnv(), SEAL_KEY: "left-over" } as Env;
+    // ALLOWED_EMAILS is not part of "configured"
+    h.env = testEnv();
     delete h.env.ALLOWED_EMAILS;
     expect(await (await h.get("/")).text()).toContain("Status: ready");
-    expect(await (await handleHome(withLegacy())).text()).toContain("Status: ready");
+    expect(await (await handleHome(withWeb())).text()).toContain("Status: ready");
   });
 
-  it("a half-set legacy pair takes only the legacy client away: logins and device-client refreshes go on", async () => {
-    // The state between the two `wrangler secret delete` commands that end the transition from the browser sign-in
-    // (each is deployed at once) — and between the two `secret put` commands that begin it.
-    const halfSet: Env[] = [
-      testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID }),
-      testEnv({ GOOGLE_LEGACY_CLIENT_SECRET: LEGACY_CLIENT_SECRET }),
-      testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: "" }),
+  it("the web client's pair and SEAL_KEY switch the hosted viewer on and nothing else: without them, half-set or with a bad key, every login and every device goes on", async () => {
+    const VIEWER_OFF = "Status: ready. The web viewer is not configured: it needs GOOGLE_LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET and SEAL_KEY.";
+    const off: Env[] = [
+      testEnv(),
+      // the states between the `wrangler secret put` / `delete` commands (each is deployed at once)
+      testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID }),
+      testEnv({ GOOGLE_LEGACY_CLIENT_SECRET: WEB_CLIENT_SECRET }),
+      testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: "" }),
+      testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: WEB_CLIENT_SECRET }),
+      withWeb({ GOOGLE_LEGACY_CLIENT_SECRET: "" }),
+      withWeb({ SEAL_KEY: undefined as unknown as string }),
+      withWeb({ SEAL_KEY: "" }),
+      // not 32 bytes of base64: a key left over from somewhere, a truncated one
+      withWeb({ SEAL_KEY: "left-over" }),
+      withWeb({ SEAL_KEY: btoa("x".repeat(31)) }),
+      withWeb({ SEAL_KEY: btoa("x".repeat(33)) }),
     ];
-    for (const env of halfSet) {
+    for (const env of off) {
       h.reset();
       h.env = env;
       // a whole login and a refresh of its token: the device client is not affected
@@ -558,37 +591,30 @@ describe("transport rules", () => {
       for (const call of h.google.calls) expect(call.form.client_id).toBe(CLIENT_ID);
       const before = h.google.calls.length;
 
-      // a login from before 0.2.0 (no `client` field): refused as a misconfiguration that names the pair — not as
-      // "log in again", and without asking Google with half a credential
-      const legacy = h.google.addRefreshToken(undefined, LEGACY_CLIENT_ID);
-      const res = await h.post("/refresh", { refresh_token: legacy });
-      expect(await errorOf(res)).toEqual({ status: 500, error: "server_misconfigured" });
-      const { message } = (await res.json()) as { message: string };
-      expect(message).toContain("GOOGLE_LEGACY_CLIENT_ID");
-      expect(message).toContain("GOOGLE_LEGACY_CLIENT_SECRET");
-      expect(message).toContain("set both, or delete both");
-      expect(message).not.toContain("gclone login");
+      // the viewer's sign-in says what is missing; its page says so too, and nothing of a secret
+      for (const path of ["/web/start", "/web/token", "/web/refresh"]) {
+        const res = await h.web(path, {});
+        expect(await errorOf(res), path).toEqual({ status: 500, error: "server_misconfigured" });
+        const { message } = (await res.json()) as { message: string };
+        for (const name of ["GOOGLE_LEGACY_CLIENT_ID", "GOOGLE_LEGACY_CLIENT_SECRET", "SEAL_KEY"]) expect(message).toContain(name);
+      }
       expect(h.google.calls.length).toBe(before);
-      // the pre-filter and the `client` check still come first
-      expect((await errorOf(await h.post("/refresh", { refresh_token: "malformed" }))).error).toBe("invalid_request");
-      expect((await errorOf(await h.post("/refresh", { refresh_token: legacy, client: "web" }))).error).toBe("invalid_request");
-
-      // the home page: ready, with a warning that names the half-set pair
-      const page = await (await h.get("/")).text();
-      expect(page).toContain("Status: ready");
-      expect(page).toContain("Warning: only one of GOOGLE_LEGACY_CLIENT_ID and GOOGLE_LEGACY_CLIENT_SECRET is set");
-      expect(page).not.toContain("not configured");
-      expect(page).not.toContain(LEGACY_CLIENT_ID);
+      for (const path of ["/", "/callback"]) {
+        const page = await (await h.get(path)).text();
+        expect(page).toContain(VIEWER_OFF);
+        expect(page).not.toContain(WEB_CLIENT_ID);
+      }
     }
-    // a complete pair, or none: no warning
-    for (const env of [testEnv(), withLegacy()]) {
+    // everything set: no remark; a key in base64url, or with the line end `openssl rand -base64 32 |` leaves, is a key
+    const urlKey = (withWeb().SEAL_KEY as string).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    for (const env of [withWeb(), withWeb({ SEAL_KEY: urlKey }), withWeb({ SEAL_KEY: `${withWeb().SEAL_KEY}\n` })]) {
       const page = await (await handleHome(env)).text();
       expect(page).toContain("Status: ready");
-      expect(page).not.toContain("Warning");
+      expect(page).not.toContain("not configured");
     }
   });
 
-  it("no CORS, no cookies; every answer is no-store; the two pages carry the CSP and nothing dynamic", async () => {
+  it("no CORS, no cookies on the device routes and the pages; every answer is no-store; the Worker's own two pages carry their CSP and nothing dynamic", async () => {
     const refreshToken = await obtainRefreshToken(h);
     const started = await startLogin(h);
     const cors = { origin: "https://evil.example", "access-control-request-method": "POST", "access-control-request-headers": "content-type" };
@@ -598,6 +624,7 @@ describe("transport rules", () => {
       await h.get("/?user_code=<script>alert(1)</script>", cors),
       await h.get("/nowhere", cors),
       await h.get("/login", cors),
+      await h.get("/callback?code=4/0Ajunk&state=<script>alert(1)</script>", { ...cors, cookie: "__Host-gclone-web=AAAA" }),
       await h.call("/device/start", { method: "OPTIONS", headers: cors }),
       await h.call("/device/poll", { method: "OPTIONS", headers: cors }),
       await h.call("/refresh", { method: "OPTIONS", headers: cors }),
@@ -605,6 +632,11 @@ describe("transport rules", () => {
       await h.post("/device/poll", { device_code: started.device_code }, cors),
       await h.post("/refresh", { refresh_token: refreshToken, client: "device" }, cors),
       await h.post("/refresh", {}, cors),
+      // … and as the gclone command sends them: no Origin
+      await h.post("/device/start", {}),
+      await h.post("/device/poll", { device_code: started.device_code }),
+      await h.post("/refresh", { refresh_token: refreshToken, client: "device" }),
+      await h.post("/refresh", {}),
     ];
     for (const res of answers) {
       const names = [...res.headers.keys()];
@@ -623,11 +655,14 @@ describe("transport rules", () => {
         expect(page).not.toContain("<script");
         expect(page).not.toContain("<form");
         expect(page).not.toContain("user_code");
+        expect(page).not.toContain("4/0Ajunk");
+        expect(res.headers.get("strict-transport-security")).toBe("max-age=63072000; includeSubDomains");
       } else {
         expect(type).toBe("application/json; charset=utf-8");
       }
     }
-    expect(answers.map((r) => r.status)).toEqual([200, 200, 200, 404, 404, 405, 405, 405, 200, 400, 200, 400]);
+    // (A POST that names an origin is a web page's: the device routes refuse it, unread.)
+    expect(answers.map((r) => r.status)).toEqual([200, 200, 200, 404, 404, 200, 405, 405, 405, 403, 403, 403, 403, 200, 400, 200, 400]);
     expect(answers.slice(0, 3).map((r) => r.headers.get("content-type"))).toEqual(Array(3).fill("text/html; charset=utf-8"));
   });
 
@@ -706,13 +741,15 @@ describe("logging", () => {
 
 // The only tests that do not inject `deps`: they must run in the Workers runtime, where `fetch` checks its `this`.
 describe("the production wiring", () => {
-  it("defaultDeps.google is the three Google URLs of §2.2", () => {
+  it("defaultDeps.google is the four Google URLs, and defaultDeps.now is the clock", () => {
     expect(defaultDeps.google).toEqual({
       deviceCodeUrl: "https://oauth2.googleapis.com/device/code",
       tokenUrl: "https://oauth2.googleapis.com/token",
       revokeUrl: "https://oauth2.googleapis.com/revoke",
+      authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     });
-    expect([GOOGLE_DEVICE_CODE_URL, GOOGLE_TOKEN_URL, GOOGLE_REVOKE_URL]).toEqual(Object.values(defaultDeps.google));
+    expect([GOOGLE_DEVICE_CODE_URL, GOOGLE_TOKEN_URL, GOOGLE_REVOKE_URL, GOOGLE_AUTH_URL]).toEqual(Object.values(defaultDeps.google));
+    expect(Math.abs(defaultDeps.now() - Date.now())).toBeLessThan(5000);
   });
 
   it("defaultDeps.fetch can be called as a property: no 'Illegal invocation'", async () => {
@@ -735,7 +772,9 @@ describe("the production wiring", () => {
     expect(await outcome(async () => bare.fetch("http://127.0.0.1:9/"))).toContain("Illegal invocation");
   });
 
-  it("one request through the default export returns the home page", async () => {
+  it("src/entry.ts exports the handler and nothing else; one request through it returns the home page", async () => {
+    expect(Object.keys(await import("../src/entry"))).toEqual(["default"]);
+    expect(Object.keys(worker)).toEqual(["fetch"]);
     const res = await worker.fetch(new Request("https://auth.test/"), testEnv());
     await h.record("/", res);
     expect(res.status).toBe(200);

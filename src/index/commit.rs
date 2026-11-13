@@ -751,6 +751,9 @@ impl<B: Backend> Vault<B> {
             let md5 = md5_of(&bytes);
             raise_lamport(c, lamport)?;
             set_base_meta(c, &sealed.name, lamport, size, &md5, &id.0)?;
+            // As every replica that takes this snapshot for its base records it
+            // (`refresh::set_base`): its writer was alive at the snapshot's time.
+            tables::device_seen(c, me, now)?;
             tables::meta_set_str(c, "last_snapshot_name", &sealed.name)?;
             tables::meta_set_str(c, "last_snapshot_id", &id.0)?;
             tables::meta_set_u64(c, "last_snapshot_size", size)?;

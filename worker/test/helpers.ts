@@ -2,15 +2,30 @@
 // enforces the logging rules after every test, and the runner for the contract fixture.
 
 import { afterEach, beforeEach, expect, vi } from "vitest";
-import { handle, type Deps, type Env, type RateLimiter } from "../src/index";
+import { handle, type AssetFetcher, type Deps, type Env, type RateLimiter } from "../src/index";
+import { STATUS_MARKER } from "../src/pages";
+import { b64urlEncode, pkceChallenge, sealSession } from "../src/seal";
+import { WEB_COOKIE } from "../src/web";
 
 export const ORIGIN = "https://auth.test";
 export const CLIENT_ID = "device-cid.apps.googleusercontent.com";
 export const CLIENT_SECRET = "test-device-secret";
-export const LEGACY_CLIENT_ID = "legacy-cid.apps.googleusercontent.com";
-export const LEGACY_CLIENT_SECRET = "test-legacy-secret";
+/** The "Web application" client: the secrets GOOGLE_LEGACY_CLIENT_ID / GOOGLE_LEGACY_CLIENT_SECRET. */
+export const WEB_CLIENT_ID = "web-cid.apps.googleusercontent.com";
+export const WEB_CLIENT_SECRET = "test-web-secret";
+export const SEAL_KEY_BYTES = new Uint8Array(32).map((_, i) => (i * 7 + 1) & 0xff);
+/** As `openssl rand -base64 32` prints it. */
+export const SEAL_KEY = btoa(String.fromCharCode(...SEAL_KEY_BYTES));
 export const EMAIL = "me@example.com";
-export const GOOGLE = { deviceCodeUrl: "https://google.test/device/code", tokenUrl: "https://google.test/token", revokeUrl: "https://google.test/revoke" };
+export const GOOGLE = {
+  deviceCodeUrl: "https://google.test/device/code",
+  tokenUrl: "https://google.test/token",
+  revokeUrl: "https://google.test/revoke",
+  authUrl: "https://google.test/auth",
+};
+export const REDIRECT_URI = `${ORIGIN}/callback`;
+/** Where the harness's clock starts (milliseconds). */
+export const T0 = 1_794_500_000_000;
 export const SCOPES = "openid email https://www.googleapis.com/auth/drive.file";
 export const GRANTED_SCOPE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.file";
 /** A grant that covers the whole Drive (an older, wider grant of the same account to the same project). */
@@ -18,13 +33,31 @@ export const WIDE_SCOPE = `${GRANTED_SCOPE} https://www.googleapis.com/auth/driv
 export const VERIFICATION_URL = "https://www.google.com/device";
 export const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
-/** The device client only; `withLegacy()` adds the legacy pair. */
+/** The device client only: a Worker without the hosted viewer. `withWeb()` adds what the viewer needs. */
 export function testEnv(over: Partial<Env> = {}): Env {
   return { GOOGLE_CLIENT_ID: CLIENT_ID, GOOGLE_CLIENT_SECRET: CLIENT_SECRET, ALLOWED_EMAILS: EMAIL, ...over };
 }
 
-export function withLegacy(over: Partial<Env> = {}): Env {
-  return testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: LEGACY_CLIENT_SECRET, ...over });
+/** The web client's pair, SEAL_KEY and the viewer's files. */
+export function withWeb(over: Partial<Env> = {}): Env {
+  return testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET: WEB_CLIENT_SECRET, SEAL_KEY, ASSETS: new FakeAssets(), ...over });
+}
+
+// ---------- fake assets binding ----------
+
+/** `index.html` of a built viewer as far as the Worker is concerned: some markup around the status marker. */
+export const VIEWER_INDEX = `<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>gclone</title><script src="/a/0123456789abcdef/shell.js" defer></script></head>\n<body><p class="status">${STATUS_MARKER}</p></body></html>\n`;
+
+/** The assets binding: `dist/` as a map of path → text. Everything the Worker asks it for is recorded. */
+export class FakeAssets implements AssetFetcher {
+  readonly requests: Array<{ method: string; url: string; headers: string[] }> = [];
+  constructor(public files: Record<string, string> = { "/index.html": VIEWER_INDEX, "/sw.js": "// sw", "/a/0123456789abcdef/shell.js": "// shell" }) {}
+  async fetch(request: Request): Promise<Response> {
+    this.requests.push({ method: request.method, url: request.url, headers: [...request.headers.keys()] });
+    const body = this.files[new URL(request.url).pathname];
+    if (body === undefined) return new Response(null, { status: 404 });
+    return new Response(body, { status: 200, headers: { "content-type": "text/html; charset=utf-8", etag: '"abc"', "cache-control": "public, max-age=0, must-revalidate" } });
+  }
 }
 
 // ---------- fake Google ----------
@@ -41,7 +74,8 @@ export function makeIdToken(claims: Record<string, unknown>): string {
   return `${part({ alg: "RS256", kid: "test", typ: "JWT" })}.${part(claims)}.c2lnbmF0dXJl`;
 }
 
-/** What the user did at google.com/device, and what Google then answers to the poll. */
+/** What the user did at Google (google.com/device, or the consent page of the browser sign-in), and what Google then
+ *  answers to the poll or to the code exchange. */
 export interface Consent {
   email?: string;
   emailVerified?: boolean;
@@ -53,6 +87,20 @@ export interface Consent {
   omit?: Array<"id_token" | "refresh_token" | "access_token" | "expires_in" | "scope">;
   /** Replaces the generated ID token verbatim. */
   idToken?: string;
+  /** Browser sign-in only: the `nonce` claim (default: the one of the authorization URL); null = no such claim. */
+  nonce?: string | null;
+  /** Browser sign-in only: the refresh token Google issues (default: a generated one). */
+  refreshToken?: string;
+}
+
+/** An authorization code of the browser sign-in, as Google remembers it. */
+interface AuthCode {
+  clientId: string;
+  redirectUri: string;
+  challenge: string;
+  nonce: string | null;
+  consent: Consent;
+  used: boolean;
 }
 
 export interface GoogleCall {
@@ -74,6 +122,11 @@ export class FakeGoogle {
   readonly unexpected: string[] = [];
   /** Every refresh token this fake issued or was told about — none may show up outside a /device/poll body. */
   readonly refreshTokens = new Set<string>();
+  /** Those of the web client: they show up nowhere at all (the browser gets them sealed). */
+  readonly webRefreshTokens = new Set<string>();
+  /** Authorization codes of the browser sign-in, and the verifiers they were redeemed with: never in an answer or a log. */
+  readonly codes = new Map<string, AuthCode>();
+  readonly verifiers = new Set<string>();
   readonly accessTokens = new Set<string>();
   readonly idTokens = new Set<string>();
   /** device code → the login it stands for. Neither a device code nor a user code may show up outside a /device/start body. */
@@ -98,10 +151,27 @@ export class FakeGoogle {
     this.device(userCode).state = state;
   }
 
+  /** The user consented at Google's page for `authorizationUrl` (what /web/start built — or what someone else did):
+   *  the code Google then sends to the redirect URI. */
+  consent(authorizationUrl: string, consent: Consent = {}): string {
+    const q = new URL(authorizationUrl).searchParams;
+    const code = `4/0Afake-auth_code.${++this.counter}`;
+    this.codes.set(code, {
+      clientId: q.get("client_id") ?? "",
+      redirectUri: q.get("redirect_uri") ?? "",
+      challenge: q.get("code_challenge") ?? "",
+      nonce: q.get("nonce"),
+      consent,
+      used: false,
+    });
+    return code;
+  }
+
   /** A live refresh token without a login, issued to `clientId`; `idToken` is what Google adds to refresh answers for it. */
   addRefreshToken(idToken?: string, clientId = CLIENT_ID): string {
     const token = `1//fake-refresh-token-${++this.counter}`;
     this.refreshTokens.add(token);
+    if (clientId === WEB_CLIENT_ID) this.webRefreshTokens.add(token);
     this.live.set(token, idToken === undefined ? { clientId, revoked: false } : { clientId, revoked: false, idToken });
     if (idToken !== undefined) this.idTokens.add(idToken);
     return token;
@@ -110,6 +180,17 @@ export class FakeGoogle {
   /** Revocation is grant-wide: every refresh token dies. */
   revokeAll(): void {
     for (const entry of this.live.values()) entry.revoked = true;
+  }
+
+  /** What Google adds to the refresh answers of `token` from now on (undefined: no ID token). */
+  setIdToken(token: string, idToken: string | undefined): void {
+    const entry = this.live.get(token);
+    if (entry === undefined) throw new Error("fake Google: no such refresh token");
+    if (idToken === undefined) delete entry.idToken;
+    else {
+      entry.idToken = idToken;
+      this.idTokens.add(idToken);
+    }
   }
 
   /** The next call to Google (device-code or token endpoint) gets this answer, whatever it asks. */
@@ -172,8 +253,8 @@ export class FakeGoogle {
     return answer(200, { device_code: deviceCode, user_code: userCode, expires_in: 1800, interval: 5, verification_url: VERIFICATION_URL });
   }
 
-  private token(form: Record<string, string>): Response {
-    const secrets: Record<string, string> = { [CLIENT_ID]: CLIENT_SECRET, [LEGACY_CLIENT_ID]: LEGACY_CLIENT_SECRET };
+  private token(form: Record<string, string>): Response | Promise<Response> {
+    const secrets: Record<string, string> = { [CLIENT_ID]: CLIENT_SECRET, [WEB_CLIENT_ID]: WEB_CLIENT_SECRET };
     if (form.client_id === undefined || secrets[form.client_id] !== form.client_secret) {
       return answer(401, { error: "invalid_client", error_description: "Unauthorized" });
     }
@@ -219,6 +300,7 @@ export class FakeGoogle {
       for (const field of consent.omit ?? []) delete body[field];
       return answer(200, body);
     }
+    if (form.grant_type === "authorization_code") return this.exchange(form);
     if (form.grant_type === "refresh_token") {
       const entry = this.live.get(form.refresh_token ?? "");
       if (entry === undefined) return this.fail("refresh with an unknown refresh token");
@@ -232,6 +314,47 @@ export class FakeGoogle {
       return answer(200, body);
     }
     return this.fail(`token request with grant_type ${form.grant_type}`);
+  }
+
+  /** The code of the browser sign-in for tokens. Google checks the client, the redirect URI and the PKCE verifier. */
+  private async exchange(form: Record<string, string>): Promise<Response> {
+    if (form.code_verifier !== undefined) this.verifiers.add(form.code_verifier);
+    const entry = this.codes.get(form.code ?? "");
+    if (entry === undefined || entry.used || entry.clientId !== form.client_id) return answer(400, { error: "invalid_grant", error_description: "Malformed auth code." });
+    if (entry.redirectUri !== form.redirect_uri) return answer(400, { error: "redirect_uri_mismatch", error_description: "Bad Request" });
+    if ((await pkceChallenge(form.code_verifier ?? "")) !== entry.challenge) return answer(400, { error: "invalid_grant", error_description: "Invalid code verifier." });
+    entry.used = true;
+    const { consent } = entry;
+    const n = ++this.counter;
+    const refreshToken = consent.refreshToken ?? `1//fake-web-refresh-token-${n}`;
+    const accessToken = `ya29.fake-web-access-token-${n}`;
+    const claims: Record<string, unknown> = {
+      iss: consent.iss ?? "https://accounts.google.com",
+      aud: consent.aud ?? form.client_id,
+      sub: "1234567890",
+      email: consent.email ?? EMAIL,
+      email_verified: consent.emailVerified ?? true,
+      iat: 1794400000,
+      exp: 1794403600,
+    };
+    const nonce = consent.nonce === undefined ? entry.nonce : consent.nonce;
+    if (nonce !== null) claims.nonce = nonce;
+    const idToken = consent.idToken ?? makeIdToken(claims);
+    this.refreshTokens.add(refreshToken);
+    this.webRefreshTokens.add(refreshToken);
+    this.accessTokens.add(accessToken);
+    this.idTokens.add(idToken);
+    this.live.set(refreshToken, { clientId: form.client_id!, revoked: false });
+    const body: Record<string, unknown> = {
+      access_token: accessToken,
+      expires_in: 3599,
+      refresh_token: refreshToken,
+      token_type: "Bearer",
+      scope: consent.scope ?? GRANTED_SCOPE,
+      id_token: idToken,
+    };
+    for (const field of consent.omit ?? []) delete body[field];
+    return answer(200, body);
   }
 
   private revoke(form: Record<string, string>): Response {
@@ -280,12 +403,18 @@ export interface CallInit {
   body?: string;
 }
 
-export const ROUTES = ["/", "/privacy", "/device/start", "/device/poll", "/refresh"];
+export const ROUTES = ["/", "/callback", "/privacy", "/device/start", "/device/poll", "/refresh", "/web/start", "/web/token", "/web/refresh", "/web/logout"];
+/** The only answers that may carry a cookie. */
+const COOKIE_ROUTES = ["/web/token", "/web/refresh", "/web/logout"];
+/** What the viewer's page sends with every request to a /web route. */
+export const SAME_ORIGIN = { origin: ORIGIN, "sec-fetch-site": "same-origin" };
 
 export class Harness {
   env: Env = testEnv();
   google = new FakeGoogle();
-  deps: Deps = { fetch: this.google.fetch, google: GOOGLE };
+  /** The Worker's clock, in milliseconds; a test moves it forward. */
+  now = T0;
+  deps: Deps = { fetch: this.google.fetch, now: () => this.now, google: GOOGLE };
   readonly logs: string[] = [];
   readonly strayConsole: string[] = [];
   readonly recorded: Recorded[] = [];
@@ -293,16 +422,18 @@ export class Harness {
   reset(): void {
     this.env = testEnv();
     this.google = new FakeGoogle();
-    this.deps = { fetch: this.google.fetch, google: GOOGLE };
+    this.now = T0;
+    this.deps = { fetch: this.google.fetch, now: () => this.now, google: GOOGLE };
     this.logs.length = 0;
     this.strayConsole.length = 0;
     this.recorded.length = 0;
   }
 
-  /** One request through handle() with the harness's env and deps. */
+  /** One request through handle() with the harness's env and deps. `path` may be a whole URL (another scheme or host). */
   async call(path: string, init: CallInit = {}): Promise<Response> {
-    const response = await handle(new Request(ORIGIN + path, init), this.env, this.deps);
-    await this.record(path, response);
+    const url = /^https?:\/\//.test(path) ? path : ORIGIN + path;
+    const response = await handle(new Request(url, init), this.env, this.deps);
+    await this.record(new URL(url).pathname, response);
     return response;
   }
 
@@ -312,6 +443,11 @@ export class Harness {
 
   post(path: string, json: unknown, headers: Record<string, string> = {}): Promise<Response> {
     return this.call(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(json) });
+  }
+
+  /** A POST as the viewer's own page sends it: same origin. `headers` are added (a cookie) or replace those. */
+  web(path: string, json: unknown = {}, headers: Record<string, string> = {}): Promise<Response> {
+    return this.post(path, json, { ...SAME_ORIGIN, ...headers });
   }
 
   /** Keeps a copy of an answer for the secret-hygiene check. */
@@ -334,11 +470,15 @@ export class Harness {
       if (entry.error !== undefined) expect(entry.error, `log line ${line}`).toMatch(/^[a-z_]{1,40}$/);
     }
 
-    const neverAnywhere = [CLIENT_SECRET, LEGACY_CLIENT_SECRET];
-    for (const secret of [this.env.GOOGLE_CLIENT_SECRET, this.env.GOOGLE_LEGACY_CLIENT_SECRET]) if (secret) neverAnywhere.push(secret);
+    // The client secrets, SEAL_KEY, the web client's refresh tokens (the browser holds them sealed, never as they
+    // are), the authorization codes of the browser sign-in and their verifiers: in no answer and in no log line.
+    const neverAnywhere = [CLIENT_SECRET, WEB_CLIENT_SECRET, SEAL_KEY, ...this.google.webRefreshTokens, ...this.google.codes.keys(), ...this.google.verifiers];
+    for (const secret of [this.env.GOOGLE_CLIENT_SECRET, this.env.GOOGLE_LEGACY_CLIENT_SECRET, this.env.SEAL_KEY]) if (secret) neverAnywhere.push(secret);
     const deviceCodes = [...this.google.devices.keys()];
     const userCodes = [...this.google.devices.values()].map((d) => d.userCode);
-    const neverLogged = [...this.google.refreshTokens, ...this.google.accessTokens, ...this.google.idTokens, ...deviceCodes, ...userCodes];
+    // Every session cookie the Worker set.
+    const cookies = this.recorded.flatMap((r) => [...r.headers.matchAll(new RegExp(`^set-cookie: ${WEB_COOKIE}=([^;\\n]+)`, "gm"))].map((m) => m[1]!));
+    const neverLogged = [...this.google.refreshTokens, ...this.google.accessTokens, ...this.google.idTokens, ...deviceCodes, ...userCodes, ...cookies, WEB_COOKIE];
     for (const line of this.logs) {
       for (const secret of [...neverAnywhere, ...neverLogged]) expect(line.includes(secret), `a secret in log line ${line}`).toBe(false);
     }
@@ -357,8 +497,19 @@ export class Harness {
           if (r.path !== path) expect(r.body.includes(token), `${what} in the ${where}`).toBe(false);
         }
       }
+      // An access token leaves the Worker only in the body of the four routes that exist to hand one out.
+      for (const token of this.google.accessTokens) {
+        expect(r.headers.includes(token), `an access token in a header of the ${where}`).toBe(false);
+        if (!["/device/poll", "/refresh", "/web/token", "/web/refresh"].includes(r.path)) expect(r.body.includes(token), `an access token in the ${where}`).toBe(false);
+      }
       expect(r.headers.toLowerCase(), `CORS header on the ${where}`).not.toContain("access-control-");
-      expect(r.headers.toLowerCase(), `cookie on the ${where}`).not.toContain("set-cookie");
+      // Cookies: the session cookie, on the three web routes that set or clear it, with every attribute — and nowhere else.
+      const setCookies = [...r.headers.matchAll(/^set-cookie: (.*)$/gm)].map((m) => m[1]!);
+      if (!COOKIE_ROUTES.includes(r.path)) expect(setCookies, `cookie on the ${where}`).toEqual([]);
+      expect(setCookies.length, `cookies on the ${where}`).toBeLessThanOrEqual(1);
+      for (const cookie of setCookies) {
+        expect(cookie, `cookie on the ${where}`).toMatch(new RegExp(`^${WEB_COOKIE}=[A-Za-z0-9_-]*; Path=/; Secure; HttpOnly; SameSite=Strict(; Max-Age=(0|2592000))?$`));
+      }
       expect(r.headers, `no-store on the ${where}`).toContain("cache-control: no-store");
     }
   }
@@ -420,6 +571,50 @@ export async function obtainRefreshToken(h: Harness): Promise<string> {
   return ((await res.json()) as { refresh_token: string }).refresh_token;
 }
 
+// ---------- the page's part of a browser sign-in ----------
+
+export interface Pkce {
+  verifier: string;
+  challenge: string;
+  state: string;
+}
+
+/** What the page makes before it leaves for Google: a verifier, its S256 challenge and a `state`. */
+export async function pkce(): Promise<Pkce> {
+  const verifier = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
+  return { verifier, challenge: await pkceChallenge(verifier), state: b64urlEncode(crypto.getRandomValues(new Uint8Array(16))) };
+}
+
+/** POST /web/start: the address at Google. */
+export async function webStart(h: Harness, p: Pkce): Promise<string> {
+  const res = await h.web("/web/start", { challenge: p.challenge, state: p.state });
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { authorization_url: string }).authorization_url;
+}
+
+export interface SignedIn {
+  res: Response;
+  /** The whole `Set-Cookie` value, and its `name=value` pair as the browser sends it back; null when none was set. */
+  setCookie: string | null;
+  cookie: string | null;
+  pkce: Pkce;
+  code: string;
+}
+
+/** A whole browser sign-in (the env must have the web client): /web/start, the user's consent at Google, /web/token. */
+export async function webSignIn(h: Harness, over: { consent?: Consent; remember?: boolean } = {}): Promise<SignedIn> {
+  const p = await pkce();
+  const code = h.google.consent(await webStart(h, p), over.consent);
+  const res = await h.web("/web/token", { code, verifier: p.verifier, ...(over.remember === undefined ? {} : { remember: over.remember }) });
+  const setCookie = res.headers.get("set-cookie");
+  return { res, setCookie, cookie: setCookie === null ? null : setCookie.split(";")[0]!, pkce: p, code };
+}
+
+/** A session cookie (`name=value`) sealed under `key`: what a browser would hold after a sign-in with this outcome. */
+export async function sealedCookie(session: { iat: number; exp: number; email?: string; refreshToken: string }, key: Uint8Array = SEAL_KEY_BYTES): Promise<string> {
+  return `${WEB_COOKIE}=${await sealSession(key, { email: EMAIL, ...session })}`;
+}
+
 export async function errorOf(res: Response): Promise<{ status: number; error: string }> {
   const body = (await res.clone().json()) as { error?: unknown; message?: unknown };
   expect(Object.keys(body).sort()).toEqual(["error", "message"]);
@@ -444,8 +639,12 @@ export interface Contract {
 }
 
 /** The closed list of SPEC §16.5: the state a case starts from. `<device_code>` is a started login in that state;
- *  `<refresh_token>` a refresh token of the device client (`legacy_token`, `legacy_unconfigured`, `legacy_half_set`:
- *  of the legacy client). */
+ *  `<refresh_token>` a refresh token of the device client (`legacy_token`: of the web client, as a device that signed
+ *  in before gclone 0.2.0 holds one — on a Worker that has that client's secrets).
+ *  The `web…` states are the hosted viewer's: a Worker with the web client, SEAL_KEY and the viewer's files.
+ *  `<challenge>` and `<state>` are a tab's PKCE challenge and state; `<code>` and `<verifier>` an authorization code
+ *  after the consent at Google and the verifier it belongs to; `<cookie>` the session cookie of a finished sign-in;
+ *  `<origin>` the Worker's own origin. */
 export const GIVEN = [
   "none",
   "pending",
@@ -463,13 +662,25 @@ export const GIVEN = [
   "refresh_revoked",
   "refresh_wide_scope",
   "legacy_token",
-  "legacy_unconfigured",
-  "legacy_half_set",
   "legacy_half_set_device_token",
   "client_broken",
   "google_down",
   "rate_limited",
   "unconfigured",
+  "web",
+  "web_consented",
+  "web_other_verifier",
+  "web_foreign_code",
+  "web_consented_other_account",
+  "web_consented_wide_scope",
+  "web_consented_no_drive_scope",
+  "web_session",
+  "web_session_remembered",
+  "web_session_expired",
+  "web_session_other_key",
+  "web_session_revoked",
+  "web_session_removed",
+  "web_session_google_down",
 ] as const;
 
 export const REQUIRED_CASES = [
@@ -502,9 +713,8 @@ export const REQUIRED_CASES = [
   "poll_malformed_code",
   "poll_get",
   "refresh_ok",
-  "refresh_legacy_ok",
-  "refresh_legacy_unconfigured",
-  "refresh_legacy_half_set",
+  "refresh_no_client",
+  "refresh_legacy_gone",
   "refresh_half_set_device_ok",
   "refresh_bad_client",
   "refresh_invalid_grant",
@@ -517,8 +727,47 @@ export const REQUIRED_CASES = [
   "refresh_get",
   "not_found",
   "login_gone",
-  "callback_gone",
   "token_gone",
+  // the hosted viewer: its page and the four routes of its sign-in
+  "page_home",
+  "page_callback",
+  "page_unconfigured",
+  "web_start_ok",
+  "web_start_malformed",
+  "web_start_cross_origin",
+  "web_start_no_origin",
+  "web_start_unconfigured",
+  "web_start_rate_limited",
+  "web_start_get",
+  "web_token_ok",
+  "web_token_remember",
+  "web_token_other_verifier",
+  "web_token_foreign_code",
+  "web_token_email_not_allowed",
+  "web_token_scope_not_allowed",
+  "web_token_scope_missing",
+  "web_token_malformed",
+  "web_token_cross_origin",
+  "web_refresh_ok",
+  "web_refresh_remembered",
+  "web_refresh_no_session",
+  "web_refresh_bad_cookie",
+  "web_refresh_other_key",
+  "web_refresh_expired",
+  "web_refresh_invalid_grant",
+  "web_refresh_email_not_allowed",
+  "web_refresh_upstream",
+  "web_refresh_cross_origin",
+  "web_refresh_wrong_content_type",
+  "web_logout_ok",
+  "web_logout_no_session",
+  "web_logout_unconfigured",
+  "web_logout_cross_origin",
+  // what is refused, or answered, without being counted by the rate limiter
+  "web_logout_over_limit",
+  "web_refresh_cross_origin_over_limit",
+  "start_from_a_page",
+  "refresh_from_a_page_over_limit",
 ];
 
 function onlyKeys(what: string, value: object, allowed: string[]): void {
@@ -555,14 +804,13 @@ export async function runContractCase(h: Harness, c: ContractCase): Promise<void
     if (c.given === "used") expect((await poll(h, started.device_code)).status).toBe(200);
   }
   if (requestText.includes("<refresh_token>")) {
-    // Exactly one of the two legacy secrets: the state between two `wrangler secret put` / `delete` commands.
-    const halfSet = () => testEnv({ GOOGLE_LEGACY_CLIENT_ID: LEGACY_CLIENT_ID });
-    if (c.given === "legacy_token" || c.given === "legacy_unconfigured" || c.given === "legacy_half_set") {
-      values["<refresh_token>"] = h.google.addRefreshToken(undefined, LEGACY_CLIENT_ID);
-      if (c.given === "legacy_token") h.env = withLegacy();
-      if (c.given === "legacy_half_set") h.env = halfSet();
+    if (c.given === "legacy_token") {
+      // The Worker has the web client's secrets, and the token is one of that client: /refresh still does not serve it.
+      h.env = withWeb();
+      values["<refresh_token>"] = h.google.addRefreshToken(undefined, WEB_CLIENT_ID);
     } else {
-      if (c.given === "legacy_half_set_device_token") h.env = halfSet();
+      // Exactly one of the two web-client secrets: the state between two `wrangler secret put` / `delete` commands.
+      if (c.given === "legacy_half_set_device_token") h.env = testEnv({ GOOGLE_LEGACY_CLIENT_ID: WEB_CLIENT_ID });
       values["<refresh_token>"] = await obtainRefreshToken(h);
     }
     if (c.given === "refresh_revoked") h.google.revokeAll();
@@ -571,6 +819,51 @@ export async function runContractCase(h: Harness, c: ContractCase): Promise<void
       h.google.accessTokens.add("ya29.wide-access-token");
       h.google.nextAnswer(200, { access_token: "ya29.wide-access-token", expires_in: 3599, scope: WIDE_SCOPE, token_type: "Bearer" });
     }
+  }
+  // The hosted viewer's states.
+  if (c.given.startsWith("web")) h.env = withWeb();
+  values["<origin>"] = ORIGIN;
+  if (/<challenge>|<state>|<code>|<verifier>/.test(requestText)) {
+    const tab = await pkce();
+    values["<challenge>"] = tab.challenge;
+    values["<state>"] = tab.state;
+    values["<verifier>"] = tab.verifier;
+    if (requestText.includes("<code>")) {
+      const consents: Record<string, Consent> = {
+        web_consented: {},
+        web_other_verifier: {},
+        web_consented_other_account: { email: "stranger@example.com" },
+        web_consented_wide_scope: { scope: WIDE_SCOPE },
+        web_consented_no_drive_scope: { scope: "openid https://www.googleapis.com/auth/userinfo.email" },
+      };
+      if (c.given === "web_foreign_code") {
+        // A code Google issued for an address that /web/start did not build: the right challenge, another nonce.
+        const url = new URL(await webStart(h, tab));
+        url.searchParams.set("nonce", "not-this-workers-nonce");
+        values["<code>"] = h.google.consent(url.toString());
+      } else {
+        const consent = consents[c.given];
+        if (consent === undefined) throw new Error(`case ${c.name}: <code> needs a web_consented… state`);
+        values["<code>"] = h.google.consent(await webStart(h, tab), consent);
+        // Another tab's verifier: well-formed, and not the one the code was issued for.
+        if (c.given === "web_other_verifier") values["<verifier>"] = (await pkce()).verifier;
+      }
+    }
+  }
+  if (requestText.includes("<cookie>")) {
+    if (!c.given.startsWith("web_session")) throw new Error(`case ${c.name}: <cookie> needs a web_session… state`);
+    if (c.given === "web_session_other_key") {
+      // Sealed by someone who does not have this Worker's SEAL_KEY (or before the key was replaced).
+      values["<cookie>"] = await sealedCookie({ iat: T0 / 1000, exp: T0 / 1000 + 3600, refreshToken: h.google.addRefreshToken(undefined, WEB_CLIENT_ID) }, new Uint8Array(32).fill(9));
+    } else {
+      const signedIn = await webSignIn(h, { remember: c.given === "web_session_remembered" });
+      expect(signedIn.res.status).toBe(200);
+      values["<cookie>"] = signedIn.cookie!;
+    }
+    if (c.given === "web_session_expired") h.now += 12 * 3600 * 1000;
+    if (c.given === "web_session_revoked") h.google.revokeAll();
+    if (c.given === "web_session_removed") h.env.ALLOWED_EMAILS = "someone-else@example.com";
+    if (c.given === "web_session_google_down") h.google.nextAnswer(503, "<html><title>503 Service Unavailable</title></html>");
   }
   const unknownPlaceholder = requestText.match(/<[a-z_]+>/g)?.find((p) => !(p in values));
   if (unknownPlaceholder !== undefined) throw new Error(`case ${c.name}: unknown placeholder ${unknownPlaceholder}`);
@@ -584,6 +877,7 @@ export async function runContractCase(h: Harness, c: ContractCase): Promise<void
   const init: CallInit = { method: c.request.method, headers: c.request.headers ?? {} };
   if (c.request.json !== undefined) init.body = fill(JSON.stringify(c.request.json));
   if (c.request.body !== undefined) init.body = fill(c.request.body);
+  if (init.headers !== undefined) init.headers = Object.fromEntries(Object.entries(init.headers).map(([name, value]) => [name, fill(value)]));
   const res = await h.call(c.request.path, init);
 
   const want = c.response;

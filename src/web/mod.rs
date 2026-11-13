@@ -33,13 +33,16 @@ use crate::backend::{AnyBackend, Backend as _};
 use crate::error::{IndexError, TransferError};
 use crate::index::{ListRow, SearchHit, Vault};
 use crate::state::{Db, LedgerDir};
-use crate::types::{BlobRec, Entry, EntryKind, Head};
+use crate::types::{BlobRec, EntryKind, Head};
 use crate::util;
 
 pub mod http;
 pub mod mime;
+pub mod rules;
 
 use http::{BadRequest, Body, ByteRange, Failure};
+use rules::{EntryJson, InfoJson, RowView, SortOrder};
+pub use rules::{LIST_PAGE, LIST_PAGE_MAX, RefreshState, SEARCH_HITS, SEARCH_HITS_MAX};
 
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_CSS: &str = include_str!("assets/app.css");
@@ -54,12 +57,6 @@ pub const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'se
 /// Everything that is neither the page nor a file: nothing to load, nothing to run.
 const BARE_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 
-/// Entries per `/api/list` answer: the default and the most a client may ask for.
-pub const LIST_PAGE: usize = 2000;
-pub const LIST_PAGE_MAX: usize = 5000;
-/// Matches per `/api/search` answer: the default and the most a client may ask for.
-pub const SEARCH_HITS: usize = 200;
-pub const SEARCH_HITS_MAX: usize = 1000;
 /// File streams at a time — each one holds a download from the store — and how long a
 /// request waits for a free one before it is told to come back (`503`).
 pub const STREAMS_MAX: usize = 16;
@@ -76,18 +73,6 @@ const USED_KEYS_KEPT: usize = 16;
 /// Plaintext handed to hyper per frame, and frames waiting between download and client.
 const FRAME_BYTES: usize = 64 * 1024;
 const FRAMES_QUEUED: usize = 16;
-
-/// The outcome of the last refresh of the replica, as the page shows it.
-#[derive(Clone, Debug, Serialize)]
-pub struct RefreshState {
-    pub at_ms: u64,
-    /// The replica is as new as the store.
-    pub ok: bool,
-    /// Index segments the refresh applied.
-    pub applied: u64,
-    /// Why not, or what else the user should know.
-    pub note: Option<String>,
-}
 
 /// Refreshes the replica the way a read-only command does — try the state lock, open the vault
 /// with it, `refresh()`, release — and says how it went. Never holds the lock longer.
@@ -245,100 +230,10 @@ impl From<IndexError> for Refusal {
 type Outcome<T> = Result<T, Refusal>;
 
 // ---------------------------------------------------------------------------------------------
-// JSON shapes
+// Listing rows (the JSON shapes and the order of a listing are in `rules`)
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct EntryJson {
-    name: String,
-    /// Search results and `/api/stat` only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    /// `/api/stat` of a file only: what `/file?id=` takes in place of the path (`FileIds`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    dir: bool,
-    /// `"folder"`, or how the viewer shows the file (`mime::Kind`).
-    kind: &'static str,
-    /// Files only.
-    size: Option<u64>,
-    mtime_ms: Option<i64>,
-}
-
-impl EntryJson {
-    fn new(name: &str, path: Option<String>, is_dir: bool, head: Option<&Head>) -> EntryJson {
-        let file = head.filter(|h| !is_dir && h.entry.kind == EntryKind::File);
-        EntryJson {
-            name: name.to_owned(),
-            path,
-            id: None,
-            dir: is_dir,
-            kind: match is_dir {
-                true => "folder",
-                false => mime::of_name(name).kind.as_str(),
-            },
-            size: file.map(|h| h.entry.size),
-            mtime_ms: file.map(|h| h.entry.mtime_ns.div_euclid(1_000_000)),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ListJson {
-    path: String,
-    sort: &'static str,
-    order: &'static str,
-    /// Entries in the directory; `entries` holds those from `offset` on, a page of them.
-    total: usize,
-    offset: usize,
-    entries: Vec<EntryJson>,
-}
-
-#[derive(Serialize)]
-struct SearchJson {
-    q: String,
-    sort: &'static str,
-    order: &'static str,
-    hits: Vec<EntryJson>,
-    /// There are more matches than `hits` holds.
-    more: bool,
-}
-
-#[derive(Serialize)]
-struct InfoJson {
-    vault: String,
-    backend: &'static str,
-    device: String,
-    version: &'static str,
-    read_only: bool,
-    files: u64,
-    bytes: u64,
-    last_change_ms: Option<u64>,
-    last_change_by: Option<String>,
-    refresh: RefreshState,
-}
-
-// ---------------------------------------------------------------------------------------------
-// Listing order
-// ---------------------------------------------------------------------------------------------
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SortKey {
-    Name,
-    Size,
-    Mtime,
-}
-
-/// What a listing orders: the entries of a directory, or the matches of a search.
-trait Listed {
-    fn name(&self) -> &str;
-    /// Tells entries with the same name apart (search: the path).
-    fn tie(&self) -> &str;
-    fn is_dir(&self) -> bool;
-    fn entry(&self) -> Option<&Entry>;
-}
-
-impl Listed for ListRow {
+impl RowView for ListRow {
     fn name(&self) -> &str {
         &self.name
     }
@@ -348,12 +243,12 @@ impl Listed for ListRow {
     fn is_dir(&self) -> bool {
         self.is_dir
     }
-    fn entry(&self) -> Option<&Entry> {
-        self.head.as_ref().map(|h| &h.entry)
+    fn head(&self) -> Option<&Head> {
+        self.head.as_ref()
     }
 }
 
-impl Listed for SearchHit {
+impl RowView for SearchHit {
     fn name(&self) -> &str {
         crate::path::file_name(&self.path)
     }
@@ -363,48 +258,15 @@ impl Listed for SearchHit {
     fn is_dir(&self) -> bool {
         self.is_dir
     }
-    fn entry(&self) -> Option<&Entry> {
-        self.head.as_ref().map(|h| &h.entry)
+    fn head(&self) -> Option<&Head> {
+        self.head.as_ref()
     }
 }
 
-/// The order of a listing — a directory's and a search's alike. Directories come first,
-/// always. `sort=name`: by name (`http::natural_cmp`), reversed as a whole under `order=desc`.
-/// `sort=size|mtime`: files by that key, reversed under `desc`, equal keys by name ascending;
-/// directories, which have neither a size nor a time, by name ascending in both orders.
-fn sort_rows<T: Listed>(rows: &mut [T], key: SortKey, descending: bool) {
-    use std::cmp::Ordering;
-    let value = |row: &T| match key {
-        SortKey::Name => 0,
-        SortKey::Size => row.entry().map_or(0, |e| i128::from(e.size)),
-        SortKey::Mtime => row.entry().map_or(0, |e| i128::from(e.mtime_ns)),
-    };
-    let flip = |o: Ordering| if descending { o.reverse() } else { o };
-    rows.sort_by(|a, b| {
-        let by_name = || http::natural_cmp(a.name(), b.name()).then_with(|| a.tie().cmp(b.tie()));
-        b.is_dir().cmp(&a.is_dir()).then_with(|| match key {
-            SortKey::Name => flip(by_name()),
-            _ if a.is_dir() => by_name(),
-            _ => flip(value(a).cmp(&value(b))).then_with(by_name),
-        })
-    });
-}
-
-/// `sort` and `order` of a listing or a search, with their names for the answer.
-fn sort_params(query: &[(String, String)]) -> Outcome<(SortKey, &'static str, bool, &'static str)> {
-    let bad = |what: &'static str| refuse(StatusCode::BAD_REQUEST, what);
-    let (key, sort) = match http::param(query, "sort").unwrap_or("name") {
-        "name" => (SortKey::Name, "name"),
-        "size" => (SortKey::Size, "size"),
-        "mtime" => (SortKey::Mtime, "mtime"),
-        _ => return Err(bad("sort is name, size or mtime")),
-    };
-    let (descending, order) = match http::param(query, "order").unwrap_or("asc") {
-        "asc" => (false, "asc"),
-        "desc" => (true, "desc"),
-        _ => return Err(bad("order is asc or desc")),
-    };
-    Ok((key, sort, descending, order))
+/// `sort` and `order` of a listing or a search.
+fn sort_params(query: &[(String, String)]) -> Outcome<SortOrder> {
+    SortOrder::parse(http::param(query, "sort"), http::param(query, "order"))
+        .map_err(|what| refuse(StatusCode::BAD_REQUEST, what))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -968,6 +830,7 @@ impl App {
             last_change_ms: stats.last_change_ms,
             last_change_by: stats.last_change_by,
             refresh: self.refreshed(),
+            head: None,
         }))
     }
 
@@ -982,11 +845,11 @@ impl App {
 
     async fn list(&self, query: &[(String, String)]) -> Outcome<Response<Body>> {
         let path = dir_param(query)?;
-        let (key, sort, descending, order) = sort_params(query)?;
+        let by = sort_params(query)?;
         let offset = number(query, "offset", 0, usize::MAX)?;
         let limit = number(query, "limit", LIST_PAGE, LIST_PAGE_MAX)?;
         if limit == 0 {
-            return Err(refuse(StatusCode::BAD_REQUEST, "limit is at least 1"));
+            return Err(refuse(StatusCode::BAD_REQUEST, rules::LIMIT_IS_ZERO));
         }
         let dir = path.clone();
         let rows = self
@@ -997,27 +860,10 @@ impl App {
                 })
             })
             .await?;
-        let Some(mut rows) = rows else {
-            return Err(refuse(
-                StatusCode::NOT_FOUND,
-                format!("There is no folder {path:?} in the vault."),
-            ));
+        let Some(rows) = rows else {
+            return Err(refuse(StatusCode::NOT_FOUND, rules::no_folder(&path)));
         };
-        sort_rows(&mut rows, key, descending);
-        let entries = rows
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|row| EntryJson::new(&row.name, None, row.is_dir, row.head.as_ref()))
-            .collect();
-        Ok(json(&ListJson {
-            path,
-            sort,
-            order,
-            total: rows.len(),
-            offset,
-            entries,
-        }))
+        Ok(json(&rules::list_json(path, rows, by, offset, limit)))
     }
 
     async fn stat(&self, query: &[(String, String)]) -> Outcome<Response<Body>> {
@@ -1044,25 +890,10 @@ impl App {
             .trim()
             .to_owned();
         let limit = number(query, "limit", SEARCH_HITS, SEARCH_HITS_MAX)?;
-        let (key, sort, descending, order) = sort_params(query)?;
+        let by = sort_params(query)?;
         let needle = q.clone();
-        let (mut hits, more) = self.query(move |v| v.search(&needle, limit)).await?;
-        // The matches the cap let through, in the order a folder would show them.
-        sort_rows(&mut hits, key, descending);
-        let hits = hits
-            .iter()
-            .map(|hit| {
-                let name = crate::path::file_name(&hit.path);
-                EntryJson::new(name, Some(hit.path.clone()), hit.is_dir, hit.head.as_ref())
-            })
-            .collect();
-        Ok(json(&SearchJson {
-            q,
-            sort,
-            order,
-            hits,
-            more,
-        }))
+        let (hits, more) = self.query(move |v| v.search(&needle, limit)).await?;
+        Ok(json(&rules::search_json(q, hits, more, by)))
     }
 
     /// `GET|HEAD file?path=…|id=…[&dl=1]`: the bytes of one file, decrypted as they are sent.
@@ -1282,30 +1113,20 @@ fn remove_launch(file: Option<PathBuf>) {
 }
 
 fn not_in_vault(path: &str) -> Refusal {
-    refuse(
-        StatusCode::NOT_FOUND,
-        format!("There is no file {path:?} in the vault."),
-    )
+    refuse(StatusCode::NOT_FOUND, rules::no_file(path))
 }
 
 /// `path` of a listing: absent or empty for the vault root, else a valid remote path (§5.1).
 /// The path is only ever looked up in the index; it never reaches the file system.
 fn dir_param(query: &[(String, String)]) -> Outcome<String> {
-    match http::param(query, "path") {
-        None | Some("") => Ok(String::new()),
-        Some(path) => match crate::path::validate(path) {
-            Ok(()) => Ok(path.to_owned()),
-            Err(e) => Err(refuse(StatusCode::BAD_REQUEST, format!("path: {e}"))),
-        },
-    }
+    rules::dir_path(http::param(query, "path"))
+        .map_err(|what| refuse(StatusCode::BAD_REQUEST, what))
 }
 
 /// `path` of one entry: required, a valid remote path.
 fn file_param(query: &[(String, String)]) -> Outcome<String> {
-    match dir_param(query)? {
-        path if path.is_empty() => Err(refuse(StatusCode::BAD_REQUEST, "path is missing")),
-        path => Ok(path),
-    }
+    rules::entry_path(http::param(query, "path"))
+        .map_err(|what| refuse(StatusCode::BAD_REQUEST, what))
 }
 
 fn number(
@@ -1320,7 +1141,7 @@ fn number(
             Ok(n) if n <= max && digits.bytes().all(|b| b.is_ascii_digit()) => Ok(n),
             _ => Err(refuse(
                 StatusCode::BAD_REQUEST,
-                format!("{name} is a number up to {max}"),
+                rules::not_a_number(name, max),
             )),
         },
     }
@@ -1367,156 +1188,6 @@ impl tokio::io::AsyncWrite for FrameWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DeviceId, Entry, Stamp};
-
-    fn row(name: &str, is_dir: bool, size: u64, mtime_ns: i64) -> ListRow {
-        let head = Head {
-            path: name.to_owned(),
-            stamp: Stamp {
-                lamport: 1,
-                device: DeviceId([1; 8]),
-                idx: 0,
-            },
-            entry: Entry {
-                kind: if is_dir {
-                    EntryKind::Dir
-                } else {
-                    EntryKind::File
-                },
-                size,
-                mtime_ns,
-                exec: false,
-                hash: [0; 32],
-                loc: None,
-            },
-            origin: None,
-            winner: true,
-        };
-        ListRow {
-            name: name.to_owned(),
-            is_dir,
-            // A directory can come with a head (created empty) or without (implied).
-            head: (!is_dir || size == 1).then_some(head),
-        }
-    }
-
-    fn sorted(key: SortKey, descending: bool) -> Vec<String> {
-        let mut rows = vec![
-            row("b.txt", false, 30, 100),
-            row("zeta", true, 0, 0),
-            row("a10.txt", false, 10, 300),
-            row("Alpha", true, 1, 999),
-            row("a2.txt", false, 30, 200),
-            row("c.txt", false, 0, -5),
-        ];
-        sort_rows(&mut rows, key, descending);
-        rows.into_iter().map(|r| r.name).collect()
-    }
-
-    #[test]
-    fn listings_put_directories_first_in_every_order() {
-        assert_eq!(
-            sorted(SortKey::Name, false),
-            ["Alpha", "zeta", "a2.txt", "a10.txt", "b.txt", "c.txt"]
-        );
-        assert_eq!(
-            sorted(SortKey::Name, true),
-            ["zeta", "Alpha", "c.txt", "b.txt", "a10.txt", "a2.txt"]
-        );
-        // Equal sizes by name; directories by name whatever the direction.
-        assert_eq!(
-            sorted(SortKey::Size, false),
-            ["Alpha", "zeta", "c.txt", "a10.txt", "a2.txt", "b.txt"]
-        );
-        assert_eq!(
-            sorted(SortKey::Size, true),
-            ["Alpha", "zeta", "a2.txt", "b.txt", "a10.txt", "c.txt"]
-        );
-        assert_eq!(
-            sorted(SortKey::Mtime, false),
-            ["Alpha", "zeta", "c.txt", "b.txt", "a2.txt", "a10.txt"]
-        );
-        assert_eq!(
-            sorted(SortKey::Mtime, true),
-            ["Alpha", "zeta", "a10.txt", "a2.txt", "b.txt", "c.txt"]
-        );
-    }
-
-    #[test]
-    fn entries_of_directories_carry_no_size_or_time() {
-        let dir = row("Alpha", true, 1, 999);
-        let entry = EntryJson::new(&dir.name, None, true, dir.head.as_ref());
-        assert_eq!(
-            serde_json::to_string(&entry).unwrap(),
-            r#"{"name":"Alpha","dir":true,"kind":"folder","size":null,"mtime_ms":null}"#
-        );
-        let file = row("old.PDF", false, 7, -1_500_000);
-        let entry = EntryJson::new(
-            &file.name,
-            Some("x/old.PDF".into()),
-            false,
-            file.head.as_ref(),
-        );
-        assert_eq!(
-            serde_json::to_string(&entry).unwrap(),
-            r#"{"name":"old.PDF","path":"x/old.PDF","dir":false,"kind":"pdf","size":7,"mtime_ms":-2}"#
-        );
-    }
-
-    #[test]
-    fn search_matches_are_ordered_like_a_listing() {
-        let hit = |path: &str, is_dir: bool, size: u64| SearchHit {
-            path: path.to_owned(),
-            is_dir,
-            head: (!is_dir).then(|| row(path, false, size, 0).head).flatten(),
-        };
-        let sorted = |key: SortKey, descending: bool| {
-            let mut hits = vec![
-                hit("z/a10.txt", false, 5),
-                hit("b/a2.txt", false, 5),
-                hit("a/a2.txt", false, 9),
-                hit("m/Docs", true, 0),
-                hit("a2.txt", false, 1),
-                hit("b/docs", true, 0),
-            ];
-            sort_rows(&mut hits, key, descending);
-            hits.into_iter().map(|h| h.path).collect::<Vec<_>>()
-        };
-        // By the name — the last component — and, where names are equal, by the path.
-        assert_eq!(
-            sorted(SortKey::Name, false),
-            [
-                "m/Docs",
-                "b/docs",
-                "a/a2.txt",
-                "a2.txt",
-                "b/a2.txt",
-                "z/a10.txt"
-            ]
-        );
-        assert_eq!(
-            sorted(SortKey::Name, true),
-            [
-                "b/docs",
-                "m/Docs",
-                "z/a10.txt",
-                "b/a2.txt",
-                "a2.txt",
-                "a/a2.txt"
-            ]
-        );
-        assert_eq!(
-            sorted(SortKey::Size, true),
-            [
-                "m/Docs",
-                "b/docs",
-                "a/a2.txt",
-                "b/a2.txt",
-                "z/a10.txt",
-                "a2.txt"
-            ]
-        );
-    }
 
     #[test]
     fn file_ids_seal_the_path() {

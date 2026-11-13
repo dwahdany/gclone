@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>gclone</title>
+<link rel="icon" type="image/svg+xml" href="/a/__GCLONE_BUILD__/icon.svg">
+<link rel="stylesheet" href="/a/__GCLONE_BUILD__/app.css">
+<link rel="stylesheet" href="/a/__GCLONE_BUILD__/shell.css">
+<noscript><link rel="stylesheet" href="/a/__GCLONE_BUILD__/noscript.css"></noscript>
+<script src="/a/__GCLONE_BUILD__/token.js" defer></script>
+<script src="/a/__GCLONE_BUILD__/provider.js" defer></script>
+<script src="/a/__GCLONE_BUILD__/shell.js" defer></script>
+</head>
+<body>
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <symbol id="s-vault" viewBox="0 0 24 24"><path d="M3.5 8a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M10.4 14.4v-1a1.6 1.6 0 0 1 3.2 0v1"/><rect x="9.6" y="14.2" width="4.8" height="2.6" rx=".6" fill="currentColor"/></symbol>
+  <symbol id="s-lock" viewBox="0 0 24 24"><rect x="5.5" y="10.5" width="13" height="9.5" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/><path d="M12 14.4v1.8"/></symbol>
+  <symbol id="s-out" viewBox="0 0 24 24"><path d="M10 4.5H6.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2H10"/><path d="M15 8l4 4-4 4M19 12H9.5"/></symbol>
+</svg>
+
+<div class="shell" id="shell" data-screen="boot">
+  <div class="sheet">
+    <div class="mark">
+      <svg class="i" width="24" height="24" aria-hidden="true"><use href="#s-vault"/></svg>
+      <span>gclone</span>
+    </div>
+
+    <section class="screen" data-screen="boot" aria-live="polite">
+      <p class="waiting"><span class="spinner" aria-hidden="true"></span><span>Starting…</span></p>
+      <p class="late">The viewer did not start: one of its files could not be loaded. Reload the page.</p>
+    </section>
+
+    <section class="screen" data-screen="signin" aria-labelledby="signin-title" hidden>
+      <h1 id="signin-title">Your vault, in this browser</h1>
+      <p class="lead">This is the private web viewer and sign-in helper of one person's gclone, a tool that syncs encrypted files to their own Google Drive. Only its owner can sign in here; it serves nobody else.</p>
+      <p class="problem" id="signin-problem" role="alert" hidden></p>
+      <div class="needs-script">
+        <button class="btn wide" id="signin-go" type="button">Sign in with Google</button>
+        <label class="check">
+          <input type="checkbox" id="signin-remember">
+          <span>Stay signed in on this device (30 days) <span class="aside">— only on your own device</span></span>
+        </label>
+      </div>
+      <ul class="notes">
+        <li>This site signs you in with a redirect to Google and nothing else. It never asks you to enter a code at google.com/device. A page that does is not gclone.</li>
+        <li>Open this page from your bookmark or home-screen icon, and check that the address starts with <code id="signin-address">https://</code><span id="signin-address-rest"> and this site's name</span>.</li>
+        <li>Files are decrypted in this browser. The passphrase and the keys of a vault never leave it.</li>
+        <li>A sign-in on a device starts with <code>gclone login</code> in a terminal, and the code that terminal shows is entered at Google. Never enter a code that someone sent you.</li>
+      </ul>
+      <p class="foot"><a href="/privacy">Privacy</a><span class="state"><!--gclone-status--></span></p>
+    </section>
+
+    <section class="screen" data-screen="unlock" aria-labelledby="unlock-title" hidden>
+      <h1 id="unlock-title">Unlock the vault</h1>
+      <dl class="facts">
+        <dt>Signed in as</dt><dd id="unlock-email"></dd>
+        <dt>Folder</dt><dd id="unlock-folder"></dd>
+      </dl>
+      <p class="problem" id="unlock-killed" role="status" hidden></p>
+      <form id="unlock-form" method="dialog" novalidate>
+        <fieldset id="unlock-fields" disabled>
+          <label for="unlock-user">Vault</label>
+          <input class="field quiet" id="unlock-user" name="username" type="text" autocomplete="username" value="gclone vault" readonly tabindex="-1">
+          <label for="unlock-pass">Passphrase</label>
+          <input class="field" id="unlock-pass" name="password" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+          <p class="problem" id="unlock-problem" role="alert" hidden></p>
+          <label class="check" id="unlock-more-row" hidden>
+            <input type="checkbox" id="unlock-more">
+            <span id="unlock-more-text"></span>
+          </label>
+          <button class="btn wide" id="unlock-go" type="submit">Unlock</button>
+        </fieldset>
+      </form>
+      <p class="cost" id="unlock-cost"></p>
+      <ul class="notes">
+        <li>gclone never asks you to enter a code at google.com/device.</li>
+        <li>Save this passphrase only in a password manager that Google cannot read (Google Password Manager with on-device encryption turned on, iCloud Keychain, or a separate manager). Otherwise decline when the browser offers to save it.</li>
+      </ul>
+      <p class="foot"><button class="plain" id="unlock-out" type="button">Sign out</button></p>
+    </section>
+
+    <section class="screen" data-screen="work" aria-live="polite" hidden>
+      <p class="waiting"><span class="spinner" aria-hidden="true"></span><span id="work-text">Working…</span></p>
+      <div class="meter" id="work-meter" hidden><div id="work-bar"></div></div>
+      <p class="cost" id="work-detail"></p>
+    </section>
+
+    <section class="screen" data-screen="ask" aria-labelledby="ask-title" hidden>
+      <h1 id="ask-title"></h1>
+      <p class="lead" id="ask-text"></p>
+      <div class="choices" id="ask-choices"></div>
+    </section>
+
+    <section class="screen" data-screen="stop" aria-labelledby="stop-title" hidden>
+      <h1 id="stop-title">The viewer cannot go on</h1>
+      <p class="lead" id="stop-text" role="alert"></p>
+      <p class="problem" id="stop-note" role="status" hidden></p>
+      <div class="choices">
+        <button class="btn" id="stop-reload" type="button">Reload</button>
+        <button class="plain" id="stop-out" type="button">Sign out</button>
+      </div>
+    </section>
+
+    <section class="screen" data-screen="out" aria-labelledby="out-title" hidden>
+      <h1 id="out-title">Signed out of the viewer</h1>
+      <p class="lead">This browser is still signed in to your Google account. On a device that is not yours, sign out of Google too: <a href="https://accounts.google.com/Logout" rel="noreferrer noopener">accounts.google.com/Logout</a></p>
+      <div class="choices needs-script">
+        <button class="btn" id="out-again" type="button">Sign in again</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<template id="shell-parts">
+  <button class="icon-btn" id="lock-btn" type="button" title="Lock: forget the keys and ask for the passphrase again" aria-label="Lock the vault">
+    <svg class="i" aria-hidden="true"><use href="#s-lock"/></svg>
+  </button>
+  <div class="session" id="session">
+    <dl id="session-list">
+      <dt>Fingerprint</dt><dd><code id="session-head"></code></dd>
+      <dt>Signed in as</dt><dd id="session-email"></dd>
+      <dt>Build</dt><dd id="session-build"></dd>
+    </dl>
+    <p class="hint">The fingerprint is the state of the vault this browser was given. <code>gclone status</code> on a device shows the same one when both are up to date.</p>
+    <div class="session-actions">
+      <button class="btn" id="session-lock" type="button"><svg class="i" aria-hidden="true"><use href="#s-lock"/></svg><span>Lock</span></button>
+      <button class="plain" id="session-out" type="button"><svg class="i" aria-hidden="true"><use href="#s-out"/></svg><span>Sign out</span></button>
+    </div>
+  </div>
+</template>
+
+<template id="app"><!--gclone-app--></template>
+</body>
+</html>

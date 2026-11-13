@@ -42,8 +42,16 @@ impl VaultDescriptor {
         bytes
     }
 
+    /// Whether this build can read the vault: `min_reader` is at most [`SUPPORTED_FORMAT`]
+    /// (§3.3 "unknown version anywhere → fail closed"). The one copy of that comparison:
+    /// discovery (`Vault::discover`) and the hosted viewer's core both ask here. The descriptor
+    /// is an unauthenticated hint, so this decides what is offered, never what is trusted.
+    pub fn readable(&self) -> bool {
+        self.min_reader <= u32::from(SUPPORTED_FORMAT)
+    }
+
     /// Unknown fields are ignored; `vault_id` must be 32 lowercase hex digits. Whether this build
-    /// can read the vault (`min_reader`) is the caller's check (§3.3).
+    /// can read the vault is [`VaultDescriptor::readable`], the caller's check (§3.3).
     pub fn parse(b: &[u8]) -> Result<Self, FormatError> {
         let d: VaultDescriptor = serde_json::from_slice(b)
             .map_err(|e| FormatError::Decode(format!("vault descriptor: {e}")))?;
@@ -93,6 +101,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!((d.gclone_vault, d.min_reader), (2, 2));
+    }
+
+    #[test]
+    fn readable_up_to_the_supported_format() {
+        let id = "000102030405060708090a0b0c0d0e0f";
+        let with = |gclone_vault: u32, min_reader: u32| {
+            VaultDescriptor::parse(
+                format!(
+                    r#"{{"gclone_vault":{gclone_vault},"min_reader":{min_reader},"vault_id":"{id}","created_ms":5}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        assert!(VaultDescriptor::new([1; 16]).readable());
+        assert!(with(1, 1).readable());
+        // Written by a newer gclone in a way this reader still understands.
+        assert!(with(2, 1).readable());
+        assert!(with(1, 0).readable());
+        // Format 2: fail closed.
+        assert!(!with(2, 2).readable());
+        assert!(!with(1, 2).readable());
+        assert!(!with(9, u32::MAX).readable());
     }
 
     #[test]

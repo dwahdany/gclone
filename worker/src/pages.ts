@@ -1,6 +1,16 @@
-// The two HTML pages (Google asks an OAuth app for a home page and a privacy policy). Static: no script, no external
-// resource, and nothing from a request.
+// The Worker's HTML pages. `/` and `/callback` are the hosted viewer's page: the bytes of the deployed `index.html`
+// with the status line put in — or, in a deployment without the viewer's files, the plain home page below. `/privacy`
+// is the privacy statement (Google asks an OAuth app for a home page and a privacy policy). Nothing of a request ever
+// gets into a page.
 
+import viewerHeaders from "./headers.json";
+
+/** The header set of the viewer's page (`/`, `/callback`). The same set is written into `dist/_headers` for the static
+ *  files (`/a/*`, `/sw.js`), which the asset layer serves without running the Worker: scripts/headers-file.mjs. */
+export const VIEWER_HEADERS: Readonly<Record<string, string>> = viewerHeaders;
+export const VIEWER_CSP: string = viewerHeaders["Content-Security-Policy"];
+
+/** The two pages the Worker writes itself: no script, no external resource. */
 const HTML_HEADERS: Record<string, string> = {
   "Content-Type": "text/html; charset=utf-8",
   "Cache-Control": "no-store",
@@ -8,6 +18,7 @@ const HTML_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "Strict-Transport-Security": viewerHeaders["Strict-Transport-Security"],
 };
 
 const STYLE = `
@@ -46,17 +57,29 @@ ${bodyHtml}
   return new Response(page, { status: 200, headers: HTML_HEADERS });
 }
 
-/** What the home page reports: `legacy_incomplete` = ready for every login and every device that signed in with gclone
- *  0.2.0 or later, but exactly one of the two GOOGLE_LEGACY_CLIENT_* secrets is set. */
-export type Status = "ready" | "legacy_incomplete" | "not_configured";
+/** What `/` reports. `viewer_not_configured`: every `gclone login` and every device works; the hosted viewer's
+ *  sign-in (`/web/*`) answers `500 server_misconfigured` until its three secrets are set. */
+export type Status = "ready" | "viewer_not_configured" | "not_configured";
 
-const STATUS_LINE: Record<Status, string> = {
+export const STATUS_LINE: Record<Status, string> = {
   ready: "Status: ready",
-  legacy_incomplete:
-    "Status: ready. Warning: only one of GOOGLE_LEGACY_CLIENT_ID and GOOGLE_LEGACY_CLIENT_SECRET is set; logins made before gclone 0.2.0 cannot be refreshed until both are set or both are deleted.",
+  viewer_not_configured: "Status: ready. The web viewer is not configured: it needs GOOGLE_LEGACY_CLIENT_ID, GOOGLE_LEGACY_CLIENT_SECRET and SEAL_KEY.",
   not_configured: "Status: not configured",
 };
 
+/** Where the status line goes in the viewer's `index.html`. */
+export const STATUS_MARKER = "<!--gclone-status-->";
+
+/** The viewer's page: `index.html` as deployed, with the status line in place of the marker. The same bytes for `/`
+ *  and `/callback` and for every query: nothing of the request is read. */
+export function viewerPage(indexHtml: string, status: Status): Response {
+  // A function as the replacement: no `$` pattern of the status text is ever interpreted.
+  const page = indexHtml.replace(STATUS_MARKER, () => STATUS_LINE[status]);
+  return new Response(page, { status: 200, headers: { ...VIEWER_HEADERS, "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+}
+
+/** `/` and `/callback` of a deployment without the viewer's files (no assets binding, or no `index.html` in it): what
+ *  the Worker is, and its status. The sign-in helper for `gclone login` does not depend on those files. */
 export function homePage(status: Status): Response {
   return html(
     "gclone sign-in helper",
@@ -64,6 +87,7 @@ export function homePage(status: Status): Response {
 It lets that person's own devices sign in to Google; only its owner can sign in here, and it serves nobody else.</p>
 <p>There is nothing to do on this page: a sign-in starts with <code>gclone login</code> in a terminal, and the code that
 terminal shows is entered at Google. Never enter a code that someone sent you.</p>
+<p>The web viewer's files are not part of this deployment.</p>
 <p><a href="/privacy">Privacy</a></p>
 <p class="status">${STATUS_LINE[status]}</p>`,
   );
@@ -72,13 +96,23 @@ terminal shows is entered at Google. Never enter a code that someone sent you.</
 export function privacyPage(): Response {
   return html(
     "Privacy",
-    `<p>This service signs its owner's gclone devices in to Google. It is not offered to anyone else.</p>
+    `<p>This service signs its owner's gclone devices, and the owner's browser for the web viewer on this site, in to Google.
+It is not offered to anyone else.</p>
 <p><strong>Google data it touches.</strong> During a sign-in it reads the e-mail address of the Google account, only to check
 that the account belongs to the owner. The access it requests (<code>drive.file</code>) covers only the Google Drive files that
 gclone itself created; it cannot see any other file. Those files are encrypted on the device before they are uploaded, and
-file data never passes through this service: devices talk to Google Drive directly.</p>
-<p><strong>What it stores.</strong> Nothing. It has no database and sets no cookies. The tokens Google issues are passed on only
+file data never passes through this service: devices, and the web viewer in the owner's browser, talk to Google Drive directly.
+The viewer decrypts files in the browser; the passphrase and the keys of a vault never leave it.</p>
+<p><strong>What it stores.</strong> Nothing on the server: it has no database. The tokens Google issues are passed on only
 to the owner's own devices and are not kept here.</p>
+<p><strong>Cookies.</strong> One, and only after the owner signed in to the web viewer: <code>__Host-gclone-web</code>. It holds
+that browser's Google sign-in for gclone (a refresh token and the account's e-mail address), encrypted so that only this
+service can open it. Scripts cannot read it, it is sent to this site only, it stops working 12 hours after the sign-in
+(30 days if "stay signed in" was chosen), and "Sign out" removes it. There is no other cookie and no tracking.</p>
+<p><strong>In the browser.</strong> Besides that cookie the web viewer keeps, in the browser's own storage for this site, the
+sort order chosen in the file list and a few short-lived markers in the tab: one random value for the minutes of a sign-in,
+and notes that let the page say so when the browser closed it in the middle of unlocking. It stores no key, nothing derived
+from the passphrase, no file name and no file content. "Sign out" clears this storage.</p>
 <p><strong>What it logs.</strong> No request content: no addresses, codes or tokens. For each request it logs only the route,
 the status and an error code. Cloudflare, the hosting platform, processes request metadata (IP address, time, URL path) under
 its own terms.</p>

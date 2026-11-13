@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "cases": [
     {
       "name": "start_ok",
@@ -182,22 +182,16 @@
       "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>"}}
     },
     {
-      "name": "refresh_legacy_ok",
-      "given": "legacy_token",
-      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
-      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>"}}
-    },
-    {
-      "name": "refresh_legacy_unconfigured",
-      "given": "legacy_unconfigured",
+      "name": "refresh_no_client",
+      "given": "refresh_token",
       "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
       "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
     },
     {
-      "name": "refresh_legacy_half_set",
-      "given": "legacy_half_set",
+      "name": "refresh_legacy_gone",
+      "given": "legacy_token",
       "request": {"method":"POST","path":"/refresh","headers":{"content-type":"application/json"},"json":{"refresh_token":"<refresh_token>"}},
-      "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"server_misconfigured","message":"<string>"}}
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
     },
     {
       "name": "refresh_half_set_device_ok",
@@ -278,16 +272,238 @@
       "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
     },
     {
-      "name": "callback_gone",
-      "given": "none",
-      "request": {"method":"GET","path":"/callback"},
-      "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
-    },
-    {
       "name": "token_gone",
       "given": "none",
       "request": {"method":"POST","path":"/token","headers":{"content-type":"application/json"},"json":{"code":"x","verifier":"y"}},
       "response": {"status":404,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"not_found","message":"<string>"}}
+    },
+    {
+      "name": "page_home",
+      "given": "web",
+      "request": {"method":"GET","path":"/"},
+      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8","cache-control":"no-store","content-security-policy":"default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; media-src 'self'; frame-src 'self'; worker-src 'self'; connect-src 'self' https://www.googleapis.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types gclone","referrer-policy":"no-referrer","x-content-type-options":"nosniff","x-frame-options":"DENY","cross-origin-opener-policy":"same-origin","cross-origin-resource-policy":"same-origin","permissions-policy":"camera=(), microphone=(), geolocation=(), payment=(), usb=()","strict-transport-security":"max-age=63072000; includeSubDomains"}}
+    },
+    {
+      "name": "page_callback",
+      "given": "web",
+      "request": {"method":"GET","path":"/callback?state=AAAAAAAAAAAAAAAAAAAAAA&code=4/0AfakeCode-of_the.callback&scope=email%20openid&iss=https://accounts.google.com"},
+      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8","cache-control":"no-store","content-security-policy":"default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; media-src 'self'; frame-src 'self'; worker-src 'self'; connect-src 'self' https://www.googleapis.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types gclone","referrer-policy":"no-referrer","x-content-type-options":"nosniff","x-frame-options":"DENY","cross-origin-opener-policy":"same-origin","cross-origin-resource-policy":"same-origin","permissions-policy":"camera=(), microphone=(), geolocation=(), payment=(), usb=()","strict-transport-security":"max-age=63072000; includeSubDomains"}}
+    },
+    {
+      "name": "page_unconfigured",
+      "given": "unconfigured",
+      "request": {"method":"GET","path":"/"},
+      "response": {"status":200,"headers":{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}}
+    },
+    {
+      "name": "web_start_ok",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/start","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"challenge":"<challenge>","state":"<state>"}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"authorization_url":"<string>"}}
+    },
+    {
+      "name": "web_start_malformed",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/start","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"challenge":"too-short","state":"<state>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
+    },
+    {
+      "name": "web_start_cross_origin",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/start","headers":{"content-type":"application/json","origin":"https://evil.example","sec-fetch-site":"cross-site"},"json":{"challenge":"<challenge>","state":"<state>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "web_start_no_origin",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/start","headers":{"content-type":"application/json"},"json":{"challenge":"<challenge>","state":"<state>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "web_start_unconfigured",
+      "given": "none",
+      "request": {"method":"POST","path":"/web/start","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"challenge":"<challenge>","state":"<state>"}},
+      "response": {"status":500,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"server_misconfigured","message":"<string>"}}
+    },
+    {
+      "name": "web_start_rate_limited",
+      "given": "rate_limited",
+      "request": {"method":"POST","path":"/web/start","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"challenge":"<challenge>","state":"<state>"}},
+      "response": {"status":429,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","retry-after":"60"},"json":{"error":"rate_limited","message":"<string>"}}
+    },
+    {
+      "name": "web_start_get",
+      "given": "web",
+      "request": {"method":"GET","path":"/web/start"},
+      "response": {"status":405,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","allow":"POST"},"json":{"error":"method_not_allowed","message":"<string>"}}
+    },
+    {
+      "name": "web_token_ok",
+      "given": "web_consented",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"<string>"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com","session_expires_in":43200}}
+    },
+    {
+      "name": "web_token_remember",
+      "given": "web_consented",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>","remember":true}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"<string>"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com","session_expires_in":2592000}}
+    },
+    {
+      "name": "web_token_other_verifier",
+      "given": "web_other_verifier",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
+    },
+    {
+      "name": "web_token_foreign_code",
+      "given": "web_foreign_code",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_grant","message":"<string>"}}
+    },
+    {
+      "name": "web_token_email_not_allowed",
+      "given": "web_consented_other_account",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"email_not_allowed","message":"<string>"}}
+    },
+    {
+      "name": "web_token_scope_not_allowed",
+      "given": "web_consented_wide_scope",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_not_allowed","message":"<string>"}}
+    },
+    {
+      "name": "web_token_scope_missing",
+      "given": "web_consented_no_drive_scope",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"scope_missing","message":"<string>"}}
+    },
+    {
+      "name": "web_token_malformed",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{"code":"not a code","verifier":"<verifier>"}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"invalid_request","message":"<string>"}}
+    },
+    {
+      "name": "web_token_cross_origin",
+      "given": "web_consented",
+      "request": {"method":"POST","path":"/web/token","headers":{"content-type":"application/json","origin":"https://evil.example","sec-fetch-site":"cross-site"},"json":{"code":"<code>","verifier":"<verifier>"}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_ok",
+      "given": "web_session",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com","session_expires_in":43200}}
+    },
+    {
+      "name": "web_refresh_remembered",
+      "given": "web_session_remembered",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"access_token":"<string>","expires_in":"<number>","scope":"<string>","email":"me@example.com","session_expires_in":2592000}}
+    },
+    {
+      "name": "web_refresh_no_session",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{}},
+      "response": {"status":401,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"no_session","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_bad_cookie",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"__Host-gclone-web=AAAA"},"json":{}},
+      "response": {"status":401,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"},"json":{"error":"no_session","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_other_key",
+      "given": "web_session_other_key",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":401,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"},"json":{"error":"no_session","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_expired",
+      "given": "web_session_expired",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":401,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"},"json":{"error":"no_session","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_invalid_grant",
+      "given": "web_session_revoked",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":400,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"},"json":{"error":"invalid_grant","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_email_not_allowed",
+      "given": "web_session_removed",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"},"json":{"error":"email_not_allowed","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_upstream",
+      "given": "web_session_google_down",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":502,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"upstream_error","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_cross_origin",
+      "given": "web_session",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"application/json","origin":"https://evil.example","sec-fetch-site":"cross-site","cookie":"<cookie>"},"json":{}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "web_refresh_wrong_content_type",
+      "given": "web_session",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"text/plain","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"body":"{}"},
+      "response": {"status":415,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"unsupported_media_type","message":"<string>"}}
+    },
+    {
+      "name": "web_logout_ok",
+      "given": "web_session",
+      "request": {"method":"POST","path":"/web/logout","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin","cookie":"<cookie>"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0","clear-site-data":"\"storage\""},"json":{}}
+    },
+    {
+      "name": "web_logout_no_session",
+      "given": "web",
+      "request": {"method":"POST","path":"/web/logout","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0","clear-site-data":"\"storage\""},"json":{}}
+    },
+    {
+      "name": "web_logout_unconfigured",
+      "given": "none",
+      "request": {"method":"POST","path":"/web/logout","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0","clear-site-data":"\"storage\""},"json":{}}
+    },
+    {
+      "name": "web_logout_cross_origin",
+      "given": "web_session",
+      "request": {"method":"POST","path":"/web/logout","headers":{"content-type":"application/json","origin":"https://evil.example","sec-fetch-site":"cross-site","cookie":"<cookie>"},"json":{}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "web_logout_over_limit",
+      "given": "rate_limited",
+      "request": {"method":"POST","path":"/web/logout","headers":{"content-type":"application/json","origin":"<origin>","sec-fetch-site":"same-origin"},"json":{}},
+      "response": {"status":200,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store","set-cookie":"__Host-gclone-web=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0","clear-site-data":"\"storage\""},"json":{}}
+    },
+    {
+      "name": "web_refresh_cross_origin_over_limit",
+      "given": "rate_limited",
+      "request": {"method":"POST","path":"/web/refresh","headers":{"content-type":"text/plain;charset=UTF-8","origin":"https://evil.example","sec-fetch-site":"cross-site"},"body":"x"},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "start_from_a_page",
+      "given": "none",
+      "request": {"method":"POST","path":"/device/start","headers":{"content-type":"application/json","origin":"https://evil.example"},"json":{}},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
+    },
+    {
+      "name": "refresh_from_a_page_over_limit",
+      "given": "rate_limited",
+      "request": {"method":"POST","path":"/refresh","headers":{"content-type":"text/plain;charset=UTF-8","sec-fetch-site":"cross-site"},"body":"x"},
+      "response": {"status":403,"headers":{"content-type":"application/json; charset=utf-8","cache-control":"no-store"},"json":{"error":"cross_origin","message":"<string>"}}
     }
   ]
 }

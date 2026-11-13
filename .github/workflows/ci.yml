@@ -63,6 +63,229 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  # The hosted viewer's core (web-core/): the CLI's read path compiled to WebAssembly. Its lockfile is a subset of the
+  # CLI's (web-core/build.sh fails on a difference), and its tests compare it with the native implementation.
+  web-core:
+    name: web-core (wasm build, native parity, Node tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain with the wasm target
+        run: |
+          # The version, rustfmt and clippy come from rust-toolchain.toml (web-core/ is below it).
+          rustup toolchain install --no-self-update
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            web-core -> target
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: wasm-bindgen, the version of the crate in web-core/Cargo.lock
+        run: sh .github/scripts/install-wasm-bindgen.sh
+      - run: cargo fmt --check
+        working-directory: web-core
+      - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+        working-directory: web-core
+      - run: cargo clippy --locked --lib --tests -- -D warnings
+        working-directory: web-core
+      # The reader against the CLI's SQL replica, natively.
+      - run: cargo test --locked
+        working-directory: web-core
+      # The native binary writes the vaults that the wasm module has to read.
+      - run: cargo build --release --locked
+      # Also the lockfile check: a package in both lockfiles has one version; wasm-bindgen's crate and command agree.
+      - name: Build the wasm module
+        run: sh web-core/build.sh
+      - name: The wasm module against vaults written by the native binary
+        run: sh web-core/test/run.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-core-pkg
+          path: web-core/pkg/
+          if-no-files-found: error
+          retention-days: 7
+      # The native binary, for the job that needs a fixture vault on Linux.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gclone-linux-ci
+          path: target/release/gclone
+          if-no-files-found: error
+          retention-days: 1
+
+  # The viewer's bundle (worker/dist): built from the module above with Node alone, checked, and served by the Worker
+  # and the asset layer under local workerd. No browser.
+  viewer:
+    name: viewer bundle, smoke, data layer
+    needs: web-core
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-core-pkg
+          path: web-core/pkg
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gclone-linux-ci
+          path: ${{ runner.temp }}/bin
+      - name: The native binary (an artifact loses its mode)
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/gclone"
+          "$RUNNER_TEMP/bin/gclone" --version
+          echo "GCLONE_BIN=$RUNNER_TEMP/bin/gclone" >> "$GITHUB_ENV"
+      - name: Build the bundle
+        run: node worker/viewer/build.mjs
+      - run: node worker/scripts/check-dist.mjs
+      - name: A second build gives the same tree
+        run: |
+          node worker/viewer/build.mjs --out "$RUNNER_TEMP/dist-again"
+          diff -r worker/dist "$RUNNER_TEMP/dist-again"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: viewer-dist
+          path: worker/dist/
+          if-no-files-found: error
+          retention-days: 7
+      - run: npm ci
+        working-directory: worker
+      # wrangler dev on the built dist/: which paths the asset layer answers, which the Worker, the headers.
+      - run: npm run smoke
+        working-directory: worker
+      # token.js, drive.js and loader.js in Node, against a fake Drive over a vault of the native binary.
+      - run: npm run test:viewer
+        working-directory: worker
+
+  # The whole browser suite, on macOS only: Playwright's Linux WebKit has another media stack than Safari, and every
+  # WebKit number in the tests was measured on the macOS build. Chrome is the runner's installed Google Chrome
+  # (Playwright's Chromium has no H.264 and AAC). The bundle is the one built above: the wasm bytes are the Linux build's.
+  viewer-browser:
+    name: viewer in Chrome, WebKit and Firefox (macOS)
+    needs: viewer
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      GCLONE_VIEWER_DIST: ${{ github.workspace }}/worker/dist
+      GCLONE_BIN: ${{ github.workspace }}/target/release/gclone
+      GCLONE_PLAYWRIGHT_CORE: ${{ github.workspace }}/worker/test/e2e/node_modules/playwright-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            web-core -> target
+      # The native binary writes the fixture vault.
+      - run: cargo build --release --locked
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            worker/package-lock.json
+            worker/test/e2e/package-lock.json
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: viewer-dist
+          path: worker/dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-core-pkg
+          path: web-core/pkg
+      - run: node worker/scripts/check-dist.mjs
+      # The sign-in test bundles the Worker with the esbuild that wrangler ships.
+      - run: npm ci
+        working-directory: worker
+      - name: Playwright (the driver only, pinned by worker/test/e2e/package-lock.json), its WebKit and Firefox
+        working-directory: worker/test/e2e
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/playwright-core/cli.js install webkit firefox
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+      # 20 s of H.264 at 20 Mbit/s, about 50 MB: only its bit rate matters, so it is made here and kept by the script's hash.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: big
+        with:
+          path: ${{ runner.temp }}/big.mp4
+          key: viewer-big-${{ hashFiles('worker/test/e2e/fixtures/make-big.sh') }}
+      - name: The large media fixture
+        if: steps.big.outputs.cache-hit != 'true'
+        run: |
+          brew install ffmpeg
+          sh worker/test/e2e/fixtures/make-big.sh "$RUNNER_TEMP/big.mp4"
+      # The module loaded by importScripts in a worker and a Service Worker under the page's policy, in each engine.
+      - name: Module smoke test
+        env:
+          GCLONE_WEB_CORE_SMOKE: chrome webkit firefox
+        run: sh web-core/test/run.sh
+      - name: The viewer end to end
+        env:
+          GCLONE_E2E_BIG: ${{ runner.temp }}/big.mp4
+        run: node worker/test/e2e/run.mjs chrome webkit firefox
+      - name: The sign-in through the Worker's own code
+        run: node worker/test/e2e/signin.mjs
+      - name: The shared page under gclone web
+        run: node worker/test/e2e/local.mjs chrome webkit firefox
+
+  # Informational until it has agreed for a while: is the wasm module the same on macOS as on Linux? The release's
+  # bundle is the Linux build either way (release.yml).
+  wasm-repro:
+    name: wasm bytes on macOS against Linux (informational)
+    needs: web-core
+    runs-on: macos-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain with the wasm target
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: web-core -> target
+      - name: wasm-bindgen, the version of the crate in web-core/Cargo.lock
+        run: sh .github/scripts/install-wasm-bindgen.sh
+      - run: sh web-core/build.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-core-pkg
+          path: ${{ runner.temp }}/linux-pkg
+      - name: Compare
+        run: |
+          mac=$(shasum -a 256 web-core/pkg/core.wasm | cut -d' ' -f1)
+          linux=$(shasum -a 256 "$RUNNER_TEMP/linux-pkg/core.wasm" | cut -d' ' -f1)
+          echo "macOS: $mac"
+          echo "Linux: $linux"
+          cat web-core/pkg/build.json "$RUNNER_TEMP/linux-pkg/build.json"
+          if [ "$mac" != "$linux" ]; then
+            echo "::warning::core.wasm built on macOS ($mac) differs from the Linux build ($linux)"
+            exit 1
+          fi
+
   install-script:
     name: install.sh
     runs-on: ubuntu-latest
@@ -72,6 +295,8 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck -s sh install.sh tests/install/test.sh
+      # The shell scripts of the hosted viewer: the wasm build and its test runner, the fixture makers, CI's own.
+      - run: shellcheck -s sh web-core/build.sh web-core/test/run.sh .github/scripts/*.sh worker/test/e2e/fixtures/*.sh
       # Against a fake release and a fake GitHub on loopback; with dash (Ubuntu's sh) and bash.
       - run: sh tests/install/test.sh
       - run: TEST_SHELL=bash sh tests/install/test.sh

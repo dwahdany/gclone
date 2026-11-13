@@ -1,7 +1,7 @@
 //! SQL reads behind the `Vault` query methods (SPEC §9.7) — owned by WP4. Private to `index`.
 //! Everything here looks at the local replica only.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -14,21 +14,12 @@ use crate::format::{DeviceRec, HeadRec, Op, RemovedRec, SnapshotV1, blob_name, o
 use crate::state::tables::{self, VERSION_COLS, arr, blob_at, heads_query, to_i, to_u, version_at};
 use crate::types::{BlobId, BlobRec, DeviceId, EntryKind, Head, OpDraft, RemovedVersion, Stamp};
 use crate::util;
+use crate::web::rules::search_paths;
 
 const BLOB_COLS: &str = "id, file_id, clen, md5, created_ms";
 
 fn text(s: impl Into<String>) -> Value {
     Value::Text(s.into())
-}
-
-/// A name as `search` compares it: NFC, lower case.
-fn fold_name(s: &str) -> String {
-    if s.is_ascii() {
-        s.to_ascii_lowercase()
-    } else {
-        use unicode_normalization::UnicodeNormalization as _;
-        s.nfc().collect::<String>().to_lowercase()
-    }
 }
 
 /// `(first path under prefix/, first path after the subtree)`: `'/' + 1 == '0'`.
@@ -263,55 +254,18 @@ impl<B: Backend> Vault<B> {
     /// of its own or exists only through what is under it. One pass over the paths of the
     /// replica; an empty needle finds nothing. For `gclone web` (§7.4).
     pub fn search(&self, needle: &str, limit: usize) -> Result<(Vec<SearchHit>, bool), IndexError> {
-        let needle = fold_name(needle);
-        if needle.is_empty() || limit == 0 {
-            return Ok((Vec::new(), false));
-        }
+        // The match itself is `rules::search_paths`: the hosted viewer runs the same loop over
+        // its in-memory index, so the two cannot disagree about what a search finds.
         Ok(self.db.read(|c| {
-            let mut found: Vec<(String, bool)> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut more = false;
-            {
+            let (found, more) = {
                 let mut stmt = c.prepare_cached(
                     "SELECT path, kind FROM heads WHERE winner = 1 ORDER BY path",
                 )?;
-                let mut rows = stmt.query([])?;
-                // The directory of the previous row: its components have been looked at.
-                let mut parent = String::new();
-                'rows: while let Some(r) = rows.next()? {
-                    let path: String = r.get(0)?;
-                    let is_dir = r.get::<_, i64>(1)? == 1;
-                    let (dir, name) = match path.rfind('/') {
-                        Some(i) => (&path[..i], &path[i + 1..]),
-                        None => ("", path.as_str()),
-                    };
-                    let mut hits: Vec<(&str, bool)> = Vec::new();
-                    if dir != parent {
-                        let ends = dir.match_indices('/').map(|(i, _)| i);
-                        for end in ends.chain([dir.len()]).filter(|end| *end > 0) {
-                            let above = &dir[..end];
-                            if fold_name(crate::path::file_name(above)).contains(&needle) {
-                                hits.push((above, true));
-                            }
-                        }
-                        parent = dir.to_owned();
-                    }
-                    if fold_name(name).contains(&needle) {
-                        hits.push((&path, is_dir));
-                    }
-                    for (hit, is_dir) in hits {
-                        if seen.contains(hit) {
-                            continue;
-                        }
-                        if found.len() == limit {
-                            more = true;
-                            break 'rows;
-                        }
-                        seen.insert(hit.to_owned());
-                        found.push((hit.to_owned(), is_dir));
-                    }
-                }
-            }
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? == 1))
+                })?;
+                search_paths(rows, needle, limit)?
+            };
             let mut out = Vec::with_capacity(found.len());
             for (path, is_dir) in found {
                 let head = if is_dir {

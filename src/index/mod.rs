@@ -29,7 +29,9 @@ mod refresh;
 mod repair;
 mod resolve;
 
-pub use apply::{ApplyStats, HeadStore, MemIndex, apply_segment, causal_order};
+pub use apply::{
+    ApplyStats, HeadStore, MemIndex, apply_segment, causal_order, check_snapshot_format,
+};
 
 #[derive(Clone, Debug)]
 pub struct VaultHandles {
@@ -581,7 +583,7 @@ impl<B: Backend> Vault<B> {
                     continue;
                 }
             };
-            if descriptor.min_reader > u32::from(SUPPORTED_FORMAT) {
+            if !descriptor.readable() {
                 tracing::warn!(
                     "ignoring vault {}: it needs a newer gclone (reader version {})",
                     descriptor.vault_id,

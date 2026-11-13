@@ -115,7 +115,8 @@ pub async fn run(g: &GlobalOpts, _args: StatusArgs) -> anyhow::Result<i32> {
     }
 
     idle_warning(&ctx);
-    // §17.18: a login from before 0.2.0 depends on the Worker's legacy OAuth client.
+    // §17.18, §17.22: a login from before 0.2.0 is refreshed only by an auth Worker older than
+    // 0.4.0; the 0.4.0 Worker answers it `invalid_grant`.
     if matches!(ctx.config.backend, BackendCfg::Drive)
         && secrets
             .as_ref()
@@ -123,8 +124,8 @@ pub async fn run(g: &GlobalOpts, _args: StatusArgs) -> anyhow::Result<i32> {
     {
         ctx.ui.warn(
             "this device's Google login was made with the browser sign-in of gclone before \
-             0.2.0; run `gclone login` to renew it — it stops working once the auth Worker's \
-             legacy client is removed",
+             0.2.0; run `gclone login` to renew it — the auth Worker of gclone 0.4.0 and later \
+             no longer serves it",
         );
     }
     if let Some(end) = secrets.as_ref().and_then(|s| s.refresh_expires_at_ms) {

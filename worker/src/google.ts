@@ -1,8 +1,10 @@
-// Everything the Worker says to Google: the device-code request, the two token-endpoint calls, revoke, and the ID-token payload.
+// Everything the Worker says to Google: the device-code request, the address of the browser sign-in, the three
+// token-endpoint calls, revoke, and the ID-token payload.
 
 import type { Deps, Env } from "./index";
+import { b64urlDecode } from "./seal";
 
-/** What `/device/start` asks Google for. Nothing a device sends can change it. */
+/** What `/device/start` and `/web/start` ask Google for. Nothing a device or a page sends can change it. */
 export const SCOPES = "openid email https://www.googleapis.com/auth/drive.file";
 export const SCOPE_DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";
 /** Every scope a grant of this Worker's clients may carry: SCOPES, plus Google's own spelling of the granted `email` scope. */
@@ -10,6 +12,8 @@ export const ALLOWED_SCOPES: readonly string[] = ["openid", "email", "https://ww
 // Pre-filters: malformed input never reaches Google. They deliberately do not assume today's "AH-1…" and "1//…" prefixes.
 export const DEVICE_CODE_RE = /^[A-Za-z0-9_\/.~+=-]{16,512}$/;
 export const REFRESH_TOKEN_RE = /^[A-Za-z0-9_\/.~+=-]{20,512}$/;
+/** An authorization code of the browser sign-in (Google: at most 256 bytes). */
+export const CODE_RE = /^[A-Za-z0-9_\/.~+=-]{8,512}$/;
 /** What a user code from Google may look like before it is passed on to a terminal: printable ASCII, short. */
 const USER_CODE_RE = /^[\x21-\x7e][\x20-\x7e]{0,62}[\x21-\x7e]$/;
 const VERIFICATION_URL_RE = /^https:\/\/[\x21-\x7e]{1,200}$/;
@@ -22,7 +26,7 @@ export const DEFAULT_POLL_INTERVAL_S = 5;
 const GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 const GOOGLE_TIMEOUT_MS = 10_000;
 const GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"];
-const CLIENT_ERRORS = ["invalid_client", "deleted_client", "unauthorized_client", "invalid_scope"];
+const CLIENT_ERRORS = ["invalid_client", "deleted_client", "unauthorized_client", "invalid_scope", "redirect_uri_mismatch"];
 const DENIED_ERRORS = ["access_denied", "admin_policy_enforced", "org_internal"];
 /** The states of a device code that is not (or no longer) redeemable, passed on under Google's own names (RFC 8628 §3.5). */
 const DEVICE_CODE_STATES: Record<string, string> = {
@@ -37,26 +41,23 @@ export interface Client {
   secret: string;
 }
 
-/** `device`: the "TVs and Limited Input devices" client every login uses. `legacy`: the "Web application" client of the
- *  browser sign-in before gclone 0.2.0, kept only so that `/refresh` still serves the refresh tokens it issued.
- *  `legacyIncomplete`: exactly one of the two legacy secrets is set — the legacy client cannot be used (`legacy` is
- *  null), and nothing else is affected. */
+/** `device`: the "TVs and Limited Input devices" client of every `gclone login`, and the only client `/refresh` serves.
+ *  `web`: the "Web application" client of the hosted viewer's sign-in (`/web/*`), from the secrets
+ *  GOOGLE_LEGACY_CLIENT_ID / GOOGLE_LEGACY_CLIENT_SECRET — the names they have had since that client served the browser
+ *  sign-in of gclone before 0.2.0; null unless both are set. */
 export interface Clients {
   device: Client;
-  legacy: Client | null;
-  legacyIncomplete: boolean;
+  web: Client | null;
 }
 
-/** The configured clients, or null when the device client's secrets are missing. A half-set legacy pair is not a
- *  reason to stop serving the device client: the documented way to remove the pair is two `wrangler secret delete`
- *  commands, each deployed at once, so every Worker passes through that state. */
+/** The configured clients, or null when the device client's secrets are missing. A missing or half-set web pair is not
+ *  a reason to stop serving the device client: it switches the hosted viewer off and nothing else. */
 export function configuredClients(env: Env): Clients | null {
   const text = (v: unknown) => (typeof v === "string" ? v : "");
   const [id, secret] = [text(env.GOOGLE_CLIENT_ID), text(env.GOOGLE_CLIENT_SECRET)];
-  const [legacyId, legacySecret] = [text(env.GOOGLE_LEGACY_CLIENT_ID), text(env.GOOGLE_LEGACY_CLIENT_SECRET)];
+  const [webId, webSecret] = [text(env.GOOGLE_LEGACY_CLIENT_ID), text(env.GOOGLE_LEGACY_CLIENT_SECRET)];
   if (id === "" || secret === "") return null;
-  const legacy = legacyId !== "" && legacySecret !== "" ? { id: legacyId, secret: legacySecret } : null;
-  return { device: { id, secret }, legacy, legacyIncomplete: (legacyId === "") !== (legacySecret === "") };
+  return { device: { id, secret }, web: webId !== "" && webSecret !== "" ? { id: webId, secret: webSecret } : null };
 }
 
 /** The entries of a space-separated `scope` answer that are outside ALLOWED_SCOPES; empty = nothing beyond what
@@ -98,6 +99,27 @@ export async function requestDeviceCode(client: Client, deps: Deps): Promise<Goo
   return { ok: true, value: { device_code, user_code, verification_url, expires_in, interval } };
 }
 
+/** The address the hosted viewer sends the browser to. Everything in it is fixed here except the PKCE challenge and
+ *  the tab's `state`; `nonce` = loginNonce(challenge). No `include_granted_scopes`, no `login_hint`, nothing derived
+ *  from ALLOWED_EMAILS. `access_type=offline` with `prompt=consent`: a refresh token on every sign-in. Google is not
+ *  contacted. */
+export function authorizationUrl(client: Client, deps: Deps, redirectUri: string, challenge: string, state: string, nonce: string): string {
+  const query = new URLSearchParams({
+    client_id: client.id,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state,
+    nonce,
+  });
+  return `${deps.google.authUrl}?${query}`;
+}
+
+/** What a login yields, through either client. */
 export interface DeviceTokens {
   refresh_token: string;
   access_token: string;
@@ -109,12 +131,12 @@ export interface DeviceTokens {
 
 /** A grant Google has issued — the device code is consumed — but that cannot be handed out. Final for the device: a
  *  further poll could only get `invalid_grant`. `what` completes "Google approved the sign-in, but …". */
-export function grantUnusable(what: string): GoogleFailure {
+export function grantUnusable(what: string, used = "code"): GoogleFailure {
   return {
     ok: false,
     status: 403,
     error: "grant_unusable",
-    message: `Google approved the sign-in, but ${what}, so nothing was handed out and the code is used up. If this happens on every login, see "Troubleshooting" in worker/README.md.`,
+    message: `Google approved the sign-in, but ${what}, so nothing was handed out and the ${used} is used up. If this happens on every login, see "Troubleshooting" in worker/README.md.`,
   };
 }
 
@@ -123,12 +145,24 @@ export function grantUnusable(what: string): GoogleFailure {
  *  token answer that lacks a part the Worker needs as 403 `grant_unusable`. */
 export async function pollDeviceCode(client: Client, deps: Deps, deviceCode: string): Promise<GoogleResult<DeviceTokens>> {
   const answer = await tokenRequest(client, deps, { grant_type: GRANT_DEVICE_CODE, device_code: deviceCode }, DEVICE_CODE_STATES);
-  if (!answer.ok) return answer;
   // From here on Google has consumed the device code: nothing below may look like "try again".
-  const { refresh_token, access_token, expires_in, scope, id_token, refresh_token_expires_in } = answer.value;
-  if (!nonEmptyString(refresh_token)) return grantUnusable("its answer carried no refresh token");
-  if (!nonEmptyString(access_token) || !finiteNumber(expires_in)) return grantUnusable("its answer carried no usable access token");
-  if (!nonEmptyString(id_token)) return grantUnusable("its answer carried no ID token (the account cannot be checked without one)");
+  return answer.ok ? grantTokens(answer.value, "code") : answer;
+}
+
+/** The authorization code of the browser sign-in for tokens (RFC 7636: with the tab's code verifier). A wrong verifier, a
+ *  used or unknown code and a code of another redirect URI come back as 400 `invalid_grant`; a redirect URI the client
+ *  does not list as 500 `client_invalid`; a token answer that lacks a part the Worker needs as 403 `grant_unusable`. */
+export async function exchangeCode(client: Client, deps: Deps, redirectUri: string, code: string, verifier: string): Promise<GoogleResult<DeviceTokens>> {
+  const answer = await tokenRequest(client, deps, { grant_type: "authorization_code", code, redirect_uri: redirectUri, code_verifier: verifier });
+  return answer.ok ? grantTokens(answer.value, "sign-in code") : answer;
+}
+
+/** The parts of a token answer that a login needs; what is missing is named. Google has consumed the code by now. */
+function grantTokens(answer: Record<string, unknown>, used: string): GoogleResult<DeviceTokens> {
+  const { refresh_token, access_token, expires_in, scope, id_token, refresh_token_expires_in } = answer;
+  if (!nonEmptyString(refresh_token)) return grantUnusable("its answer carried no refresh token", used);
+  if (!nonEmptyString(access_token) || !finiteNumber(expires_in)) return grantUnusable("its answer carried no usable access token", used);
+  if (!nonEmptyString(id_token)) return grantUnusable("its answer carried no ID token (the account cannot be checked without one)", used);
   const value: DeviceTokens = { refresh_token, access_token, expires_in, scope: typeof scope === "string" ? scope : "", id_token };
   if (finiteNumber(refresh_token_expires_in)) value.refresh_token_expires_in = refresh_token_expires_in;
   return { ok: true, value };
@@ -168,6 +202,8 @@ export interface IdClaims {
   iss?: string;
   email?: string;
   email_verified?: boolean;
+  /** Only the browser sign-in asks for one (`/web/start`). */
+  nonce?: string;
 }
 
 /** Payload only, no signature check: the token is only ever taken from Google's token endpoint, over TLS, in answer to a
@@ -189,6 +225,7 @@ export function idTokenClaims(idToken: string): IdClaims | null {
   if (typeof json.iss === "string") claims.iss = json.iss;
   if (typeof json.email === "string") claims.email = json.email;
   if (typeof json.email_verified === "boolean") claims.email_verified = json.email_verified;
+  if (typeof json.nonce === "string") claims.nonce = json.nonce;
   return claims;
 }
 
@@ -229,14 +266,6 @@ export function maskedEmail(email: string | undefined): string | null {
   const at = email.lastIndexOf("@");
   if (at < 1 || at === email.length - 1) return null;
   return `${email[0]}***${email.slice(at)}`;
-}
-
-export function b64urlDecode(text: string): Uint8Array | null {
-  if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) return null;
-  const bin = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 const UPSTREAM = { ok: false, status: 502, error: "upstream_error", message: "Google's sign-in service did not give a usable answer." } as const;

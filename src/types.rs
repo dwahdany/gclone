@@ -281,6 +281,7 @@ impl SegRef {
 }
 
 impl StatSig {
+    #[cfg(unix)]
     pub fn from_metadata(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         StatSig {

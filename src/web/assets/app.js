@@ -4,8 +4,29 @@
 // No name from the vault is put where the browser keeps it beyond the tab: the address and
 // the title never change (the place in the vault is in history.state), and files are
 // addressed by the opaque ids the server hands out.
+//
+// The page has one seam, `provider`: where the answers and the files come from. `gclone web`
+// uses the one below (this server). The hosted viewer runs the same script over a vault it
+// reads in the browser, and sets `window.gcloneProvider` before the script starts.
 'use strict';
 (() => {
+  const provider = window.gcloneProvider || {
+    // (name, params, options) -> Promise<object>: one call of the viewer's API.
+    api: httpApi,
+    // (id, download) -> string: the address of a file's bytes, by the id `stat` gave.
+    fileUrl: httpFileUrl,
+    // Said when a request gets no answer at all.
+    unreachable: 'The viewer does not answer. Is `gclone web` still running in its terminal?',
+    // true: places live in the page's memory, and history.state holds no name either.
+    privateAddress: false,
+    // false: a card with "Open" (a tab of its own) in place of the PDF frame.
+    pdfInline: true,
+    // (kind) -> boolean: whether a file of this kind is offered "Open in a new tab".
+    openInTab: () => true,
+    // false: download links are plain links, which the answer's Content-Disposition turns
+    // into downloads (a browser may fetch a `download` link past a Service Worker).
+    downloadAttribute: true,
+  };
   const $ = (id) => document.getElementById(id);
   const SVG = 'http://www.w3.org/2000/svg'; // a namespace name, not an address
   const PAGE = 2000; // entries per request
@@ -114,10 +135,14 @@
   // Rows know their folder: `view.path` already names the next one while that is loading.
   const pathOf = (entry) => (entry.path != null ? entry.path : join(view.entriesDir, entry.name));
 
-  // A name as it is shown: every character of it, on one line. Line breaks, tabs and other
-  // control characters become their pictures (U+2400…); spaces are kept by `white-space: pre`.
-  const show = (name) => name.replace(/[\u0000-\u001f\u007f]/g,
-    (c) => (c === '\u007f' ? '\u2421' : String.fromCharCode(0x2400 + c.charCodeAt(0))));
+  // A name as it is shown: every character of it, on one line, in the order it has. Line
+  // breaks, tabs and other control characters become their pictures (U+2400…); spaces are kept
+  // by `white-space: pre`. The characters that turn the text around them (U+202E and its kin)
+  // become U+FFFD: `invoice<U+202E>fdp.exe` must not read "invoiceexe.pdf". Tooltips and
+  // labels keep the name as it is.
+  const show = (name) => name
+    .replace(/[\u0000-\u001f\u007f]/g, (c) => (c === '\u007f' ? '\u2421' : String.fromCharCode(0x2400 + c.charCodeAt(0))))
+    .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '\ufffd');
 
   // A sentence with `commands` in it: text nodes and <code> elements, never markup.
   function prose(node, text) {
@@ -131,8 +156,25 @@
   // history.state: reload, back and forward work, and neither the address nor the title ever
   // carries a name from the vault into the browser's history.
 
+  // With `provider.privateAddress` not even history.state holds a place — session history
+  // outlives the tab in the browser's session files. The places are in `places`, in this
+  // page's memory; an entry holds its number there and `epoch`, which names this run of the
+  // script. An entry of another run (before a reload) leads to the vault's root.
+  const places = [];
+  const epoch = provider.privateAddress
+    ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('') : null;
+  const ownEntry = () => !provider.privateAddress || !!(history.state && history.state.e === epoch);
+
+  // What an entry keeps of its place: the place itself, or its number in `places`.
+  function kept(place, replace) {
+    if (!provider.privateAddress) return place;
+    const n = replace && ownEntry() ? history.state.n : places.length;
+    places[n] = place;
+    return { e: epoch, n };
+  }
+
   function where() {
-    const state = history.state;
+    const state = provider.privateAddress ? (ownEntry() && places[history.state.n]) || null : history.state;
     if (state && typeof state.search === 'string' && state.search.trim()) return { search: state.search.trim() };
     if (state && typeof state.file === 'string' && state.file) return { file: state.file };
     if (state && typeof state.dir === 'string') return { dir: state.dir };
@@ -141,16 +183,17 @@
 
   const samePlace = (a, b) => a.dir === b.dir && a.file === b.file && a.search === b.search;
   const placeOf = (entry) => (entry.dir ? { dir: pathOf(entry) } : { file: pathOf(entry) });
-  const depth = () => (history.state && history.state.depth) || 0;
+  const depth = () => (ownEntry() && history.state && history.state.depth) || 0;
+  // This entry began a search from inside the page, so "back" ends it.
+  const began = () => !!(ownEntry() && history.state && history.state.began);
 
   function navigate(place, replace) {
     if (samePlace(place, where())) {
       route();
       return;
     }
-    // `began`: this entry began a search from inside the page, so "back" ends it.
-    if (replace) history.replaceState({ ...place, depth: depth(), began: !!(history.state && history.state.began) }, '');
-    else history.pushState({ ...place, depth: depth() + 1, began: place.search != null }, '');
+    if (replace) history.replaceState({ ...kept(place, true), depth: depth(), began: began() }, '');
+    else history.pushState({ ...kept(place, false), depth: depth() + 1, began: place.search != null }, '');
     route();
   }
 
@@ -162,15 +205,18 @@
     return node;
   }
 
-  // Files are fetched by the id `api/stat` gives (the path, sealed by the server).
-  const fileUrl = (id, download) => `file?id=${encodeURIComponent(id)}${download ? '&dl=1' : ''}`;
+  // Files are fetched by the id `api/stat` gives (here: the path, sealed by the server).
+  function httpFileUrl(id, download) {
+    return `file?id=${encodeURIComponent(id)}${download ? '&dl=1' : ''}`;
+  }
+  const fileUrl = (id, download) => provider.fileUrl(id, download);
 
   // Out of the search, to the folder it was started from.
   function leaveSearch() {
     clearTimeout(searchTimer);
     dom.search.value = '';
     if (view.mode !== 'search') return;
-    if (history.state && history.state.began) history.back();
+    if (began()) history.back();
     else navigate({ dir: lastDir }, true);
   }
 
@@ -187,17 +233,18 @@
     try {
       res = await fetch(url, { cache: 'no-store', credentials: 'same-origin', ...options });
     } catch (_) {
-      throw new Error('The viewer does not answer. Is `gclone web` still running in its terminal?');
+      throw new Error(provider.unreachable);
     }
     if (!res.ok) throw new Error(await explain(res));
     return res;
   }
 
-  async function api(name, params, options) {
+  async function httpApi(name, params, options) {
     const query = params ? `?${new URLSearchParams(params)}` : '';
     const res = await request(`api/${name}${query}`, options);
     return res.json();
   }
+  const api = (name, params, options) => provider.api(name, params, options);
 
   function setBusy(on) {
     busy = Math.max(0, busy + (on ? 1 : -1));
@@ -518,7 +565,7 @@
     ? request(fileUrl(entry.id), { headers: { Range: 'bytes=0-0' } }) : Promise.resolve());
 
   function downloadLink(entry, cls, ...children) {
-    const node = el('a', { class: `${cls} dl`, href: fileUrl(entry.id, true), download: true, title: 'Download this file' }, ...children);
+    const node = el('a', { class: `${cls} dl`, href: fileUrl(entry.id, true), download: provider.downloadAttribute, title: 'Download this file' }, ...children);
     node.entry = entry;
     return node;
   }
@@ -531,7 +578,7 @@
     control.classList.add('wait');
     try {
       await probe(control.entry);
-      const go = el('a', { href: control.getAttribute('href'), download: true, hidden: true });
+      const go = el('a', { href: control.getAttribute('href'), download: provider.downloadAttribute, hidden: true });
       document.body.append(go);
       go.click();
       go.remove();
@@ -599,6 +646,13 @@
       media.addEventListener('loadedmetadata', ready, { once: true });
       media.addEventListener('error', fallback, { once: true });
       put(wait, media);
+    } else if (entry.kind === 'pdf' && !provider.pdfInline) {
+      // No frame for a PDF (a browser that shows only its first page in one; a viewer that
+      // keeps PDFs out of its own tab): a tab of its own, which the viewer has no hold on.
+      const box = kindCard(entry, 'A PDF opens in a tab of its own. That tab is not part of the viewer: close it when you are done.');
+      box.insertBefore(el('a', { class: 'btn', href: url, target: '_blank', rel: 'noopener' },
+        icon('open'), el('span', { text: 'Open' })), box.lastChild);
+      put(box);
     } else if (entry.kind === 'pdf') {
       // A frame cannot say that it failed: ask for the first byte before it is filled.
       put(wait);
@@ -678,7 +732,7 @@
       save.entry = entry;
       save.setAttribute('href', fileUrl(entry.id, true));
       save.hidden = false;
-      if (PREVIEWS.has(entry.kind) && entry.size > 0) {
+      if (PREVIEWS.has(entry.kind) && entry.size > 0 && provider.openInTab(entry.kind)) {
         $('viewer-open').setAttribute('href', fileUrl(entry.id));
         $('viewer-open').hidden = false;
       }
@@ -905,6 +959,7 @@
 
   // ---- start ------------------------------------------------------------------------------------
 
+  if (!provider.downloadAttribute) $('viewer-download').removeAttribute('download');
   renderSort();
   renderCrumbs();
   loadInfo(true);

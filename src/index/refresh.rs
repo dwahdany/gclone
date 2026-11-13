@@ -9,14 +9,16 @@ use futures_util::{StreamExt, TryStreamExt};
 use rusqlite::Connection;
 
 use super::commit::{apply_and_record, raise_lamport, set_base_meta};
-use super::{RefreshReport, Vault, blocking, cache_store, causal_order, not_visible, query};
+use super::{
+    RefreshReport, Vault, blocking, cache_store, causal_order, check_snapshot_format, not_visible,
+    query,
+};
 use crate::backend::{Backend, Handle, ObjMeta, get_bounded, md5_of};
 use crate::consts::{GAP_GRACE_MS, INDEX_PARALLEL_MAX};
 use crate::crypto::Keyring;
 use crate::error::{BackendError, FormatError, IndexError, StateError};
 use crate::format::{
-    IndexName, SUPPORTED_FORMAT, SegmentV1, SnapshotV1, open_segment, open_snapshot,
-    parse_index_name, segment_name,
+    IndexName, SegmentV1, SnapshotV1, open_segment, open_snapshot, parse_index_name, segment_name,
 };
 use crate::state::tables::{self, AppliedRow, Version};
 use crate::types::{CoveredSeg, DeviceId, SegRef};
@@ -1307,15 +1309,18 @@ fn set_base(
         tables::hw_raise(c, tip)?;
     }
     raise_lamport(c, snap.lamport)?;
+    // The device that wrote S was alive when it did. A snapshot carries only the time each
+    // device joined (`first_ms`): without this, a replica that starts from S — a new device,
+    // a rebuilt one, the hosted viewer on every visit — would name the device that joined
+    // last, at the time it joined, as the vault's last change.
+    tables::device_seen(c, snap.device, snap.created_ms)?;
     Ok(())
 }
 
 /// Replaces heads, removed versions, devices and the blob rows without `trashed_ms` by the
 /// content of `snap` (§5.3 rebuild_from). `applied`, the base tables and `hw` are the caller's.
 pub(super) fn load_snapshot(c: &Connection, snap: &SnapshotV1) -> Result<(), IndexError> {
-    if snap.vault_format > SUPPORTED_FORMAT {
-        return Err(IndexError::NeedsNewerGclone);
-    }
+    check_snapshot_format(snap)?;
     c.execute_batch(
         "DELETE FROM heads; DELETE FROM removed; DELETE FROM devices; \
          DELETE FROM blobs WHERE trashed_ms IS NULL;",

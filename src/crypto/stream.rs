@@ -518,6 +518,37 @@ impl Opener {
         self.chunk_log2
     }
 
+    /// A **ticket**: what opens the chunks of this one stream and nothing else — its stream
+    /// key and the 60 header bytes it belongs to. For a reader that must hold neither a
+    /// purpose key nor a master key (the hosted viewer's Service Worker gets one ticket per
+    /// opened file). The stream key is `HKDF(K_purpose, salt, …)[0..32]` of this stream: no
+    /// other stream's key, no purpose key and no master key can be derived from it.
+    pub fn export_ticket(&self) -> (Zeroizing<[u8; 32]>, [u8; HEADER_LEN]) {
+        (self.key.clone(), self.header)
+    }
+
+    /// The opener of the Data stream a ticket was exported from ([`Opener::export_ticket`]).
+    /// `header` must be exactly the 60 header bytes of a Data stream this build can read
+    /// (`Truncated`, `TrailingData`, `BadMagic`, `Unsupported` as in [`Header::decode`]; another
+    /// stream type is `WrongKey`). The commitment in the header cannot be checked here — it is
+    /// derived from the purpose key, which a ticket deliberately does not carry — so the key is
+    /// taken on trust from whoever issued the ticket; every chunk is still authenticated under
+    /// it, so a wrong key opens nothing.
+    pub fn from_ticket(key: Zeroizing<[u8; 32]>, header: &[u8]) -> Result<Opener, CryptoError> {
+        if header.len() > HEADER_LEN {
+            return Err(CryptoError::TrailingData);
+        }
+        let h = Header::decode(header)?;
+        if h.ty != StreamType::Data {
+            return Err(CryptoError::WrongKey);
+        }
+        Ok(Opener {
+            key,
+            header: h.encode(),
+            chunk_log2: h.chunk_log2,
+        })
+    }
+
     /// `ct` = exactly one chunk's ct‖tag; appends plaintext to `out` only after the tag
     /// verified. `Corrupt` on failure — also for a chunk whose length no stream can contain: a
     /// non-final chunk that is not full, a chunk longer than `C + 16`, or an empty chunk other
@@ -968,5 +999,134 @@ pub(crate) mod tests {
             Err(CryptoError::Misuse(_))
         ));
         assert!(out.is_empty());
+    }
+
+    /// A Data stream of the KAT keyring with its own salt, as an index entry describes it.
+    fn data_stream(salt: [u8; 16], chunk_log2: u8, pt: &[u8]) -> (Loc, Vec<u8>) {
+        let (key, epoch) = kat_key(StreamType::Data);
+        let mut sealer =
+            Sealer::with_salt_for_tests(&key, StreamType::Data, epoch, chunk_log2, salt);
+        let sealed = seal_with(&mut sealer, pt);
+        let loc = Loc {
+            blob: crate::types::BlobId([7; 16]),
+            off: 0,
+            clen: sealed.len() as u64,
+            salt,
+            chunk_log2,
+            epoch,
+            suite: SUITE_V1,
+            flags: 0,
+        };
+        (loc, sealed)
+    }
+
+    /// Every chunk of `sealed` through `opener`, the final one decided by the plaintext length.
+    fn open_chunks(opener: &Opener, sealed: &[u8], plain_len: u64) -> Result<Vec<u8>, CryptoError> {
+        let chunk_log2 = opener.chunk_log2();
+        let (mut out, mut at) = (Vec::new(), HEADER_LEN);
+        let chunks = chunk_count(plain_len, chunk_log2);
+        for idx in 0..chunks {
+            let len = chunk_cipher_len(idx, plain_len, chunk_log2);
+            opener.open_chunk(idx, idx + 1 == chunks, &sealed[at..at + len], &mut out)?;
+            at += len;
+        }
+        assert_eq!(at, sealed.len());
+        Ok(out)
+    }
+
+    #[test]
+    fn a_ticket_opens_its_stream_and_no_other() {
+        let keys = kat_keyring();
+        let pt = kat_plaintext(3 * 4096 + 17);
+        let (loc_a, sealed_a) = data_stream(KAT_SALT, 12, &pt);
+        let (loc_b, sealed_b) = data_stream(seq::<16>(0x10), 12, &pt);
+        let opener_a = keys.data_opener(&loc_a).unwrap();
+        let (key_a, header_a) = opener_a.export_ticket();
+        // The ticket's header is the stream's own: what a full read compares with.
+        assert_eq!(header_a, sealed_a[..HEADER_LEN]);
+        assert_eq!(header_a, opener_a.expected_header());
+
+        // From the ticket alone — no keyring, no purpose key — every chunk opens.
+        let ticket_a = Opener::from_ticket(key_a.clone(), &header_a).unwrap();
+        assert_eq!(ticket_a.chunk_log2(), 12);
+        assert_eq!(ticket_a.expected_header(), header_a);
+        assert_eq!(
+            open_chunks(&ticket_a, &sealed_a, pt.len() as u64).unwrap(),
+            pt
+        );
+        // A single chunk in the middle, as a ranged read asks for it.
+        let full = 4096 + TAG_LEN;
+        let mut one = Vec::new();
+        ticket_a
+            .open_chunk(
+                2,
+                false,
+                &sealed_a[HEADER_LEN + 2 * full..HEADER_LEN + 3 * full],
+                &mut one,
+            )
+            .unwrap();
+        assert_eq!(one, pt[2 * 4096..3 * 4096]);
+
+        // Another stream of the same file content, the same purpose key and the same epoch
+        // has another stream key: the ticket opens none of its chunks.
+        assert!(matches!(
+            open_chunks(&ticket_a, &sealed_b, pt.len() as u64),
+            Err(CryptoError::Corrupt)
+        ));
+        let (key_b, header_b) = keys.data_opener(&loc_b).unwrap().export_ticket();
+        assert_ne!(key_a.as_slice(), key_b.as_slice());
+        // Neither does a ticket put together from one stream's key and the other's header.
+        let mixed = Opener::from_ticket(key_a.clone(), &header_b).unwrap();
+        assert!(matches!(
+            open_chunks(&mixed, &sealed_b, pt.len() as u64),
+            Err(CryptoError::Corrupt)
+        ));
+        // The chunk rules hold for a ticket as for any opener: position and final flag.
+        let mut out = Vec::new();
+        assert!(matches!(
+            ticket_a.open_chunk(1, false, &sealed_a[HEADER_LEN..HEADER_LEN + full], &mut out),
+            Err(CryptoError::Corrupt)
+        ));
+        assert!(matches!(
+            ticket_a.open_chunk(0, true, &sealed_a[HEADER_LEN..HEADER_LEN + full], &mut out),
+            Err(CryptoError::Corrupt)
+        ));
+        assert!(out.is_empty());
+
+        // The stream key is not a key of the hierarchy: neither the purpose key it came from
+        // nor the master key.
+        let (purpose, _) = kat_key(StreamType::Data);
+        assert_ne!(key_a.as_slice(), purpose.expose());
+        assert_ne!(key_a.as_slice(), KAT_MK);
+    }
+
+    #[test]
+    fn a_ticket_needs_the_header_of_a_readable_data_stream() {
+        let (loc, sealed) = data_stream(KAT_SALT, 12, b"x");
+        let (key, header) = kat_keyring().data_opener(&loc).unwrap().export_ticket();
+        let ticket = |header: &[u8]| Opener::from_ticket(key.clone(), header).map(drop);
+        assert!(ticket(&header).is_ok());
+        assert!(matches!(ticket(&header[..59]), Err(CryptoError::Truncated)));
+        assert!(matches!(ticket(&[]), Err(CryptoError::Truncated)));
+        assert!(matches!(ticket(&sealed), Err(CryptoError::TrailingData)));
+        let with = |at: usize, byte: u8| {
+            let mut h = header;
+            h[at] = byte;
+            ticket(&h)
+        };
+        assert!(matches!(with(0, b'X'), Err(CryptoError::BadMagic)));
+        assert!(matches!(with(4, 2), Err(CryptoError::Unsupported(_))));
+        assert!(matches!(with(5, 11), Err(CryptoError::Unsupported(_))));
+        assert!(matches!(with(5, 25), Err(CryptoError::Unsupported(_))));
+        assert!(matches!(with(6, 4), Err(CryptoError::Unsupported(_))));
+        assert!(matches!(with(7, 1), Err(CryptoError::Unsupported(_))));
+        // An index or keyfile stream is never opened from a ticket.
+        for ty in [
+            StreamType::Segment,
+            StreamType::Snapshot,
+            StreamType::Bundle,
+        ] {
+            assert!(matches!(with(6, ty as u8), Err(CryptoError::WrongKey)));
+        }
     }
 }

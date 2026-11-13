@@ -1470,8 +1470,8 @@ fn files_are_addressed_by_opaque_ids() {
         (200, &b"secret name\n"[..])
     );
     by_id.has("content-type", "text/plain; charset=utf-8");
-    let disposition = by_id.header("content-disposition").expect("a disposition");
-    assert!(disposition.starts_with("inline; "), "{disposition}");
+    // A file that is shown carries no name: a browser would make it the title of a tab.
+    by_id.has("content-disposition", "inline");
     let download = v.with("HEAD", &format!("/file?id={id}&dl=1"), &[]);
     let disposition = download
         .header("content-disposition")
@@ -1800,45 +1800,61 @@ fn vault_files_are_served_as_untrusted_content() {
             name != "doc.pdf",
             "{name}: {csp}"
         );
+        // Shown: `inline` and nothing else (the name would become a tab's title and an entry
+        // of the browser's history). Not shown: an attachment, with the name to save under.
         let disposition = res.header("content-disposition").expect("a disposition");
-        let kind = if inline { "inline; " } else { "attachment; " };
-        assert!(disposition.starts_with(kind), "{name}: {disposition}");
-        assert!(
-            disposition.contains(&format!("filename=\"{name}\"")),
-            "{disposition}"
-        );
-        // The download link: always an attachment, same type and policy.
+        if inline {
+            assert_eq!(disposition, "inline", "{name}");
+        } else {
+            assert!(
+                disposition.starts_with("attachment; "),
+                "{name}: {disposition}"
+            );
+            assert!(
+                disposition.contains(&format!("filename=\"{name}\"")),
+                "{disposition}"
+            );
+        }
+        // The download link: always an attachment with the name, same type and policy.
         let download = v.with("HEAD", &format!("{target}&dl=1"), &[]);
         download.has("content-type", content_type);
         let forced = download
             .header("content-disposition")
             .expect("a disposition");
         assert!(forced.starts_with("attachment; "), "{name}: {forced}");
+        assert!(
+            forced.contains(&format!("filename=\"{name}\"")),
+            "{name}: {forced}"
+        );
     }
 
     // Names in Content-Disposition: an ASCII stand-in, and the real name percent-encoded.
     for (name, expected) in [
         (
             NAMES[0],
-            "inline; filename=\"he said _hi__ it's.txt\"; filename*=UTF-8''he%20said%20%22hi%22%3B%20it%27s.txt",
+            "attachment; filename=\"he said _hi__ it's.txt\"; filename*=UTF-8''he%20said%20%22hi%22%3B%20it%27s.txt",
         ),
         (
             NAMES[1],
-            "inline; filename=\"gr__e _.pdf\"; filename*=UTF-8''gr%C3%B6%C3%9Fe%20%F0%9F%8E%89.pdf",
+            "attachment; filename=\"gr__e _.pdf\"; filename*=UTF-8''gr%C3%B6%C3%9Fe%20%F0%9F%8E%89.pdf",
         ),
         (
             NAMES[2],
-            "inline; filename=\"line_break_tab.txt\"; filename*=UTF-8''line%0Abreak%09tab.txt",
+            "attachment; filename=\"line_break_tab.txt\"; filename*=UTF-8''line%0Abreak%09tab.txt",
         ),
         (
             NAMES[3],
-            "inline; filename=\"100_ [1] #2 ?.txt\"; filename*=UTF-8''100%25%20%5B1%5D%20#2%20%3F.txt",
+            "attachment; filename=\"100_ [1] #2 ?.txt\"; filename*=UTF-8''100%25%20%5B1%5D%20#2%20%3F.txt",
         ),
     ] {
         let res = v.get(&file(&format!("names/{name}")));
         assert_eq!(res.status, 200, "{name:?}");
-        res.has("content-disposition", expected);
+        res.has("content-disposition", "inline");
         assert_eq!(res.body, b"x");
+        let saved = v.get(&format!("{}&dl=1", file(&format!("names/{name}"))));
+        assert_eq!(saved.status, 200, "{name:?}");
+        saved.has("content-disposition", expected);
+        assert_eq!(saved.body, b"x");
         // The listing gives the name back as it is.
         assert!(
             v.names("path=names").contains(&name.to_string()),

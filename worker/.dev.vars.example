@@ -5,6 +5,9 @@ GOOGLE_CLIENT_ID="000000000000-placeholder.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET="placeholder-client-secret"
 # comma-separated Google account addresses; empty = nobody may sign in
 ALLOWED_EMAILS="you@example.com"
-# Only while a device still holds a login from gclone < 0.2.0 (the "Web application" client); used when both are set:
-# GOOGLE_LEGACY_CLIENT_ID="000000000000-legacy.apps.googleusercontent.com"
-# GOOGLE_LEGACY_CLIENT_SECRET="legacy-client-secret"
+# Only for the hosted viewer's sign-in (/web/*), which is on when all three are set. The OAuth client of type
+# "Web application" (the names date from gclone < 0.2.0, when this client served the browser sign-in):
+# GOOGLE_LEGACY_CLIENT_ID="000000000000-web.apps.googleusercontent.com"
+# GOOGLE_LEGACY_CLIENT_SECRET="web-client-secret"
+# 32 random bytes in base64, the key of the viewer's session cookie; make your own with: openssl rand -base64 32
+# SEAL_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="

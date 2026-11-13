@@ -188,6 +188,7 @@ impl BackendError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    #[cfg(not(target_family = "wasm"))]
     #[error("local state database: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("another gclone is running on this vault")]
@@ -387,6 +388,7 @@ fn visit<'a>(e: &'a (dyn StdError + 'static), f: &mut dyn FnMut(&'a (dyn StdErro
         }
     } else if let Some(x) = e.downcast_ref::<StateError>() {
         match x {
+            #[cfg(not(target_family = "wasm"))]
             StateError::Sqlite(i) => visit(i, f),
             StateError::Io(i) => visit(i, f),
             _ => {}
