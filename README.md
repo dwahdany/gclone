@@ -57,7 +57,7 @@ it). To use your own auth Worker, pass its URL once: `gclone login https://<your
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.2.0` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.3.0` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`). If `~/.local/bin` is not on your `PATH`, the script says
 so and names the line to add and the file it goes into (on Debian and Ubuntu, logging in again
@@ -80,7 +80,7 @@ carry the one from the repository variable `GCLONE_DEFAULT_AUTH_URL`, so that `g
 needs no argument:
 
 ```
-gclone 0.2.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.3.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
 ```
 
 On Linux gclone uses the system's CA certificates (the `ca-certificates` package — present on
@@ -323,6 +323,7 @@ gclone sync -n ~/Photos :Photos             # dry run: show the plan, change not
 gclone ls -l :Photos/2026                   # list; -R is recursive
 gclone tree :Photos
 gclone cat :Documents/notes.txt             # to stdout; --offset N --count N read a range
+gclone web                                  # browse the vault in your browser (read-only; below)
 gclone mkdir :Archive/2027
 gclone mv :Photos/old :Archive              # into an existing directory: :Archive/old (no data is transferred)
 gclone mv :Photos/old :Photos/2019          # otherwise a rename; replaces nothing without --force
@@ -439,6 +440,65 @@ permission bits other than "executable or not", directory mtimes, extended attri
 download that replaces an existing file keeps that file's permission bits (a `chmod 600` file
 stays private); a file that is new on a device gets 0644 / 0755 under your umask.
 
+### Browse the vault in your browser
+
+Everything on Drive is ciphertext, so Google's own pages show nothing useful. `gclone web`
+starts a small web server on this machine and opens the **decrypted** vault as a file browser
+in your default browser: folders with breadcrumbs, a list sortable by name, size and time, a
+search over every file and folder name in the vault, previews (images, PDF, audio and video
+with seeking, text and code) and downloads.
+
+```sh
+gclone web                             # opens the browser; Ctrl-C in the terminal ends it
+gclone web --no-browser --port 8377    # only print the link; a fixed port instead of a free one
+```
+
+It is **read-only**: no upload, rename, delete or restore — those stay with the commands
+above. It shows what this device's index knows; **Refresh** in the page reads the vault's
+index again, so that uploads from other devices appear. The viewer holds no lock while it
+runs: `gclone sync` in another terminal works as usual. Keys: arrows, Enter, Backspace (up
+one folder), Esc, and `/` for the search.
+
+Security, in three sentences. The server listens on this machine only (`127.0.0.1` and `::1`;
+there is no option for anything else) and answers only to a browser that came in through a
+one-time link — printed in the terminal, or, when gclone opens the browser itself, handed
+over in a private file rather than on a command line that other users of the machine could
+read — which is traded for a session cookie that the browser sends to this server and to no
+other program on the machine; another user, or a web page that guesses the port, gets a `403`
+and nothing else, and requests under a foreign host name or from another site are refused as
+well. Files are decrypted on their way to the browser, never written to disk, and treated as
+untrusted content: an HTML or SVG file from the vault never runs as a page of the viewer
+(HTML is shown as text, anything unknown is a download). The names of your files and folders
+stay out of the browser's address bar, tab title and history — the address never changes
+while you browse, and files are fetched under opaque ids — so nothing of the vault ends up
+in a history that the browser may sync to its vendor.
+
+What remains: anyone who can already read your files or your browser profile can read the
+vault through the viewer too; the places you visited in a tab stay in the browser's
+session-restore data (so that reload and "restore tabs" work) until the tab and its "recently
+closed" entry are gone; and a file you download is in the
+browser's download list under its name, like any download.
+
+**A new link ends the old sessions.** Press Enter in the terminal for a new link — to move
+to another browser, or after closing the first. Every link and every browser session from
+before stops working at that moment, downloads included. So if a link ever answers "has been used
+already" although you did not open it, press Enter: whoever was faster is shut out.
+
+**Signing out ends the viewer.** `gclone logout` on this device stops a viewer that is still
+running in another terminal within a second or so (it exits with a message); it does not go
+on serving a device you have just signed out.
+
+**From another machine.** The viewer never listens on the network. To browse the vault of a
+machine without a display from your laptop, forward the port over SSH — the same number on
+both ends — and open the printed link on the laptop:
+
+```sh
+ssh -t -L 8377:127.0.0.1:8377 nas gclone web --port 8377
+```
+
+(`-t` gives the remote gclone a terminal, so that Ctrl-C and a closed connection end it; under
+SSH it prints the link and does not look for a browser.)
+
 ### Using a vault without Google
 
 `gclone login --vault-dir DIR` uses a local directory as the store — no Google account, no
@@ -500,6 +560,14 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   reaches what every gclone login reaches: ciphertext, which it could trash (restorable for 30
   days) but not read. Remove the app at <https://myaccount.google.com/permissions> and sign
   in again. Details: [`docs/AUTH.md`](docs/AUTH.md).
+- **The browser view** (`gclone web`) serves plaintext, so it is locked down: loopback only,
+  every request needs the session that a one-time link hands out (the link never appears on
+  a command line, the cookie is not sent to other local servers), foreign `Host` names and
+  cross-site requests are refused, vault files are served as untrusted content (nothing from
+  the vault runs as a page), and file names stay out of the browser's history. It is
+  read-only, and `gclone logout` ends it. See
+  [Browse the vault in your browser](#browse-the-vault-in-your-browser) for what it does not
+  protect against.
 
 ### Lost or stolen device
 
@@ -518,6 +586,12 @@ cached: data it could already download stays exposed, because re-keying is not i
 - Tested on macOS and, in containers, on Linux; no Windows (WSL2 runs the Linux binary — keep
   the synced directories inside the Linux file system, not under `/mnt/c`); no FUSE mount; no
   shared drives; no sharing between users.
+- `gclone web` is a viewer, not a file manager: read-only, no thumbnails, no list of deleted
+  files (`gclone restore --list` has it), and what the browser cannot show (HEIC outside
+  Safari, most video containers) is a download. A folder cannot be bookmarked or opened in a
+  second tab (the address is always the same, on purpose). Its page was checked in Chrome
+  only; on Linux, a browser installed as a snap or flatpak may not be able to read the file
+  gclone hands it — press Enter (or use `--no-browser`) and paste the link.
 - `copy` / `sync` work on **directories** — a single file cannot be the source or the
   destination (use `cat` to fetch one file). There is no two-way sync in one command: run
   `sync` up and then down, or use `copy` in both directions. A `sync` in one direction only
@@ -698,8 +772,9 @@ src/auth/                   client of the auth Worker (login, token refresh)
 src/state/, src/index/      SQLite replica; journal, merge, refresh, commit, repair
 src/transfer/               upload pipeline (packing), downloads, ranged reads
 src/sync/                   scan, planner, executor, remote-only commands, gc, check
+src/web/                    `gclone web`: the loopback HTTP server, and its page in assets/ (no build step)
 src/config.rs, src/cli/     local configuration; one file per command
-tests/                      integration tests; cli_e2e.rs drives the binary, live.rs is opt-in
+tests/                      integration tests; cli_e2e.rs and web.rs drive the binary, live.rs is opt-in
 tests/support/              seeded PRNG for property tests, the fake Google Drive + auth Worker
 worker/                     the auth Worker (TypeScript); see worker/README.md
 ```

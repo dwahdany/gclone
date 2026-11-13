@@ -1779,6 +1779,43 @@ fn exit_codes_json_and_dry_run() {
         .stdout_has("all good");
     write(&w.src.join("a.txt"), b"changed locally\n");
     a.run(&["check", &src, ":docs"]).code(3).stderr_has("a.txt");
+
+    // An object in a data folder that the index does not know: while it is young it is, as
+    // far as anyone can tell, another device's upload whose segment is not published yet —
+    // blobs go first. `check` says that, and does not send the user to `gc`.
+    let data = w.vault_root().join("data");
+    let folder = std::fs::read_dir(&data)
+        .expect("data folder")
+        .next()
+        .expect("a blob folder")
+        .expect("entry")
+        .path();
+    let stray = folder.join("0123456789abcdef0123456789abcdef");
+    write(&stray, b"not in the index yet");
+    let out = a.run(&["check"]).ok().stdout_has("all good");
+    out.stderr_has(
+        "note: 1 recent object(s) in the data folders are not in the index yet — probably \
+         another device's upload in progress; nothing to do (`gclone gc --orphans` only \
+         collects such objects once they are older than 14 days)",
+    );
+    a.run(&["gc", "-n", "--orphans"])
+        .ok()
+        .stdout_has("0 orphans");
+    // Past the grace period it is what `gc --orphans` is for.
+    let old = filetime::FileTime::from_unix_time(
+        filetime::FileTime::now().unix_seconds() - 15 * 86_400,
+        0,
+    );
+    filetime::set_file_mtime(&stray, old).expect("mtime");
+    let out = a.run(&["check"]).ok().stdout_has("all good");
+    assert!(!out.stderr.contains("recent object"), "{}", out.stderr);
+    out.stderr_has(
+        "note: 1 object(s) in the data folders belong to no known blob and are older than 14 \
+         days (leftovers of interrupted uploads); `gclone gc --orphans` collects them",
+    );
+    a.run(&["gc", "-n", "--orphans"])
+        .ok()
+        .stdout_has("1 orphans");
 }
 
 /// §17.14: `rm -r` says "restorable" and `restore` can do it for a directory; `mv` follows the

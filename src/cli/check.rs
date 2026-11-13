@@ -1,6 +1,7 @@
 //! `gclone check` (SPEC §5.9, §10) — owned by WP7.
 
 use super::{GlobalOpts, OpenOpts, open_ctx, usage};
+use crate::consts::ORPHAN_GRACE;
 use crate::path::{Arg, parse_arg};
 use crate::sync::{self, CheckReport};
 use crate::types::EntryKind;
@@ -42,6 +43,31 @@ fn what(args: &CheckArgs) -> anyhow::Result<What> {
     }
 }
 
+/// What `check` says about objects in the data folders that are no known blob (§5.9). A device
+/// uploads its blobs before it publishes the index segment that names them, so during another
+/// device's upload such objects are expected: they are counted apart from the old ones, which
+/// are what `gc --orphans` exists for.
+fn orphan_notes(orphans: u64, recent: u64) -> Vec<String> {
+    let days = ORPHAN_GRACE.as_secs() / 86_400;
+    let mut notes = Vec::new();
+    if recent > 0 {
+        notes.push(format!(
+            "note: {recent} recent object(s) in the data folders are not in the index yet — \
+             probably another device's upload in progress; nothing to do (`gclone gc --orphans` \
+             only collects such objects once they are older than {days} days)"
+        ));
+    }
+    let old = orphans.saturating_sub(recent);
+    if old > 0 {
+        notes.push(format!(
+            "note: {old} object(s) in the data folders belong to no known blob and are older \
+             than {days} days (leftovers of interrupted uploads); `gclone gc --orphans` \
+             collects them"
+        ));
+    }
+    notes
+}
+
 pub async fn run(g: &GlobalOpts, args: CheckArgs) -> anyhow::Result<i32> {
     let what = what(&args)?;
     let ctx = open_ctx(g, OpenOpts::read_only()).await?;
@@ -77,11 +103,8 @@ pub async fn run(g: &GlobalOpts, args: CheckArgs) -> anyhow::Result<i32> {
             report.listed_late
         ));
     }
-    if report.orphans > 0 {
-        ctx.ui.info(&format!(
-            "note: {} object(s) in the data folders belong to no known blob (gclone gc --orphans)",
-            report.orphans
-        ));
+    for note in orphan_notes(report.orphans, report.orphans_recent) {
+        ctx.ui.info(&note);
     }
     for name in &report.missing {
         ctx.ui.error(&format!("missing: {name}"));
@@ -104,5 +127,30 @@ pub async fn run(g: &GlobalOpts, args: CheckArgs) -> anyhow::Result<i32> {
             report.differing.len()
         ));
         Ok(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphans_of_an_upload_in_progress_are_not_called_garbage() {
+        assert!(orphan_notes(0, 0).is_empty());
+        let recent = orphan_notes(3, 3);
+        assert_eq!(recent.len(), 1, "{recent:?}");
+        assert!(
+            recent[0].starts_with("note: 3 recent object(s)"),
+            "{recent:?}"
+        );
+        assert!(recent[0].contains("another device's upload in progress"));
+        assert!(recent[0].contains("older than 14 days"), "{recent:?}");
+        let old = orphan_notes(2, 0);
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert!(old[0].starts_with("note: 2 object(s)"), "{old:?}");
+        assert!(old[0].contains("`gclone gc --orphans` collects them"));
+        let both = orphan_notes(5, 3);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[0].starts_with("note: 3 recent") && both[1].starts_with("note: 2 object(s)"));
     }
 }

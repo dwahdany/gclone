@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use super::blocking;
 use super::scan::{Filter, remote_rows, scan};
 use crate::backend::{Backend, ObjMeta};
+use crate::consts::ORPHAN_GRACE_MS;
 use crate::error::{SyncError, TransferError};
 use crate::format::blob_name;
 use crate::index::Vault;
@@ -23,7 +24,12 @@ pub struct CheckReport {
     pub mismatched: Vec<String>,
     pub untrashed: Vec<String>,
     pub listed_late: u64,
+    /// Objects in the data folders that are no blob this device knows.
     pub orphans: u64,
+    /// Of those, the ones younger than `ORPHAN_GRACE`: in all likelihood another device's
+    /// upload whose index segment is not published yet (blobs go first, §5.7). `gc --orphans`
+    /// leaves them alone.
+    pub orphans_recent: u64,
     pub differing: Vec<String>,
 }
 
@@ -113,11 +119,17 @@ pub async fn check_blobs<B: Backend>(vault: &Vault<B>) -> Result<CheckReport, Sy
     }
 
     known.extend(vault.pending_blob_names()?);
-    report.orphans = listed
+    for object in listed
         .iter()
         .filter(|(name, _)| !known.contains(*name))
-        .map(|(_, objects)| objects.len() as u64)
-        .sum();
+        .flat_map(|(_, objects)| objects)
+    {
+        report.orphans += 1;
+        // The same rule as `gc --orphans` (server time).
+        if now.saturating_sub(object.created_ms) <= ORPHAN_GRACE_MS {
+            report.orphans_recent += 1;
+        }
+    }
     Ok(report)
 }
 

@@ -2817,7 +2817,9 @@ async fn check_blobs_finds_missing_and_heals_trashed_blobs() {
     assert_eq!(report.untrashed.len(), 1);
     assert_eq!(report.mismatched.len(), 1);
     assert!(report.mismatched[0].contains("accidental corruption check"));
-    assert_eq!(report.orphans, 1);
+    // The stray object is young: as far as anyone can tell, another device's upload whose
+    // segment is not published yet.
+    assert_eq!((report.orphans, report.orphans_recent), (1, 1));
     assert_eq!(
         trashed(&net, &handle_of("two")).await,
         Some(false),
@@ -2825,6 +2827,11 @@ async fn check_blobs_finds_missing_and_heals_trashed_blobs() {
     );
     let again = sync::check_blobs(v).await.unwrap();
     assert_eq!((again.missing.len(), again.untrashed.len()), (1, 0));
+
+    // Once it is old enough for `gc --orphans` it is no longer counted as recent.
+    net.backend.advance_ms(ORPHAN_GRACE_MS + DAY_MS);
+    let later = sync::check_blobs(v).await.unwrap();
+    assert_eq!((later.orphans, later.orphans_recent), (1, 0));
 }
 
 #[tokio::test]

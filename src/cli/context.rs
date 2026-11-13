@@ -14,7 +14,7 @@ use crate::backend::drive::{DriveBackend, DriveConfig};
 use crate::backend::{AnyBackend, DirBackend};
 use crate::config::{BackendCfg, Config, Paths, Secrets, secret_store};
 use crate::consts::{LOCK_WAIT, PASSPHRASE_WARN_CHARS};
-use crate::crypto::{KdfParams, Passphrase};
+use crate::crypto::{KdfParams, Keyring, Passphrase};
 use crate::error::{
     AuthError, BackendError, ConfigError, FormatError, IndexError, StateError, SyncError,
 };
@@ -104,21 +104,27 @@ impl Ctx {
     /// busy, or the refresh came back with a verdict. The command continues either way.
     pub fn report_refresh(&self) {
         match &self.refresh {
-            None if self.lock.is_none() => self
-                .ui
-                .info("note: index not refreshed (another gclone is running)"),
-            Some(Err(e)) => self.ui.warn(&format!(
-                "{e}. Showing the last state this device has seen{}",
-                if needs_repair(e) {
-                    "; run `gclone repair`."
-                } else {
-                    "."
-                }
-            )),
+            None if self.lock.is_none() => self.ui.info(&format!("note: {NOT_REFRESHED}")),
+            Some(Err(e)) => self.ui.warn(&stale_text(e)),
             Some(Ok(report)) => warn_corrupt(&self.ui, report),
             None => {}
         }
     }
+}
+
+/// What a read-only command says when the lock was busy (§7.1).
+pub(crate) const NOT_REFRESHED: &str = "index not refreshed (another gclone is running)";
+
+/// What a read-only command says about a refresh that failed and left it with the replica.
+pub(crate) fn stale_text(e: &IndexError) -> String {
+    format!(
+        "{e}. Showing the last state this device has seen{}",
+        if needs_repair(e) {
+            "; run `gclone repair`."
+        } else {
+            "."
+        }
+    )
 }
 
 /// The failures whose fix is `gclone login` (or the Worker's configuration), not waiting: this
@@ -126,7 +132,7 @@ impl Ctx {
 /// (`AuthError::Network`: offline, Worker down, rate limit, quota page) or a local I/O error on
 /// the way to a token says nothing about the login — it is a network condition like an
 /// unreachable Drive, and `RefreshPolicy::Tolerant` treats it as one (§9.10, §17.9).
-fn login_failure(e: &IndexError) -> bool {
+pub(crate) fn login_failure(e: &IndexError) -> bool {
     match e {
         IndexError::VaultNotVisible | IndexError::Backend(BackendError::AppNotAuthorized) => true,
         IndexError::Backend(BackendError::Auth(auth)) => {
@@ -140,14 +146,21 @@ fn needs_repair(e: &IndexError) -> bool {
     matches!(e, IndexError::Gap { .. } | IndexError::Rollback { .. })
 }
 
-fn warn_corrupt(ui: &Ui, report: &RefreshReport) {
-    if !report.corrupt_objects.is_empty() {
-        ui.warn(&format!(
+/// Index objects that the refresh could not verify and left out, if any.
+pub(crate) fn corrupt_text(report: &RefreshReport) -> Option<String> {
+    (!report.corrupt_objects.is_empty()).then(|| {
+        format!(
             "{} index object(s) failed verification (damaged, oversized, or not written with \
              this vault's key) and were ignored: {}",
             report.corrupt_objects.len(),
             report.corrupt_objects.join(", ")
-        ));
+        )
+    })
+}
+
+fn warn_corrupt(ui: &Ui, report: &RefreshReport) {
+    if let Some(text) = corrupt_text(report) {
+        ui.warn(&text);
     }
 }
 
@@ -285,42 +298,7 @@ pub async fn open_ctx(g: &GlobalOpts, o: OpenOpts) -> anyhow::Result<Ctx> {
     let (backend, tokens) = build_backend(&config, &secrets, &paths, o.transfers)?;
     drop(secrets);
 
-    let state_dir = paths.state_dir(&config.vault_id);
-    let lock = match o.lock {
-        LockMode::Exclusive => Some(lock_state(&state_dir).await?),
-        LockMode::TryShared => {
-            let dir = state_dir.clone();
-            blocking(move || Ok(state::try_lock(&dir)?)).await?
-        }
-    };
-    let db_file = paths.db_file(&config.vault_id);
-    // Without the lock (TryShared, busy) nothing may be written to the state: the replica is
-    // read as it is (§8.3). The lock holder may be inside a write transaction of many seconds
-    // — a rebuild from a snapshot — and an open that wrote would wait for it and then fail.
-    let locked = lock.is_some();
-    let (db, device_name) = blocking(move || {
-        let db = if locked {
-            Db::open(&db_file)?
-        } else {
-            Db::open_shared(&db_file)?
-        };
-        let name = stored_device_name(&db)?;
-        Ok((db, name))
-    })
-    .await?;
-    let params = OpenParams {
-        vault_id,
-        handles: config.handles(),
-        device_name,
-        cache_dir: paths.index_cache_dir(&config.vault_id),
-        machine_fp: None,
-    };
-    let backend = Arc::new(backend);
-    let vault = if locked {
-        Vault::open(backend, db, keys, params).await?
-    } else {
-        Vault::open_unlocked(backend, db, keys, params).await?
-    };
+    let (vault, lock) = open_vault(&paths, &config, Arc::new(backend), keys, Some(o.lock)).await?;
 
     let mut refresh = None;
     let mut commit_blocked = None;
@@ -358,6 +336,68 @@ pub async fn open_ctx(g: &GlobalOpts, o: OpenOpts) -> anyhow::Result<Ctx> {
         commit_blocked,
         cancel: cancel_token(),
         tokens,
+    })
+}
+
+/// The vault over this device's replica (§8.3): with the state lock when `lock` asks for one
+/// and gets it, otherwise — `None`, or a busy `TryShared` — read as it is, for queries and
+/// downloads only. `open_ctx` uses it once per command; `gclone web` (§7.4) keeps a lock-less
+/// vault for its whole life (`lock: None`).
+pub(crate) async fn open_vault(
+    paths: &Paths,
+    config: &Config,
+    backend: Arc<AnyBackend>,
+    keys: Keyring,
+    lock: Option<LockMode>,
+) -> anyhow::Result<(Vault<AnyBackend>, Option<StateLock>)> {
+    let state_dir = paths.state_dir(&config.vault_id);
+    let lock = match lock {
+        Some(LockMode::Exclusive) => Some(lock_state(&state_dir).await?),
+        Some(LockMode::TryShared) => {
+            let dir = state_dir.clone();
+            blocking(move || Ok(state::try_lock(&dir)?)).await?
+        }
+        None => None,
+    };
+    let vault = open_replica(paths, config, backend, keys, lock.is_some()).await?;
+    Ok((vault, lock))
+}
+
+/// The second half of `open_vault`. `locked`: the caller holds the state lock — `gclone web`
+/// takes it for the length of each refresh, and only where state exists already
+/// (`state::try_lock_existing`).
+pub(crate) async fn open_replica(
+    paths: &Paths,
+    config: &Config,
+    backend: Arc<AnyBackend>,
+    keys: Keyring,
+    locked: bool,
+) -> anyhow::Result<Vault<AnyBackend>> {
+    let db_file = paths.db_file(&config.vault_id);
+    // Without the lock (TryShared, busy) nothing may be written to the state: the replica is
+    // read as it is (§8.3). The lock holder may be inside a write transaction of many seconds
+    // — a rebuild from a snapshot — and an open that wrote would wait for it and then fail.
+    let (db, device_name) = blocking(move || {
+        let db = if locked {
+            Db::open(&db_file)?
+        } else {
+            Db::open_shared(&db_file)?
+        };
+        let name = stored_device_name(&db)?;
+        Ok((db, name))
+    })
+    .await?;
+    let params = OpenParams {
+        vault_id: config.vault_id_bytes()?,
+        handles: config.handles(),
+        device_name,
+        cache_dir: paths.index_cache_dir(&config.vault_id),
+        machine_fp: None,
+    };
+    Ok(if locked {
+        Vault::open(backend, db, keys, params).await?
+    } else {
+        Vault::open_unlocked(backend, db, keys, params).await?
     })
 }
 

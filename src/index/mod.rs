@@ -128,6 +128,15 @@ pub struct ListRow {
     pub head: Option<Head>,
 }
 
+/// One match of [`Vault::search`].
+#[derive(Clone, Debug)]
+pub struct SearchHit {
+    pub path: String,
+    pub is_dir: bool,
+    /// `None` for directories.
+    pub head: Option<Head>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub id: DeviceId,

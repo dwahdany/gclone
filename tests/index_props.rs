@@ -3544,6 +3544,47 @@ async fn queries_read_the_replica() {
     assert!(a.head("docs").unwrap().is_none());
     assert!(a.heads("nope").unwrap().is_empty());
 
+    // search: names, not paths, in path order; directories with and without a head
+    let found = |needle: &str, limit: usize| -> (Vec<(String, bool, bool)>, bool) {
+        let (hits, more) = a.search(needle, limit).unwrap();
+        let hits = hits
+            .into_iter()
+            .map(|h| (h.path, h.is_dir, h.head.is_some()));
+        (hits.collect(), more)
+    };
+    let hit = |path: &str, is_dir: bool| (path.to_owned(), is_dir, !is_dir);
+    assert_eq!(
+        found("docs", 10),
+        (
+            vec![
+                hit("docs-other", false),
+                hit("docs.txt", false),
+                hit("docs", true)
+            ],
+            false
+        )
+    );
+    assert_eq!(
+        found("TXT", 10).0,
+        vec![
+            hit("docs.txt", false),
+            hit("docs/a.txt", false),
+            hit("docs/sub/b.txt", false)
+        ]
+    );
+    assert_eq!(found("Sub", 10), (vec![hit("docs/sub", true)], false));
+    assert_eq!(found("empty", 10), (vec![hit("empty-dir", true)], false));
+    assert_eq!(found("o", 1), (vec![hit("docs-other", false)], true));
+    assert!(
+        !found("o", 4).1,
+        "exactly as many as the limit: nothing more"
+    );
+    assert_eq!(found("o", 4).0.len(), 4);
+    for nothing in ["", "zzz", "docs/a", "/"] {
+        assert_eq!(found(nothing, 10), (Vec::new(), false), "{nothing:?}");
+    }
+    assert_eq!(found("docs", 0), (Vec::new(), false));
+
     let s = a.stats(now).unwrap();
     assert_eq!((s.files, s.dirs, s.bytes), (5, 1, 3 * 1001 + 2 * 1002));
     assert_eq!(

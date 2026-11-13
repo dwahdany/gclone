@@ -328,6 +328,33 @@ pub fn try_lock(state_dir: &Path) -> Result<Option<StateLock>, StateError> {
     Ok(try_acquire(&file)?.then_some(StateLock { file }))
 }
 
+/// What `try_lock_existing` found.
+pub enum Existing {
+    Held(StateLock),
+    /// Another gclone holds the lock.
+    Busy,
+    /// There is no lock file: this vault has no state on this device (any more).
+    Gone,
+}
+
+/// `try_lock` for a process that must never create state — a running `gclone web`, which a
+/// `gclone logout --forget` may have taken the state directory from (§7.4): neither the
+/// directory nor the lock file is created.
+pub fn try_lock_existing(state_dir: &Path) -> Result<Existing, StateError> {
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .open(state_dir.join("lock"))
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Existing::Gone),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(match try_acquire(&file)? {
+        true => Existing::Held(StateLock { file }),
+        false => Existing::Busy,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +417,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!((mode.as_str(), sync, version), ("wal", 2, 1));
+    }
+
+    /// The lock for a process that must not create state (`gclone web` after `logout
+    /// --forget`).
+    #[test]
+    fn try_lock_existing_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        assert!(matches!(try_lock_existing(&state).unwrap(), Existing::Gone));
+        assert!(!state.exists(), "no directory was made");
+        std::fs::create_dir(&state).unwrap();
+        assert!(matches!(try_lock_existing(&state).unwrap(), Existing::Gone));
+        assert!(!state.join("lock").exists(), "no lock file was made");
+
+        let held = try_lock(&state).unwrap().expect("the lock");
+        assert!(matches!(try_lock_existing(&state).unwrap(), Existing::Busy));
+        drop(held);
+        let Existing::Held(lock) = try_lock_existing(&state).unwrap() else {
+            panic!("the lock is free");
+        };
+        assert!(try_lock(&state).unwrap().is_none(), "it is the same lock");
+        drop(lock);
+        assert!(try_lock(&state).unwrap().is_some());
     }
 
     #[test]

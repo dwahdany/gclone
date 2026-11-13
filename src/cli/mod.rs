@@ -24,6 +24,7 @@ pub mod repair;
 pub mod restore;
 pub mod rm;
 pub mod status;
+pub mod web;
 
 pub use context::*;
 
@@ -118,6 +119,27 @@ pub enum Command {
     Tree(ls::TreeArgs),
     /// Write a remote file to stdout (a failure after output started is signalled only by the exit code)
     Cat(cat::CatArgs),
+    /// Browse the vault in a web browser (local, read-only file viewer)
+    ///
+    /// Starts a small web server on this machine and opens the vault in the default browser
+    /// as a file browser, decrypted: folders, search, previews of images, PDFs, audio, video
+    /// and text, and downloads. Google's own Drive pages show only ciphertext.
+    ///
+    /// The viewer is read-only: it cannot upload, rename, delete or restore. It listens on
+    /// 127.0.0.1 only and answers only to a browser that came through its one-time link —
+    /// printed here, or handed to the browser gclone opens in a private file, never on a
+    /// command line. Press Enter for a new link: it also ends every session before it. Files
+    /// are decrypted on the way to the browser and never written to disk, and no file or
+    /// folder name appears in the browser's address bar, title or history.
+    ///
+    /// It runs until Ctrl-C and holds no lock in between: `gclone sync` in another terminal
+    /// works as usual, and "Refresh" in the page shows what other devices uploaded since.
+    /// `gclone logout` on this device ends a running viewer.
+    ///
+    /// To browse the vault of a machine without a display from a laptop, forward the port
+    /// (the same number on both ends): `ssh -t -L 8377:127.0.0.1:8377 HOST gclone web --port
+    /// 8377`, then open the printed link on the laptop.
+    Web(web::WebArgs),
     /// Create a remote directory
     Mkdir(mkdir::MkdirArgs),
     /// Remove remote files or directories
@@ -197,6 +219,10 @@ fn saved_terminal() -> &'static Mutex<Option<libc::termios>> {
     })
 }
 
+/// Set while `web` serves: Ctrl-C is how the viewer is ended. The first one cancels, without a
+/// note, and the command exits 0.
+pub(crate) static SERVING: AtomicBool = AtomicBool::new(false);
+
 fn exit_interrupted() -> ! {
     if let Some(t) = *saved_terminal().lock().unwrap_or_else(|e| e.into_inner()) {
         // SAFETY: `t` came from tcgetattr on the same descriptor.
@@ -214,7 +240,9 @@ fn install_interrupt_handler() {
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
             }
-            if GRACEFUL.load(Ordering::SeqCst) && !token.is_cancelled() {
+            if SERVING.load(Ordering::SeqCst) && !token.is_cancelled() {
+                token.cancel();
+            } else if GRACEFUL.load(Ordering::SeqCst) && !token.is_cancelled() {
                 token.cancel();
                 eprintln!(
                     "\ninterrupted: committing what is finished (Ctrl-C again stops at once)"
@@ -441,6 +469,7 @@ async fn dispatch(g: &GlobalOpts, command: Command) -> anyhow::Result<i32> {
         Command::Ls(a) => ls::run(g, a).await,
         Command::Tree(a) => ls::run_tree(g, a).await,
         Command::Cat(a) => cat::run(g, a).await,
+        Command::Web(a) => web::run(g, a).await,
         Command::Mkdir(a) => mkdir::run(g, a).await,
         Command::Rm(a) => rm::run(g, a).await,
         Command::Mv(a) => mv::run(g, a).await,
@@ -552,6 +581,8 @@ mod tests {
             "gclone ls",
             "gclone tree :",
             "gclone cat :a/b --offset 10 --count 20",
+            "gclone web",
+            "gclone web --port 8377 --no-browser",
             "gclone mkdir :d",
             "gclone rm -r :a :b",
             "gclone mv :a :b",
@@ -618,6 +649,10 @@ mod tests {
             "gclone cat",
             "gclone copy a b --max-delete 3",
             "gclone check a b c",
+            "gclone web --port 0",
+            "gclone web --port 65536",
+            "gclone web --bind 0.0.0.0",
+            "gclone web :path",
         ] {
             let args: Vec<&str> = argv.split(' ').collect();
             assert!(

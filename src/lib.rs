@@ -17,6 +17,7 @@ pub mod transfer;
 pub mod types;
 pub mod ui;
 pub mod util;
+pub mod web;
 
 /// The seeded test PRNG of `tests/support/prng.rs`, compiled into the library's unit-test
 /// build so that its self-tests (`util::tests::prng_selftest`) run; integration tests include

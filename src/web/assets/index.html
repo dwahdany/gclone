@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>gclone</title>
+<link rel="icon" type="image/svg+xml" href="assets/icon.svg">
+<link rel="stylesheet" href="assets/app.css">
+<script src="assets/app.js" defer></script>
+</head>
+<body>
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-vault" viewBox="0 0 24 24"><path d="M3.5 8a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M10.4 14.4v-1a1.6 1.6 0 0 1 3.2 0v1"/><rect x="9.6" y="14.2" width="4.8" height="2.6" rx=".6" fill="currentColor"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.6h-4.6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><path d="M12 7.6v.2"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" fill="currentColor" fill-opacity=".2"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3.5h7L18.5 8v11a1.5 1.5 0 0 1-1.5 1.5H7A1.5 1.5 0 0 1 5.5 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M14 3.5V8h4.5"/></symbol>
+  <symbol id="i-text" viewBox="0 0 24 24"><path d="M7 3.5h7L18.5 8v11a1.5 1.5 0 0 1-1.5 1.5H7A1.5 1.5 0 0 1 5.5 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M14 3.5V8h4.5"/><path d="M8.7 12.5h6.6M8.7 16h4.6"/></symbol>
+  <symbol id="i-pdf" viewBox="0 0 24 24"><path d="M7 3.5h7L18.5 8v11a1.5 1.5 0 0 1-1.5 1.5H7A1.5 1.5 0 0 1 5.5 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M14 3.5V8h4.5"/><rect x="8.2" y="12" width="7.6" height="4.6" rx=".8" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8.6" cy="10" r="1.5"/><path d="M4 17l5-4.5 3.5 3 3-2.5 4.5 4"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="3.5" y="5.5" width="17" height="13" rx="2"/><path d="M10.2 9.4v5.2l4.6-2.6z" fill="currentColor"/></symbol>
+  <symbol id="i-audio" viewBox="0 0 24 24"><path d="M9 17.5v-11l9-2v11"/><circle cx="6.5" cy="17.5" r="2.5"/><circle cx="15.5" cy="15.5" r="2.5"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><path d="M4.5 8v10.5A1.5 1.5 0 0 0 6 20h12a1.5 1.5 0 0 0 1.5-1.5V8"/><rect x="3.5" y="4" width="17" height="4" rx="1"/><path d="M10 12h4"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M14.5 6l-6 6 6 6"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4.5h5.5V10M19.5 4.5l-8 8"/><path d="M11 6.5H6.5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V13"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 18.5v-13M6.5 11L12 5.5 17.5 11"/></symbol>
+</svg>
+
+<a class="skip" href="#list">Skip to the file list</a>
+
+<header class="bar">
+  <a class="brand" id="brand" href="./" title="Vault root">
+    <svg class="i" aria-hidden="true"><use href="#i-vault"/></svg>
+    <span id="vault-name">Vault</span>
+  </a>
+  <div class="search" role="search">
+    <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+    <input id="search" type="search" placeholder="Search the vault" aria-label="Search file and folder names in the whole vault" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+    <kbd aria-hidden="true">/</kbd>
+  </div>
+  <button class="icon-btn" id="refresh" type="button" title="Refresh: read the vault's index again" aria-label="Refresh: read the vault's index again">
+    <svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg>
+  </button>
+  <button class="icon-btn" id="info-btn" type="button" title="About this vault" aria-label="About this vault" aria-expanded="false" aria-controls="info">
+    <svg class="i" aria-hidden="true"><use href="#i-info"/></svg>
+  </button>
+</header>
+<div class="progress" id="progress" aria-hidden="true"></div>
+
+<section class="popover" id="info" aria-label="About this vault" hidden>
+  <dl id="info-list"></dl>
+  <p class="hint">This viewer is read-only: it cannot upload, rename, delete or restore. Files are decrypted on this machine on their way to the browser.</p>
+</section>
+
+<nav class="crumbs" aria-label="Folder path"><ol id="crumbs"></ol></nav>
+
+<div class="notice" id="notice" role="status" hidden>
+  <span id="notice-text"></span>
+  <button class="icon-btn small" id="notice-close" type="button" aria-label="Dismiss">
+    <svg class="i" aria-hidden="true"><use href="#i-close"/></svg>
+  </button>
+</div>
+
+<main id="main">
+  <div class="list" id="list" role="grid" aria-label="Files and folders" tabindex="0">
+    <div role="rowgroup">
+      <div class="head" role="row" aria-rowindex="1">
+        <div class="c-name" role="columnheader" id="h-name"><button type="button" data-sort="name">Name<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></button></div>
+        <div class="c-size" role="columnheader" id="h-size"><button type="button" data-sort="size">Size<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></button></div>
+        <div class="c-time" role="columnheader" id="h-mtime"><button type="button" data-sort="mtime">Modified<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></button></div>
+      </div>
+    </div>
+    <div class="rows" id="rows" role="rowgroup" tabindex="-1">
+      <div class="canvas" id="canvas" role="presentation"></div>
+    </div>
+  </div>
+  <div class="empty" id="empty" hidden>
+    <svg class="i" id="empty-icon" aria-hidden="true"><use href="#i-folder"/></svg>
+    <h2 id="empty-title"></h2>
+    <p id="empty-text"></p>
+  </div>
+</main>
+
+<footer class="status">
+  <span id="count" aria-live="polite"></span>
+  <span id="summary"></span>
+</footer>
+
+<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-labelledby="viewer-name" hidden>
+  <header class="bar viewer-bar">
+    <button class="icon-btn" id="viewer-close" type="button" title="Close (Esc)" aria-label="Close the preview">
+      <svg class="i" aria-hidden="true"><use href="#i-back"/></svg>
+    </button>
+    <div class="viewer-title">
+      <span id="viewer-name"></span>
+      <span id="viewer-meta"></span>
+    </div>
+    <button class="icon-btn" id="viewer-prev" type="button" title="Previous file (←)" aria-label="Previous file">
+      <svg class="i" aria-hidden="true"><use href="#i-prev"/></svg>
+    </button>
+    <button class="icon-btn" id="viewer-next" type="button" title="Next file (→)" aria-label="Next file">
+      <svg class="i" aria-hidden="true"><use href="#i-next"/></svg>
+    </button>
+    <a class="icon-btn" id="viewer-open" target="_blank" rel="noopener" title="Open in a new tab" aria-label="Open in a new tab" hidden>
+      <svg class="i" aria-hidden="true"><use href="#i-open"/></svg>
+    </a>
+    <a class="btn dl" id="viewer-download" download title="Download this file" hidden>
+      <svg class="i" aria-hidden="true"><use href="#i-download"/></svg><span>Download</span>
+    </a>
+  </header>
+  <div class="viewer-body" id="viewer-body"></div>
+</div>
+</body>
+</html>
