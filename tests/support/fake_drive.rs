@@ -3,7 +3,7 @@
 //! enters the code behind them) and Google's revoke endpoint (`/revoke`).
 //!
 //! Included with `#[path = "support/fake_drive.rs"] mod fake_drive;` by `tests/drive_http.rs`,
-//! `tests/auth.rs` and `tests/cli_e2e.rs`. The Drive side follows the documented wire shapes,
+//! `tests/auth.rs`, `tests/cli_e2e.rs` and `tests/restic_e2e.rs`. The Drive side follows the documented wire shapes,
 //! not the client's expectations: int64 values are strings, folders have no size, a create
 //! answers in the default projection unless `fields=` was sent where Drive reads it, a `308`
 //! has no `Location`, top-level objects name the root folder's id as their parent, and
@@ -1996,6 +1996,53 @@ impl FakeDrive {
             .cloned()
             .collect()
     }
+
+    /// Inspection only: the direct children of a folder, oldest first — those in the trash
+    /// included, flagged.
+    pub fn children(&self, parent: &str) -> Vec<Child> {
+        let st = self.st();
+        let children = st
+            .order
+            .iter()
+            .filter(|id| st.objects[*id].parent == parent);
+        children
+            .map(|id| {
+                let obj = &st.objects[id];
+                Child {
+                    id: id.clone(),
+                    name: obj.name.clone(),
+                    size: obj.data.len(),
+                    trashed: st.effectively_trashed(id),
+                    is_folder: obj.mime == FOLDER_MIME,
+                }
+            })
+            .collect()
+    }
+
+    /// Inspection only: the folder at this path from the top of My Drive (the oldest one of
+    /// each name that is not in the trash).
+    pub fn path(&self, names: &[&str]) -> Option<String> {
+        let mut at = ROOT_ID.to_string();
+        for name in names {
+            let next = self.children(&at).into_iter();
+            at = next
+                .filter(|c| c.is_folder && !c.trashed && c.name == *name)
+                .map(|c| c.id)
+                .next()?;
+        }
+        Some(at)
+    }
+}
+
+/// One object as `FakeDrive::children` shows it.
+#[derive(Clone, Debug)]
+pub struct Child {
+    pub id: String,
+    pub name: String,
+    pub size: usize,
+    /// In the trash itself, or inside a folder that is.
+    pub trashed: bool,
+    pub is_folder: bool,
 }
 
 /// Practically no pacing (throttling still halves the rates); the §6.1 attempt count and breaker.

@@ -23,6 +23,7 @@ pub mod probe;
 pub mod repair;
 pub mod restore;
 pub mod rm;
+pub mod serve;
 pub mod status;
 pub mod web;
 
@@ -140,6 +141,8 @@ pub enum Command {
     /// (the same number on both ends): `ssh -t -L 8377:127.0.0.1:8377 HOST gclone web --port
     /// 8377`, then open the printed link on the laptop.
     Web(web::WebArgs),
+    /// Serve restic's backend protocol: a restic repository on Drive, beside the vault
+    Serve(serve::ServeArgs),
     /// Create a remote directory
     Mkdir(mkdir::MkdirArgs),
     /// Remove remote files or directories
@@ -223,6 +226,10 @@ fn saved_terminal() -> &'static Mutex<Option<libc::termios>> {
 /// note, and the command exits 0.
 pub(crate) static SERVING: AtomicBool = AtomicBool::new(false);
 
+/// Set by `serve restic --stdio`: Ctrl-C does nothing. The process ends when restic closes the
+/// pipe — restic still needs it to remove its lock after a signal that reached both (§7.6).
+pub(crate) static DETACHED: AtomicBool = AtomicBool::new(false);
+
 fn exit_interrupted() -> ! {
     if let Some(t) = *saved_terminal().lock().unwrap_or_else(|e| e.into_inner()) {
         // SAFETY: `t` came from tcgetattr on the same descriptor.
@@ -239,6 +246,9 @@ fn install_interrupt_handler() {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
+            }
+            if DETACHED.load(Ordering::SeqCst) {
+                continue;
             }
             if SERVING.load(Ordering::SeqCst) && !token.is_cancelled() {
                 token.cancel();
@@ -470,6 +480,7 @@ async fn dispatch(g: &GlobalOpts, command: Command) -> anyhow::Result<i32> {
         Command::Tree(a) => ls::run_tree(g, a).await,
         Command::Cat(a) => cat::run(g, a).await,
         Command::Web(a) => web::run(g, a).await,
+        Command::Serve(a) => serve::run(g, a).await,
         Command::Mkdir(a) => mkdir::run(g, a).await,
         Command::Rm(a) => rm::run(g, a).await,
         Command::Mv(a) => mv::run(g, a).await,
@@ -515,10 +526,11 @@ pub async fn run() -> i32 {
     crate::ui::init_logging(cli.global.verbose);
     install_interrupt_handler();
     let g = cli.global;
-    let is_login = matches!(cli.command, Command::Login(_));
+    // `login` is the fix itself; `serve` has restic at its stdin, not a person.
+    let no_offer = matches!(cli.command, Command::Login(_) | Command::Serve(_));
     let (code, failure) = report(dispatch(&g, cli.command).await);
     if let Some(e) = failure
-        && !is_login
+        && !no_offer
         && offer_login(&g, &e).await
     {
         let (login_code, _) = report(login::run(&g, login::LoginArgs::default()).await);
@@ -583,6 +595,12 @@ mod tests {
             "gclone cat :a/b --offset 10 --count 20",
             "gclone web",
             "gclone web --port 8377 --no-browser",
+            "gclone serve restic --stdio main",
+            "gclone serve restic --stdio --b2-hard-delete main",
+            "gclone serve restic --stdio --append-only my-laptop.2026",
+            "gclone serve restic --port 8765",
+            "gclone serve restic --port 8765 --append-only",
+            "gclone -v serve restic --stdio main",
             "gclone mkdir :d",
             "gclone rm -r :a :b",
             "gclone mv :a :b",
@@ -626,6 +644,7 @@ mod tests {
             ("gclone status --json", false),
             ("gclone restore --list :p --json", false),
             ("gclone login --json", false),
+            ("gclone --json serve restic --stdio main", false),
         ] {
             let args: Vec<&str> = argv.split(' ').collect();
             let cli = Cli::try_parse_from(&args).unwrap();
@@ -653,6 +672,18 @@ mod tests {
             "gclone web --port 65536",
             "gclone web --bind 0.0.0.0",
             "gclone web :path",
+            "gclone serve",
+            "gclone serve restic",
+            "gclone serve restic --stdio",
+            "gclone serve restic --stdio Main",
+            "gclone serve restic --stdio a/b",
+            "gclone serve restic --stdio ..",
+            "gclone serve restic --stdio -x",
+            "gclone serve restic --port 0",
+            "gclone serve restic --port 8765 main",
+            "gclone serve restic --stdio --port 8765 main",
+            "gclone serve restic --addr 0.0.0.0 --port 8765",
+            "gclone serve rclone",
         ] {
             let args: Vec<&str> = argv.split(' ').collect();
             assert!(

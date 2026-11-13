@@ -11,6 +11,7 @@ pub mod error;
 pub mod format;
 pub mod index;
 pub mod path;
+pub mod restic;
 pub mod state;
 pub mod sync;
 pub mod transfer;

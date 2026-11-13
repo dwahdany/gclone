@@ -1261,6 +1261,26 @@ async fn listing_follows_next_page_token_and_asks_for_untrashed_objects() {
             .unwrap()
             .is_empty()
     );
+
+    // … and `list_strict` says so instead: its callers act on "empty" (§7.6, R2).
+    let missing = b.list_strict(&Handle("1NoSuchFolder".into())).await;
+    assert!(
+        matches!(missing, Err(BackendError::NotFound)),
+        "{missing:?}"
+    );
+    assert_eq!(b.list_strict(&dir).await.unwrap().len(), 5);
+    // A `404` for a folder that exists is never a listing, empty or short. It is not
+    // retried: the caller looks at the folder.
+    let before = fake.hits(Route::List);
+    fake.fail_next(Route::List, 1, 404, "notFound");
+    let listed = b.list_strict(&dir).await;
+    assert!(matches!(listed, Err(BackendError::NotFound)), "{listed:?}");
+    assert_eq!(fake.hits(Route::List) - before, 1);
+    fake.fail_next(Route::List, 1, 404, "notFound");
+    assert!(
+        b.list(&dir).await.unwrap().is_empty(),
+        "`list` is unchanged"
+    );
 }
 
 #[tokio::test]

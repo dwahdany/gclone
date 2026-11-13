@@ -44,6 +44,11 @@ and Firefox against a fake Google Drive and a fake of the Worker's sign-in — *
 never run against the real Drive, never run on a phone**. Its own checklist for the first
 deployment is in [`worker/README.md`](worker/README.md#first-deployment-what-to-check).
 
+0.5.0 adds a backend for [restic](https://restic.net): `gclone serve restic` keeps a restic
+repository on Drive, beside the vault ([Back up with restic](#back-up-with-restic)). It is
+tested with the real restic against the fake Google Drive — **it, too, has not run against
+the real Google Drive yet**.
+
 ## Install
 
 Prebuilt binaries for Linux (x86_64 and aarch64) and macOS on Apple silicon are attached to
@@ -65,7 +70,7 @@ it). To use your own auth Worker, pass its URL once: `gclone login https://<your
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.4.0` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.5.0` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`). If `~/.local/bin` is not on your `PATH`, the script says
 so and names the line to add and the file it goes into (on Debian and Ubuntu, logging in again
@@ -88,7 +93,7 @@ carry the one from the repository variable `GCLONE_DEFAULT_AUTH_URL`, so that `g
 needs no argument:
 
 ```
-gclone 0.4.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.5.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
 ```
 
 On Linux gclone uses the system's CA certificates (the `ca-certificates` package — present on
@@ -631,6 +636,131 @@ every browser session at once — a lost phone — put a new `SEAL_KEY` on the W
 - Devices that signed in before gclone 0.2.0 must run `gclone login` once (see the one-time
   setup).
 
+### Back up with restic
+
+[restic](https://restic.net) makes deduplicated, encrypted snapshots; `gclone serve restic`
+lets it keep its repository on Google Drive. restic does the encrypting, deduplicating and
+packing — gclone adds no second encryption and its vault is not involved. What gclone
+contributes is the Google sign-in (no OAuth setup, no rclone configuration) and its Drive
+client: resumable uploads, retries, rate limiting. **A signed-in device is all it takes**; the
+vault passphrase is never asked for.
+
+There is no daemon and no port. restic starts gclone itself, through its `rclone` backend,
+and stops it when it is done (restic 0.17 or later):
+
+```sh
+export RESTIC_REPOSITORY=rclone:laptop      # the name after "rclone:" is the repository on Drive
+export RESTIC_PACK_SIZE=64                  # MiB; Drive is slow per file
+alias restic='restic -o rclone.program=gclone'
+
+restic init                                 # about a minute: it creates the repository's 262 folders
+restic backup ~/Documents
+restic snapshots
+restic restore latest --target /tmp/restore
+restic forget --keep-daily 7 --keep-weekly 8 --prune
+restic check                                # --read-data downloads every pack
+```
+
+A repository name is 1 to 63 characters of `a-z`, `0-9`, `.`, `_` and `-`. Systemd units,
+cron jobs, resticprofile, Backrest and the like need the same two settings: the option
+`rclone.program=gclone` and a repository `rclone:NAME`. restic looks the program up on its
+`PATH`, and what starts restic there usually has a short one that leaves out `~/.local/bin`,
+where the installer puts gclone — name it in full (`-o
+rclone.program=/home/you/.local/bin/gclone`), and run restic as the user who signed in:
+gclone finds the sign-in under that user's home directory.
+
+- **Pack size.** restic's default is 16 MiB per pack; use 64 (`--pack-size 64` or
+  `RESTIC_PACK_SIZE=64`, on every command that writes — it is not stored in the repository).
+  Every file costs Drive API calls, and `check` and `prune` list every pack: 1 TiB is about
+  65,000 packs at 16 MiB and 16,000 at 64. restic needs (connections + 1) × pack size of
+  temporary disk space; gclone holds up to 33 MiB of memory per upload in flight (five at once
+  by default; `-o rclone.connections=2` on a small machine).
+- **Where the files are.** `My Drive/gclone-restic/<name>/` with `config`, `keys/`, `locks/`,
+  `snapshots/`, `index/` and `data/00` … `data/ff` — restic's own local layout. Downloaded
+  from drive.google.com and unzipped, the folder is a restic repository that restic opens
+  directly (`restic -r ./laptop snapshots`), without gclone. **The reverse does not work**:
+  files put into `gclone-restic/` through drive.google.com or another tool are invisible to
+  gclone, which sees only files it created itself. To move an existing repository to Drive,
+  use `restic copy`.
+- **Leave the folders alone.** Do not rename, move or half-delete anything under
+  `gclone-restic/` in the Drive UI. A folder that is missing, in the trash or there twice is
+  an error that stops restic within seconds, with a line that names the folder — never an
+  empty listing, which would let `prune` remove live data.
+- **Deletes go to the Drive trash**, as everywhere in gclone: what `forget`, `prune` or
+  `unlock` remove can be restored in drive.google.com for about 30 days, and its space is
+  freed only when the trash is emptied (there, by hand, to free it sooner). A file restored by
+  hand is back for restic too — also for a `--port` listener that is still running, at the
+  latest half a minute after the delete: a restored lock is a stale lock (`restic unlock`), a
+  restored pack is unreferenced data (`restic prune`).
+- **`--append-only`** refuses every delete except locks, like rest-server's flag: `backup` and
+  `check` work, `forget`, `prune` and `key remove` fail within about 20 seconds (restic retries the refusal a few times).
+
+  ```sh
+  restic -o rclone.program=gclone -o rclone.args="serve restic --stdio --append-only" backup ~/Documents
+  ```
+
+  It is a guard against mistakes and scripts gone wrong, **not a security boundary**: the same
+  machine holds a Google login that can trash or delete those files directly.
+- **Several machines, one repository.** Run `restic init` on one machine, once; then each
+  machine signs in (`gclone login`) and uses the same name. (A second `init` for the name
+  that starts seconds after the first fails, as it should, and says so — but the key file it
+  wrote first stays in `keys/`: remove it with `restic key list` and `restic key remove`.)
+  restic's locks keep the machines apart: gclone answers every listing from Drive at that
+  moment, never from memory, and acknowledges a lock only once a listing shows it. `backup`
+  runs alongside other backups; `forget`, `prune` and `check` need the repository to
+  themselves and say "already locked" otherwise. A lock left by a killed restic is removed
+  with `restic unlock`.
+- **Speed.** Drive is slow per file, not per byte. `forget --prune` deletes one file per
+  call — thousands of packs take minutes — and `check` and `prune` list 256 folders first
+  (some 25 seconds at the rate gclone starts with).
+- **A machine that only runs restic.** Run `gclone login`. When it asks for the vault
+  passphrase, stop with Ctrl-C: the sign-in is saved by then, and `serve restic` needs nothing
+  else.
+- **`sudo restic …`** runs gclone as root, which has its own (empty) configuration and is
+  refused the user's files. Sign in once as root (`sudo gclone login`), or run restic as the
+  user.
+- **The daily upload limit.** Google accepts about 750 GB of uploads per account and day,
+  restic's and the vault's together (restic's are not counted in gclone's own warning). Once
+  it is reached nothing can be uploaded for up to 24 hours — not even restic's lock file, so
+  every restic command that takes a lock fails, on every machine. It does not fail at once:
+  restic and gclone keep trying, restic sits silent for about four minutes and gives up after
+  about twelve. The first line it shows (`rclone: gclone: POST …:locks: rate limited …`)
+  already names the daily limit and the way out — stop restic there. Read-only commands
+  (`snapshots`, `restore`, `ls`, `check`) work in that state with `--no-lock`, within a
+  second. For a first backup of more than about 700 GB, limit it from the start: `restic
+  backup --limit-upload 8000 …` (KiB/s).
+- **Stopping.** Ctrl-C or SIGTERM to restic. gclone ends when restic does, and ignores those
+  signals itself, so that restic can still remove its lock. If restic is stopped in the middle
+  of an upload, gclone stays a moment longer (at most ten seconds) to take the unfinished
+  file back — after restic has exited: restic does not wait for it. Where everything that is
+  left is killed the moment restic exits (restic as the main process of a container, the end
+  of a CI step), that does not happen, and a lock restic was just creating can stay behind:
+  `restic unlock` removes it. An index file is never taken back — another machine may be
+  relying on it already.
+
+**The listener.** For tools that can only speak restic's `rest:` backend, `gclone serve
+restic --port 8765` listens on 127.0.0.1 and prints a token, new at every start:
+
+```
+Serving restic repositories on http://127.0.0.1:8765/NAME/ — Ctrl-C stops.
+export RESTIC_REST_USERNAME=gclone
+export RESTIC_REST_PASSWORD=3f0c…
+restic -r rest:http://127.0.0.1:8765/NAME/ snapshots
+```
+
+Every request must carry the token (restic takes it from those two variables): a loopback port
+is reachable by every user of the machine and, through a browser, by any web page. Use
+`127.0.0.1` in the URL as printed. It serves every repository of the signed-in account and
+takes `--append-only` as well. It stops with Ctrl-C, with SIGTERM or SIGHUP (`kill`, a service
+manager, `docker stop`, a closing terminal) — exit code 0, after taking back uploads restic
+was not answered for — and with `gclone logout` (exit code 4). For unattended runs the first
+form is the better one: nothing listens, and nothing has to be kept running.
+
+The token keeps other users of the machine from the data, **not from the port**: a local
+program that opens connections and sends nothing can keep the listener busy, so that restic
+waits. It cannot read or change anything. On a machine you share with people you would not
+trust that far, use the first form.
+
 ### Using a vault without Google
 
 `gclone login --vault-dir DIR` uses a local directory as the store — no Google account, no
@@ -814,6 +944,25 @@ can be unlocked, treat it like the stolen device above.
   everything that needs Drive fails with exit 4 until the Worker is back. It is stateless and
   can be redeployed from `worker/` in minutes; the `--vault-dir` path needs neither it nor
   OAuth.
+- **`gclone serve restic` rests on two assumptions about Drive's listings** that are not
+  verified against the real service: once a listing has shown a file, later listings show it
+  too until it is trashed; and once a listing made after a file was trashed has left it out,
+  later listings leave it out too. gclone waits for the listing in both directions before it
+  tells restic "stored" or "deleted", so nothing depends on timing. If Drive broke the first,
+  two machines could both get conflicting locks, or a `prune` could miss a snapshot — restic
+  has that exposure on every eventually consistent store. If it broke the second, a `backup`
+  on another machine could deduplicate against packs a `prune` just removed; `restic check`
+  finds it, and the packs are in the Drive trash for 30 days. Also unverified for restic: that
+  a trashed file still downloads by ID (if not, a file another machine deleted answers "not
+  found" one listing earlier), that an upload into a trashed folder is reported as trashed,
+  that two logins of one account see each other's files (checklist row 2 — "several
+  machines, one repository" depends on it), and how Drive signals the daily upload limit.
+- restic's traffic is not counted in gclone's daily-upload warning (700 GiB), and restic's
+  files are not covered by `gclone check`, `gc` or the viewers: `restic check` is their check.
+- In `--port` mode restic gives up on a request that moves no byte for five minutes; on a very
+  slow uplink that can hit the end of a large pack (the last 32 MiB go to Drive after restic
+  has sent them). The `--stdio` form has no such timer. The listener's token protects the
+  data, not the listener's availability against other local users (see there).
 - `--json` exists for `copy` / `sync` only; every other command refuses it (exit code 2).
 - `restore -r` brings back files, not empty directories, and takes the newest removed version
   of each deleted file — a directory cannot be restored "as of" an earlier day.
@@ -827,6 +976,10 @@ can be unlocked, treat it like the stolen device above.
 | `secrets.json` — this device's refresh token and the cached master key | `$GCLONE_STATE_DIR`, else `$XDG_STATE_HOME/gclone`, else `~/.local/state/gclone` | 0600 |
 | `token.json` — cached access token | same directory | 0600 |
 | `state.db`, `lock`, `index-cache/` — the index replica and sync state | `<state root>/<vault id>/` | 0600 / 0700 |
+
+`gclone serve restic` reads `secrets.json` and `token.json`, writes only `token.json`, and
+uses neither `config.json` nor a vault's state: it takes no lock, and runs beside any other
+gclone command.
 
 `gclone logout` deletes `secrets.json` and `token.json` (and temp copies of them that an
 interrupted write may have left in that directory); `gclone logout --forget` also deletes
@@ -846,6 +999,17 @@ and is as sensitive as the synced files themselves.
 | 6 | partial: some files were skipped or failed |
 | 75 | temporary failure: quota or rate limit, index changes could not be published yet |
 | 130 | interrupted |
+
+`gclone serve restic` reports what goes wrong while it serves to restic, as HTTP statuses, and
+has exit codes only for its start and end:
+
+| Code | `serve restic` |
+|---|---|
+| 0 | `--stdio`: restic closed the connection; `--port`: Ctrl-C, SIGTERM or SIGHUP |
+| 1 | `--port`: the port is in use, on 127.0.0.1 or on [::1]; `--stdio`: the connection to restic broke in a way that is not "closed" |
+| 2 | usage: a bad repository name, `--stdio` on a terminal |
+| 4 | not signed in, or an unsafe `secrets.json`; `--port`: the device was signed out while it ran |
+| 130 | `--port` only: a second Ctrl-C |
 
 ## Day-0 checklist (before the first real use)
 
@@ -868,7 +1032,11 @@ verified by any automated test (§2.9). After the one-time setup:
 | ☐ | 4 | A second OAuth client in the same Cloud project sees the files the first one created — the hosted viewer's "Web application" client after a vault was created through the device client (the viewer finds the vault), and the device client after a vault was created through the "Web application" client of 0.1.0 (`gclone login` on such a device: "Signed in again … Vault unchanged."). | The hosted viewer cannot be used with that vault. For a login from before 0.2.0: `gclone login` reports it and changes nothing; the vault is moved while a Worker older than 0.4.0 is still deployed (`worker/README.md`, "Moving from the browser sign-in"). The "Worker cannot authenticate" recovery must use a web download. |
 | ☐ | 5 | The first real `gclone login` succeeds: Google's device-code endpoint accepts the client with `openid email drive.file` (verified 2026-11-12), and the token answer after the consent carries an **ID token** with the verified e-mail address and a refresh token, with a `scope` that holds nothing but `openid`, `email` / `…/auth/userinfo.email` and `…/auth/drive.file`. | No ID token → every login ends right after the approval with "Sign-in was not completed (Google approved the sign-in, but its answer carried no ID token …)" — the Worker's `403 grant_unusable`; it fails closed, because it cannot apply the allowlist. The Worker then has to ask Google's userinfo endpoint instead. Login refused with `scope_not_allowed` naming a harmless scope → Google spells a granted scope differently; add it to `ALLOWED_SCOPES` in `worker/src/google.ts`. |
 | ☐ | 7 | Sustained create rate; does session initiation count against it? | Tune the pack size and the pacer's start rate. |
-| ☐ | 11 | A trashed file is still downloadable by ID. | Affects self-heal wording only. |
+| ☐ | 11 | A trashed file is still downloadable by ID. | Affects self-heal wording only. For `serve restic`: a file that another machine deleted answers "not found" one listing earlier — nothing breaks. |
+
+`gclone serve restic` adds nothing to the table but leans on rows 2, 7, 8 and 11: its first
+real run — `restic init`, a backup from two machines, `restic check --read-data`, a
+`forget --prune` — is the check (see [Limitations](#limitations) for what is assumed).
 
 The first real `gclone login` on two devices answers rows 1, 2 and 5. Repeat the checklist
 after any Google policy change. The hosted viewer has a checklist of its own for its first
@@ -878,7 +1046,7 @@ deployment, and a fifteen-minute test for the phone:
 ## Development
 
 ```sh
-cargo test --locked                  # everything; no network, no credentials
+cargo test --locked                  # everything; no network, no credentials (restic on PATH: see below)
 cargo clippy --locked --all-targets
 cargo fmt --check
 cd worker && npm ci && npm run typecheck && npm test
@@ -898,7 +1066,7 @@ runs with `-D warnings`: bump the version deliberately). The browser suite runs 
 Google Chrome, on the bundle that the Linux job built. The workflows pin every action to a
 commit; `.github/dependabot.yml` proposes the updates.
 
-(With nix: `nix-shell -p cargo rustc clippy rustfmt --run '…'` and
+(With nix: `nix-shell -p cargo rustc clippy rustfmt restic --run '…'` and
 `nix-shell -p nodejs --run '…'`; for the wasm build
 `nix-shell -p cargo rustc lld wasm-bindgen-cli nodejs --run 'sh web-core/build.sh'` — a
 development build: nixpkgs' compiler is not the pinned one, and the bundle's manifest says
@@ -912,6 +1080,12 @@ so.)
   Drive + auth Worker (`tests/support/fake_drive.rs`). The `GCLONE_TEST_*` switches it uses
   (fast KDF, Drive and revoke endpoints) are honoured only by builds with debug assertions; a
   release build ignores them.
+- `tests/restic_e2e.rs` runs the real restic (0.17 or later: `restic` on `PATH`, or the
+  binary named by `GCLONE_TEST_RESTIC`) against the fake Google Drive, through the debug
+  binary. Without restic those tests are skipped, each with a line `note: restic 0.17 or later
+  is not installed — skipped: <test>`; with `GCLONE_REQUIRE_RESTIC=1` a missing restic is a
+  failure. CI sets it and installs a pinned restic (`.github/scripts/install-restic.sh`,
+  usable locally too). The release workflow runs the tests without restic.
 - Opt-in live run against the real service (needs a device signed in with `gclone login`; it
   works inside one throwaway top-level folder `gclone-live-test-<hex>`, which it trashes at
   the end — the vault itself is not touched):
@@ -936,7 +1110,8 @@ install.sh                  installer of the released binaries (tests: tests/ins
 rust-toolchain.toml         the Rust version of CI and of the release binaries (for rustup)
 .github/workflows/          ci.yml (fmt, clippy, tests, Worker, install.sh, the wasm core, the viewer and its
                             browser suite), release.yml (binaries and the attested viewer bundle on a tag)
-.github/scripts/            install-wasm-bindgen.sh: the command in the lockfile's version
+.github/scripts/            install-wasm-bindgen.sh: the command in the lockfile's version;
+                            install-restic.sh: a pinned, checksummed restic for the tests
 .github/dependabot.yml      keeps the pinned actions current
 docs/SPEC.md                the implementation spec (design contract, errata in §17)
 src/lib.rs, src/main.rs     module declarations; main → cli::run
@@ -950,11 +1125,16 @@ src/transfer/               upload pipeline (packing), downloads, ranged reads
 src/sync/                   scan, planner, executor, remote-only commands, gc, check
 src/web/                    `gclone web`: the loopback HTTP server, and its page in assets/ (no build step);
                             rules.rs: what both viewers answer identically (order, search, JSON shapes, ranges)
+src/restic/                 `gclone serve restic`: restic's REST protocol in front of Drive — the wire grammar,
+                            the folder tree, the store (cache, listings, uploads, deletes), HTTP, stdio
 web-core/                   the read path for the hosted viewer: a crate of its own that includes src/ files by
                             path and builds to WebAssembly (build.sh → pkg/); tests against the native binary
-src/config.rs, src/cli/     local configuration; one file per command
-tests/                      integration tests; cli_e2e.rs and web.rs drive the binary, live.rs is opt-in
-tests/support/              seeded PRNG for property tests, the fake Google Drive + auth Worker
+src/config.rs, src/cli/     local configuration; one file per command (serve.rs: `serve restic`)
+tests/                      integration tests; cli_e2e.rs and web.rs drive the binary, live.rs is opt-in;
+                            restic_http.rs (the protocol, in process) and restic_e2e.rs (the binary, and the
+                            real restic against the fake Drive)
+tests/support/              seeded PRNG for property tests, the fake Google Drive + auth Worker, an HTTP/2
+                            test client
 worker/                     the auth Worker (TypeScript); see worker/README.md
 worker/viewer/              the hosted viewer's browser app (plain scripts) and build.mjs → worker/dist/
 worker/scripts/             check-config, check-dist, the release tooling (release-bundle, fetch-viewer,

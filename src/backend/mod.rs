@@ -119,6 +119,17 @@ pub trait Backend: Send + Sync + 'static {
         parent: &Handle,
     ) -> impl Future<Output = Result<Vec<ObjMeta>, BackendError>> + Send;
 
+    /// As [`Backend::list`], for callers that must tell "no children" from "no such folder":
+    /// a store that answers "not found" for the folder itself returns `NotFound` here and not
+    /// an empty listing (Drive: a `404` on any page of the listing). The default is `list` —
+    /// the fakes have no such answer; their callers `stat` the folder of an empty listing.
+    fn list_strict(
+        &self,
+        parent: &Handle,
+    ) -> impl Future<Output = Result<Vec<ObjMeta>, BackendError>> + Send {
+        self.list(parent)
+    }
+
     /// Exact name, non-trashed, anywhere visible.
     fn find_by_name(
         &self,

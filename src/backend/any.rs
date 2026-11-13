@@ -61,6 +61,10 @@ impl Backend for AnyBackend {
         delegate!(self, b => b.list(parent).await)
     }
 
+    async fn list_strict(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        delegate!(self, b => b.list_strict(parent).await)
+    }
+
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {
         delegate!(self, b => b.find_by_name(name).await)
     }

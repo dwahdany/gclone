@@ -40,8 +40,15 @@ jobs:
       - run: cargo fmt --check
       # Per system: the Linux- and macOS-only code paths are different code.
       - run: cargo clippy --locked --all-targets -- -D warnings
-      # No network, no credentials: directory vaults, a fake Google Drive and a fake auth Worker.
+      # The real restic, for the tests of `gclone serve restic` (they skip without it; here
+      # a missing restic is a failure).
+      - name: restic
+        run: sh .github/scripts/install-restic.sh
+      # No credentials, and no network beyond loopback: directory vaults, a fake Google Drive
+      # and a fake auth Worker.
       - run: cargo test --locked
+        env:
+          GCLONE_REQUIRE_RESTIC: "1"
 
   worker:
     name: worker typecheck + tests
