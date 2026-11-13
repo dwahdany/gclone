@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { ENGINES, loadPlaywright, startStack } from './harness.mjs';
 import { BIDI_DIR, BIDI_NAME, HOSTILE_HTML, ODD_NAMES, PASS, foreignKeyfile, tree } from './vault.mjs';
 
@@ -939,6 +940,627 @@ steps.keys = async (s, page) => {
   s.note(`keys: ${seen.n} messages between the page and its workers, none with a key, a ticket or bytes`);
 };
 
+// --- the seal of the ticket port (SPEC §7.5; the audit's finding L2) ----------------------------
+
+let oracleCore = null;
+
+/**
+ * What the attack below is after, computed outside the browser: the real ticket of every file,
+ * from the passphrase, with the core and the loader of the bundle under test. `Map(path → ticket)`.
+ */
+async function realTickets(stack, paths) {
+  const dir = path.join(stack.dist, 'a', stack.server.build);
+  if (!oracleCore) {
+    globalThis.self = globalThis;
+    for (const name of ['token.js', 'drive.js', 'loader.js', 'core.js']) vm.runInThisContext(fs.readFileSync(path.join(dir, name), 'utf8'), { filename: path.join(dir, name) });
+    oracleCore = vm.runInThisContext('wasm_bindgen');
+    oracleCore.initSync({ module: fs.readFileSync(path.join(dir, 'core.wasm')) });
+  }
+  const core = oracleCore;
+  const { loader, createDrive } = globalThis.gclone;
+  const real = 'https://www.googleapis.com';
+  const access = stack.server.issueToken();
+  const drive = createDrive({
+    token: { get: async () => access },
+    random: () => 0,
+    offline: () => false,
+    fetch: (url, init) => fetch(stack.drive.origin + String(url).slice(real.length), init),
+  });
+  const found = await loader.discover(core, drive);
+  assert.equal(found.vaults.length, 1);
+  const opened = await loader.open(core, drive, found.vaults[0].root);
+  const keyfile = opened.candidates[0];
+  const vault = core.Vault.from_keys(core.unlock(keyfile.name, keyfile.bytes, PASS, found.vaults[0].vault_id));
+  await loader.createIndex({ core, drive, vault, folder: opened.index }).load();
+  const tickets = new Map(paths.map((p) => [p, JSON.parse(vault.ticket(p))]));
+  vault.free();
+  return tickets;
+}
+
+/** Runs in the page: every file of the vault, through the page's own provider. */
+const WALK = `async () => {
+  const out = [];
+  const visit = async (dir) => {
+    for (let offset = 0; ;) {
+      const answer = await window.gcloneProvider.api('list', { path: dir, sort: 'name', order: 'asc', offset: String(offset), limit: '100' });
+      for (const entry of answer.entries) {
+        const p = dir ? dir + '/' + entry.name : entry.name;
+        if (entry.dir) await visit(p); else out.push(p);
+      }
+      offset += answer.entries.length;
+      if (offset >= answer.total || answer.entries.length === 0) break;
+    }
+  };
+  await visit('');
+  return out;
+}`;
+
+/**
+ * Runs in the page: the audit's attack. A script that was not there when the vault was
+ * unlocked learns the vault worker from the page's next message to it, hands it a port of its
+ * own as the ticket port, and asks for the ticket of every file. Returns what arrived, bytes as
+ * base64, and what the script could make of it with everything a page can get hold of.
+ */
+const STEAL = `async (paths) => {
+  const b64 = (bytes) => { let t = ''; for (const b of bytes) t += String.fromCharCode(b); return btoa(t); };
+  const plain = (v) => (v instanceof Uint8Array ? { b64: b64(v) } : v instanceof ArrayBuffer ? { b64: b64(new Uint8Array(v)) }
+    : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v);
+  const post = Worker.prototype.postMessage;
+  const worker = await new Promise((resolve) => {
+    Worker.prototype.postMessage = function hooked(...args) { Worker.prototype.postMessage = post; resolve(this); return post.apply(this, args); };
+    window.gcloneProvider.api('info');
+  });
+  const channel = new MessageChannel();
+  const got = [];
+  channel.port1.onmessage = (event) => got.push(event.data);
+  const t0 = performance.now();
+  post.call(worker, { call: 'tickets', args: {} }, [channel.port2]);
+  paths.forEach((p, i) => post.call(worker, { call: 'issue', args: { id: 'attack' + String(i).padStart(16, '0'), path: p } }));
+  while (got.length < paths.length && performance.now() - t0 < 30000) await new Promise((r) => setTimeout(r, 20));
+  const ms = Math.round(performance.now() - t0);
+  // What a page can do with a sealed ticket: it can ask the Service Worker for its public key
+  // too, and make key pairs of its own. Every key it can derive from those is tried.
+  const opened = [];
+  const sealed = got.find((m) => m && m.sealed);
+  let swKey = null;
+  if (sealed) {
+    const res = await fetch('/seal-key', { cache: 'no-store' });
+    swKey = res.status === 200 ? new Uint8Array(await res.arrayBuffer()) : null;
+    const curve = { name: 'ECDH', namedCurve: 'P-256' };
+    const mine = await crypto.subtle.generateKey(curve, false, ['deriveBits']);
+    const myPublic = new Uint8Array(await crypto.subtle.exportKey('raw', mine.publicKey));
+    const enc = new TextEncoder();
+    const label = enc.encode('gclone-viewer/ticket-seal/1');
+    const info = (a, b) => { const out = new Uint8Array(label.length + 1 + 130); out.set(label, 0); out.set(a, label.length + 1); out.set(b, label.length + 66); return out; };
+    const { to, from, iv, data } = sealed.sealed;
+    const tries = [[to, to, from], [from, to, from], [to, to, myPublic], [from, to, myPublic], [from, myPublic, from]];
+    for (const [peer, a, b] of tries) {
+      try {
+        const theirs = await crypto.subtle.importKey('raw', peer, curve, false, []);
+        const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: theirs }, mine.privateKey, 256);
+        const material = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+        const key = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: info(a, b) }, material, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+        const text = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: enc.encode('gclone-viewer/ticket-seal/1\\0' + sealed.id) }, key, data);
+        opened.push(new TextDecoder().decode(text));
+      } catch (_) { /* this key does not open it */ }
+    }
+  }
+  // While the vault is unlocked the script reads files the way the page does: it hands the
+  // sealed tickets on to the Service Worker, which can open them, and asks for the addresses.
+  const mine2 = new MessageChannel();
+  navigator.serviceWorker.controller.postMessage({ type: 'port' }, [mine2.port2]);
+  for (const message of got) mine2.port1.postMessage(message);
+  const read = [];
+  for (const i of [0, Math.floor(paths.length / 2), paths.length - 1]) {
+    const res = await fetch('/v/attack' + String(i).padStart(16, '0'));
+    read.push([paths[i], res.status, b64(new Uint8Array(await res.arrayBuffer()))]);
+  }
+  window.__haul = got;
+  return { got: got.map(plain), ms, opened, swKey: swKey ? b64(swKey) : null, read };
+}`;
+
+/** Runs in a page that has locked since: the sealed tickets a script kept are handed to the Service Worker again. */
+const REPLAY = `async (haul) => {
+  const bytes = (v) => (v && typeof v === 'object' && typeof v.b64 === 'string' ? Uint8Array.from(atob(v.b64), (c) => c.charCodeAt(0))
+    : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, bytes(x)])) : v);
+  const channel = new MessageChannel();
+  navigator.serviceWorker.controller.postMessage({ type: 'port' }, [channel.port2]);
+  const out = [];
+  for (const message of haul.slice(0, 3)) {
+    channel.port1.postMessage(bytes(message));
+    const res = await fetch('/v/' + message.id);
+    out.push([res.status, (await res.text()).slice(0, 80)]);
+  }
+  return out;
+}`;
+
+/**
+ * Runs in every document before its scripts (after `instrument`): a script that is in the page
+ * from the start and sits in the middle of the ticket channel. The vault worker gets a port of
+ * the script's; everything is passed on to the port the page meant, and kept.
+ */
+function relay() {
+  if (window.__relay) return;
+  window.__relay = [];
+  const b64 = (bytes) => { let t = ''; for (const b of bytes) t += String.fromCharCode(b); return btoa(t); };
+  const plain = (v) => (v instanceof Uint8Array ? { b64: b64(v) }
+    : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v);
+  const post = Worker.prototype.postMessage;
+  Worker.prototype.postMessage = function relayed(message, transfer) {
+    if (message && message.call === 'tickets' && transfer && transfer[0]) {
+      const theirs = transfer[0]; // meant for the vault worker; its other end goes to the Service Worker
+      const mine = new MessageChannel();
+      mine.port1.onmessage = (event) => { window.__relay.push(['vault worker to Service Worker', plain(event.data)]); theirs.postMessage(event.data); };
+      theirs.onmessage = (event) => { window.__relay.push(['Service Worker to vault worker', plain(event.data)]); mine.port1.postMessage(event.data); };
+      return post.call(this, message, [mine.port2]);
+    }
+    return post.call(this, message, transfer);
+  };
+}
+
+/**
+ * Runs in every document before its scripts (after `instrument`): the first `window.__unsealed`
+ * vault workers of the page answer `init` as one does whose requests the engine did not put
+ * under the Service Worker — it could not get the seal's key.
+ */
+function unsealedStarts() {
+  if (window.__starts !== undefined) return;
+  window.__starts = 0;
+  const Instrumented = window.Worker;
+  window.Worker = class extends Instrumented {
+    constructor(url, options) {
+      super(url, options);
+      this.__vault = String(url).endsWith('/vault-worker.js');
+      if (this.__vault) window.__starts += 1;
+      this.__unsealed = this.__vault && window.__starts <= Number(sessionStorage.getItem('test.unsealed') || 0);
+    }
+
+    set onmessage(handler) {
+      super.onmessage = !this.__unsealed ? handler : (event) => {
+        const data = event.data;
+        if (data && data.ok && data.value && data.value.sealed === true) {
+          handler(new MessageEvent('message', { data: { ...data, value: { ...data.value, sealed: false } } }));
+        } else {
+          handler(event);
+        }
+      };
+    }
+
+    get onmessage() {
+      return super.onmessage;
+    }
+  };
+}
+
+steps.seal = async (s) => {
+  const { server } = s.stack;
+  const text = (value) => Buffer.from(JSON.stringify(value));
+  const bytesOf = (value, out = []) => {
+    if (value && typeof value === 'object') {
+      if (typeof value.b64 === 'string') out.push(Buffer.from(value.b64, 'base64'));
+      else Object.values(value).forEach((item) => bytesOf(item, out));
+    }
+    return out;
+  };
+
+  // --- 1. The audit's attack: a script in the unlocked page takes the ticket port. ---
+  let { context, page } = await s.fresh();
+  const paths = await page.evaluate(`(${WALK})()`);
+  assert.ok(paths.length >= 270, `${paths.length} files`);
+  const tickets = await realTickets(s.stack, paths);
+  const keyed = [...tickets].filter(([, t]) => typeof t.key === 'string');
+  assert.ok(keyed.length >= paths.length - 4, 'the real tickets are known to the test');
+  // What must not turn up anywhere: each stream key, as bytes and in every usual spelling; each blob's name.
+  const secrets = [];
+  for (const [, t] of keyed) {
+    const raw = Buffer.from(t.key, 'base64url');
+    assert.equal(raw.length, 32);
+    secrets.push(raw, Buffer.from(t.key), Buffer.from(raw.toString('base64')), Buffer.from(raw.toString('hex')), Buffer.from(t.blob_name));
+  }
+  const clean = (haystack, what) => {
+    for (const secret of secrets) assert.equal(haystack.indexOf(secret), -1, `${s.label}: ${what} holds a stream key or a blob's name`);
+  };
+  const stolen = await page.evaluate(`(${STEAL})(${JSON.stringify(paths)})`);
+  assert.equal(stolen.got.length, paths.length, `${s.label}: the vault worker answered the script's port`);
+  const haul = Buffer.concat([text(stolen.got), ...bytesOf(stolen.got)]);
+  clean(haul, 'what the script collected');
+  for (const message of stolen.got) {
+    assert.deepEqual(Object.keys(message).sort(), ['build', 'id', 'sealed', 'type'], `${s.label}: a message on the script's port is ${JSON.stringify(Object.keys(message))}`);
+    assert.deepEqual([message.type, message.build], ['ticket', server.build]);
+    assert.deepEqual(Object.keys(message.sealed).sort(), ['data', 'from', 'iv', 'to']);
+    const sizes = Object.fromEntries(Object.entries(message.sealed).map(([name, value]) => [name, Buffer.from(value.b64, 'base64').length]));
+    assert.deepEqual([sizes.to, sizes.from, sizes.iv], [65, 65, 12]);
+    assert.ok(sizes.data > 16);
+  }
+  assert.ok(!haul.includes('"key"') && !haul.includes('blob_name') && !haul.includes('fake-access-'), `${s.label}: a field of a ticket, or the access token, is readable in what the script collected`);
+  assert.deepEqual(stolen.opened, [], `${s.label}: the script opened a sealed ticket`);
+  // The key the Service Worker hands a page is the one the tickets are sealed to: a public key.
+  assert.equal(stolen.swKey, stolen.got[0].sealed.to.b64);
+  // What stays true while the vault is unlocked: the script reads files, as the page does.
+  for (const [p, status, body] of stolen.read) {
+    assert.equal(status, 200, `${s.label}: ${p} through the Service Worker`);
+    assert.equal(sha256(Buffer.from(body, 'base64')), sha256(s.stack.vault.files.get(p)), `${s.label}: ${p} read by the script while unlocked`);
+  }
+  // Nothing of it reached the page by another way either.
+  const said = await page.evaluate(() => ({ flagged: window.__flagged, bytes: window.__bytes, all: JSON.stringify(window.__messages) }));
+  assert.deepEqual([said.flagged, said.bytes], [[], []]);
+  clean(Buffer.from(said.all), 'what the page was told');
+  await s.settle(page, 'seal: the attack');
+  // Lock. What the script kept — sealed tickets — opens nothing any more: the key pair they
+  // were sealed to went with the lock, in the Service Worker and in the vault worker.
+  await page.click('#lock-btn');
+  await s.screen(page, 'unlock');
+  s.expect(/410|502/, /Failed to load resource/);
+  const replayed = await page.evaluate(`(${REPLAY})(${JSON.stringify(stolen.got)})`);
+  for (const [status, body] of replayed) {
+    assert.ok(status === 410 || status === 502, `${s.label}: a sealed ticket from before the lock was answered ${status}`);
+    assert.match(body, /^(This link has expired|The file could not be read from the vault: the viewer's Service Worker and its vault worker could not agree)/);
+  }
+  assert.equal((await s.ping(page)).tickets, 0, `${s.label}: the Service Worker took a ticket from before the lock`);
+  await s.settle(page, 'seal: after the lock');
+  await context.close();
+
+  // --- 2. A script that is in the page from the start and sits in the middle of the channel. ---
+  ({ context, page } = await s.open());
+  await context.addInitScript(relay);
+  await s.signedIn(context, page);
+  await s.unlock(page);
+  await s.goDir(page, 'docs');
+  await s.openFile(page, 'notes.txt');
+  await page.waitForSelector('#viewer-body pre');
+  assert.match(await page.$eval('#viewer-body pre', (pre) => pre.textContent), /^These are the notes\./);
+  await s.closeFile(page);
+  await s.goDir(page, 'pics');
+  await s.openFile(page, 'photo.png');
+  await page.waitForFunction(() => { const img = document.querySelector('#viewer-body img'); return img && img.complete && img.naturalWidth === 480; });
+  await s.closeFile(page);
+  const relayed = await page.evaluate(() => window.__relay);
+  const passed = relayed.filter(([way, m]) => way === 'vault worker to Service Worker' && m.type === 'ticket');
+  assert.ok(passed.length >= 2, `${s.label}: the tickets went through the script (${relayed.length} messages)`);
+  for (const [, message] of passed) assert.deepEqual(Object.keys(message).sort(), ['build', 'id', 'sealed', 'type']);
+  clean(Buffer.concat([text(relayed), ...bytesOf(relayed)]), 'what crossed the channel');
+  await s.settle(page, 'seal: in the middle');
+  await context.close();
+
+  // --- 3. A vault worker that cannot get the seal's key is replaced before anything is typed;
+  //        three in a row, and the viewer says so and stops. ---
+  ({ context, page } = await s.open());
+  await context.addInitScript(unsealedStarts);
+  await context.addInitScript(() => { try { sessionStorage.setItem('test.unsealed', sessionStorage.getItem('test.unsealed') || '2'); } catch (_) { /* no storage */ } });
+  await s.signedIn(context, page);
+  assert.equal(await page.evaluate(() => window.__starts), 3, `${s.label}: two vault workers were replaced`);
+  assert.equal(page.workers().length, 1, 'the replaced vault workers are gone');
+  await s.unlock(page);
+  await s.goDir(page, 'docs');
+  await s.openFile(page, 'notes.txt');
+  await page.waitForSelector('#viewer-body pre');
+  await s.closeFile(page);
+  await page.evaluate(() => sessionStorage.setItem('test.unsealed', '9'));
+  await page.reload();
+  await s.screen(page, 'stop');
+  assert.match(await page.textContent('#stop-text'), /^The viewer's Service Worker does not answer the worker that holds the vault's keys, so no file could be opened\./);
+  assert.deepEqual([await page.evaluate(() => window.__starts), page.workers().length], [3, 0]);
+  await s.settle(page, 'seal: a vault worker without the key');
+  await context.close();
+
+  s.note(`seal: a script in the unlocked page that took the ticket port got ${stolen.got.length} sealed tickets in ${stolen.ms} ms and opened none: none of the ${keyed.length} real stream keys, no blob name and no token in ${haul.length} bytes; while unlocked it read files through the Service Worker, as the page does; after Lock its sealed tickets were answered ${[...new Set(replayed.map(([status]) => status))].join('/')}; a script in the middle of the channel saw ${passed.length} sealed tickets and nothing else; a vault worker without the seal's key is replaced, and after three the viewer stops`);
+};
+
+steps.planted = async (s) => {
+  // What someone who served this origin before may have left in the browser: Service Worker
+  // registrations of their own. One for a narrower scope does not keep the viewer's page from
+  // loading — and the page removes it. (One for the whole origin answers `/` itself: the
+  // Worker's answer to its update check is tested with the Worker's code, in signin.mjs.)
+  const { context, page } = await s.open();
+  await s.signedIn(context, page);
+  const scopes = () => page.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).map((r) => [new URL(r.scope).pathname, new URL((r.active || r.waiting || r.installing).scriptURL).pathname]).sort());
+  assert.deepEqual(await scopes(), [['/', '/sw.js']]);
+  // Planted with the only script this origin serves as one, for the address Google sends the browser back to.
+  await page.evaluate(async () => {
+    const registration = await navigator.serviceWorker.register(window.gclone.page.scriptUrl('/sw.js'), { scope: '/callback' });
+    for (let i = 0; i < 100 && !registration.active; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+  // An instance of /sw.js that is not registered for the whole origin is inert and removes
+  // itself as soon as it is activated (steps.second): the registration does not outlive that.
+  for (let i = 0; i < 100 && (await scopes()).length > 1; i += 1) await sleep(50);
+  assert.deepEqual(await scopes(), [['/', '/sw.js']], `${s.label}: the planted registration removed itself`);
+  await page.reload();
+  await s.screen(page, 'unlock');
+  assert.deepEqual(await scopes(), [['/', '/sw.js']], `${s.label}: a registration for another scope was left in place`);
+  // The viewer works as before.
+  await s.unlock(page);
+  await s.goDir(page, 'docs');
+  await s.openFile(page, 'notes.txt');
+  await page.waitForSelector('#viewer-body pre');
+  await s.closeFile(page);
+  await context.close();
+  s.note('planted: a Service Worker registration of /sw.js for another scope (/callback) removes itself, and the page removes what is left the next time it loads');
+};
+
+// --- a script in the unlocked page against the lock (the second review of the key boundary) -----
+
+/** Runs in the page: `Promise<[status, first bytes]>` for the file `f`, through the page's provider and the Service Worker. */
+const READ = `async (f) => {
+  try {
+    const stat = await window.gcloneProvider.api('stat', { path: f });
+    const res = await fetch('/v/' + stat.id);
+    return [res.status, (await res.text()).slice(0, 20)];
+  } catch (error) { return ['threw', String(error).slice(0, 80)]; }
+}`;
+
+steps.unskippable = async (s) => {
+  // A script that arrives AFTER the unlock makes one statement of the lock throw. `lock()`
+  // used to set its "leaving" flag, assign `document.body.hidden` — and, when that threw,
+  // never tell the Service Worker to forget, never end the vault worker (which holds the
+  // master keys) and never reload; with the flag set, every later Lock, the lock by the
+  // clock, the "lock" of another tab and Sign out returned at once. The irreversible steps
+  // now come first, each on its own, with functions taken when the page's script loaded.
+  const { server } = s.stack;
+  // What the script breaks for the page itself (its keep-alive ping to the Service Worker, the
+  // list's own history entries) throws the script's error in the page: expected here.
+  s.expect(/pageerror: .*Error: no/);
+  const sabotage = () => {
+    window.__marker = 'the document that was unlocked';
+    const refuse = () => { throw new Error('no'); };
+    Object.defineProperty(document.body, 'hidden', { configurable: true, get() { return false; }, set: refuse });
+    // What the lock calls, replaced after the fact: the shell took its own at load.
+    ServiceWorker.prototype.postMessage = refuse;
+    Worker.prototype.terminate = refuse;
+    History.prototype.replaceState = refuse;
+    Storage.prototype.setItem = refuse;
+  };
+  const gone = async (page, what) => {
+    assert.equal(await page.evaluate(() => window.__marker || null), null, `${what}: the document that was unlocked is still there`);
+    assert.equal(await page.$('#rows'), null, `${what}: no list in the document`);
+    assert.equal(page.url(), `${s.stack.origin}/`);
+  };
+  const locked = async (page, what) => {
+    await s.screen(page, 'unlock');
+    await gone(page, what);
+    const pong = await s.ping(page);
+    assert.deepEqual([pong.tickets, pong.port], [0, false], `${what}: the Service Worker holds no ticket and no port`);
+    assert.equal(page.workers().length, 1, `${what}: only the new vault worker (which holds no key) runs`);
+  };
+  const start = async () => {
+    const { context, page } = await s.fresh();
+    assert.deepEqual(await page.evaluate(`(${READ})('docs/notes.txt')`), [200, 'These are the notes.']);
+    assert.ok((await s.ping(page)).tickets >= 1);
+    return { context, page };
+  };
+
+  // 1. The Lock button.
+  let { context, page } = await start();
+  await page.evaluate(sabotage);
+  await page.click('#lock-btn');
+  await locked(page, 'the Lock button, with a script that makes the lock throw');
+  // The vault opens again in the new document, which that script is not in.
+  await s.unlock(page);
+  assert.deepEqual(await page.evaluate(`(${READ})('docs/notes.txt')`), [200, 'These are the notes.']);
+  await context.close();
+
+  // 2. The lock by the clock (the 15 s check, no event).
+  ({ context, page } = await s.open());
+  await page.clock.install();
+  await s.signedIn(context, page);
+  await s.unlock(page);
+  await page.evaluate(sabotage);
+  await page.clock.fastForward(16 * 60000);
+  await locked(page, 'the clock, with a script that makes the lock throw');
+  await context.close();
+
+  // 3. The "lock" of another tab.
+  ({ context, page } = await start());
+  const other = await context.newPage();
+  s.watch(other);
+  await other.goto(`${s.stack.origin}/`);
+  await s.screen(other, 'unlock');
+  await s.unlock(other);
+  await page.evaluate(sabotage);
+  await other.click('#lock-btn');
+  await s.screen(other, 'unlock');
+  await locked(page, 'the lock of another tab, with a script that makes the lock throw');
+  await context.close();
+
+  // 4. Sign out: the request is sent, the session ends at the Worker, the vault is dropped.
+  ({ context, page } = await start());
+  s.expect(/401/, /Failed to load resource/);
+  const sessions = server.sessions.size;
+  await page.evaluate(sabotage);
+  await page.evaluate(() => { document.getElementById('info-btn').click(); document.getElementById('session-out').click(); });
+  await page.waitForFunction(() => !window.__marker, null, { timeout: 30000 });
+  await page.waitForSelector('#shell:not([hidden])');
+  await gone(page, 'Sign out, with a script that makes the lock throw');
+  assert.equal(server.sessions.size, sessions - 1, `${s.label}: the sign-out did not reach the Worker`);
+  assert.deepEqual((await context.cookies()).filter((c) => c.name.startsWith('gclone')), [], 'the cookie is gone');
+  await context.close();
+  s.note('unskippable: with a script in the unlocked page that makes document.body.hidden throw and replaces ServiceWorker.postMessage, Worker.terminate, history.replaceState and Storage.setItem, the Lock button, the clock, another tab\'s lock and Sign out still end in a new document with no key, ticket or port left');
+};
+
+steps.second = async (s) => {
+  // /sw.js behaves as the viewer's Service Worker only where it is registered for the whole
+  // origin. A script in the unlocked page registered a second instance for /a/<build>/: its
+  // clients.claim() took the running vault worker over, which then fetched the seal's key
+  // from that instance and sealed real tickets to it — an instance no Lock reached, which
+  // went on answering a window inside its scope with whole files after the Lock.
+  const build = s.stack.server.build;
+  const files = ['docs/notes.txt', 'pics/photo.png', 'bin/pattern-3m.bin'];
+  const { context, page } = await s.fresh();
+  const scopes = () => page.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).map((r) => new URL(r.scope).pathname).sort());
+  // Which key the vault worker seals a ticket to, and which one the page's Service Worker hands out.
+  const probe = () => page.evaluate(async () => {
+    const b64 = (bytes) => { let t = ''; for (const b of bytes) t += String.fromCharCode(b); return btoa(t); };
+    const post = Worker.prototype.postMessage;
+    const worker = await new Promise((resolve) => {
+      Worker.prototype.postMessage = function hooked(...args) { Worker.prototype.postMessage = post; resolve(this); return post.apply(this, args); };
+      window.gcloneProvider.api('info');
+    });
+    const channel = new MessageChannel();
+    const got = new Promise((resolve) => { channel.port1.onmessage = (event) => resolve(event.data); setTimeout(() => resolve(null), 5000); });
+    post.call(worker, { call: 'tickets', args: {} }, [channel.port2]);
+    post.call(worker, { call: 'issue', args: { id: `probe${String(Date.now()).padStart(17, '0')}`, path: 'docs/notes.txt' } });
+    const message = await got;
+    const mine = await fetch('/seal-key', { cache: 'no-store' });
+    return {
+      type: message && message.type,
+      to: message && message.sealed ? b64(message.sealed.to) : null,
+      pageSees: mine.status === 200 ? b64(new Uint8Array(await mine.arrayBuffer())) : mine.status,
+    };
+  });
+  const before = await probe();
+  assert.equal(before.type, 'ticket');
+  assert.equal(before.to, before.pageSees, `${s.label}: tickets are sealed to the key of the page's Service Worker`);
+
+  // The attempt: the second registration, a window inside its scope, tickets handed to it.
+  s.expect(/./);
+  const attempt = await page.evaluate(async ([scope, list]) => {
+    const out = { registered: null, active: false, handed: 0, viaWindow: [] };
+    let registration;
+    try {
+      registration = await navigator.serviceWorker.register(window.gclone.page.scriptUrl('/sw.js'), { scope });
+      out.registered = true;
+    } catch (error) {
+      out.registered = String(error).slice(0, 120);
+      return out;
+    }
+    for (let i = 0; i < 40 && !registration.active; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const instance = registration.active || registration.waiting || registration.installing;
+    out.active = Boolean(registration.active);
+    window.__popup = window.open(`${scope}app.css`);
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const post = Worker.prototype.postMessage;
+    const worker = await new Promise((resolve) => {
+      Worker.prototype.postMessage = function hooked(...args) { Worker.prototype.postMessage = post; resolve(this); return post.apply(this, args); };
+      window.gcloneProvider.api('info');
+    });
+    const channel = new MessageChannel();
+    const got = [];
+    channel.port1.onmessage = (event) => got.push(event.data);
+    post.call(worker, { call: 'tickets', args: {} }, [channel.port2]);
+    const ids = list.map((_, i) => `second${String(i).padStart(16, '0')}`);
+    list.forEach((p, i) => post.call(worker, { call: 'issue', args: { id: ids[i], path: p } }));
+    for (let i = 0; i < 200 && got.length < list.length; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+    out.ids = ids;
+    if (instance) {
+      try {
+        const mine = new MessageChannel();
+        instance.postMessage({ type: 'port' }, [mine.port2]);
+        for (const message of got) mine.port1.postMessage(message);
+        out.handed = got.length;
+      } catch (_) { /* an instance that is gone takes nothing */ }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const id of ids) {
+      try {
+        const res = await window.__popup.fetch(`/v/${id}`, { headers: { Range: 'bytes=0-9' } });
+        out.viaWindow.push(res.status);
+      } catch (error) { out.viaWindow.push('threw'); }
+    }
+    out.windowControlledBy = window.__popup.navigator.serviceWorker.controller ? new URL(window.__popup.navigator.serviceWorker.controller.scriptURL).pathname : null;
+    return out;
+  }, [`/a/${build}/`, files]);
+  for (let i = 0; i < 100 && (await scopes()).length > 1; i += 1) await sleep(50);
+  assert.deepEqual(await scopes(), ['/'], `${s.label}: a second registration of /sw.js stayed`);
+  const after = await probe();
+  assert.equal(after.type, 'ticket');
+  assert.equal(after.pageSees, before.pageSees, `${s.label}: the page's Service Worker changed its key`);
+  assert.equal(after.to, before.to, `${s.label}: the vault worker was taken over — it seals to another instance's key`);
+  // The window inside the second scope is the origin's ordinary Service Worker's client, if anyone's.
+  assert.ok(attempt.windowControlledBy === null || attempt.windowControlledBy === '/sw.js', JSON.stringify(attempt));
+  // (The script took the ticket port for itself, as in steps.seal: this page gets no ticket
+  // until it loads again. That a script in the page can deny service is not news.)
+
+  // Lock. Whatever the script kept and wherever it put it: nothing answers a file afterwards.
+  const popup = context.pages().find((p) => p !== page);
+  assert.ok(popup, 'the window the script opened');
+  await page.click('#lock-btn');
+  await s.screen(page, 'unlock');
+  const pong = await s.ping(page);
+  assert.deepEqual([pong.tickets, pong.port], [0, false]);
+  assert.deepEqual(await scopes(), ['/']);
+  for (const wait of [0, 3000]) {
+    await sleep(wait);
+    const read = await popup.evaluate(async (ids) => {
+      const out = [];
+      for (const id of ids) {
+        const res = await fetch(`/v/${id}`);
+        out.push([res.status, (await res.arrayBuffer()).byteLength]);
+      }
+      return out;
+    }, attempt.ids);
+    for (const [status, length] of read) {
+      assert.ok(status !== 200 && status !== 206, `${s.label}: a window in the second scope read ${length} bytes of a file after the Lock (${JSON.stringify(read)})`);
+      assert.ok(length < 400, `${s.label}: ${length} bytes came back after the Lock`);
+    }
+  }
+  // The page that loaded again after the Lock is the viewer as it was: it opens files.
+  await s.unlock(page);
+  assert.deepEqual(await page.evaluate(`(${READ})('docs/notes.txt')`), [200, 'These are the notes.']);
+  s.tolerated.push(/./);
+  await s.settle(page, 'second');
+  s.tolerated = [];
+  await context.close();
+  s.note(`second: a second registration of /sw.js for /a/<build>/ ${attempt.active ? 'was activated and removed itself' : 'never became active'}; the vault worker kept sealing to the page's Service Worker, and a window inside that scope read nothing after the Lock`);
+};
+
+steps.recover = async (s) => {
+  // The Service Worker lost its tickets (another tab left: `forget`; or the browser stopped
+  // it) and several files are asked for at about the same moment. Every `need-ticket`
+  // without a port makes the page open a new channel, and the vault worker closed the port
+  // of the one before: a ticket that was being sealed for the old channel was then posted on
+  // a closed port, and all but the last file answered "410 This link has expired" after 3 s.
+  const files = ['docs/notes.txt', 'pics/photo.png', 'bin/pattern-3m.bin'];
+  const { context, page: first } = await s.fresh();
+  const second = await context.newPage();
+  s.watch(second);
+  await second.goto(`${s.stack.origin}/`);
+  await s.screen(second, 'unlock');
+  await s.unlock(second);
+  const many = (page, list) => page.evaluate(async (paths) => {
+    const ids = [];
+    for (const f of paths) ids.push((await window.gcloneProvider.api('stat', { path: f })).id);
+    const t0 = performance.now();
+    return Promise.all(ids.map(async (id) => {
+      const res = await fetch(`/v/${id}`, { headers: { Range: 'bytes=0-9' } });
+      await res.arrayBuffer();
+      return [res.status, Math.round(performance.now() - t0)];
+    }));
+  }, list);
+  const all206 = (answers, what) => {
+    assert.deepEqual(answers.map(([status]) => status), answers.map(() => 206), `${s.label}: ${what}: ${JSON.stringify(answers)}`);
+    for (const [, ms] of answers) assert.ok(ms < 2500, `${s.label}: ${what}: a file waited ${ms} ms (${JSON.stringify(answers)})`);
+  };
+  all206(await many(second, files), 'three files at once, warm');
+  const seen = [];
+  // The other tab leaves — its page tells the Service Worker to forget — and this tab asks
+  // for three files at once, several times over.
+  for (let round = 0; round < 3; round += 1) {
+    await first.reload();
+    await s.screen(first, 'unlock');
+    assert.equal((await s.ping(second)).tickets, 0, 'the Service Worker forgot');
+    const answers = await many(second, files);
+    all206(answers, `three files at once after another tab left (round ${round})`);
+    seen.push(answers.map(([, ms]) => ms));
+    await s.unlock(first);
+  }
+  // The browser stops the Service Worker (it does that to an idle one): the same, in Chrome,
+  // where the test can ask for it.
+  let stopped = 'not tried in this engine';
+  if (s.engine === 'chrome') {
+    const cdp = await second.context().newCDPSession(second);
+    await cdp.send('ServiceWorker.enable');
+    await cdp.send('ServiceWorker.stopAllWorkers');
+    await sleep(500);
+    const answers = await many(second, files);
+    all206(answers, 'three files at once after the Service Worker was stopped');
+    stopped = JSON.stringify(answers.map(([, ms]) => ms));
+    await cdp.detach();
+  }
+  await s.settle(second, 'recover');
+  await context.close();
+  s.note(`recover: three files asked for at once after another tab made the Service Worker forget were all answered 206 (ms per round: ${JSON.stringify(seen)}); after a stopped Service Worker: ${stopped}`);
+};
+
 /** The entries of the session history that this run of the page made (the place table's), newest first. Ends where it began. */
 async function walkOwnHistory(page) {
   const snapshot = () => page.evaluate(() => ({ state: history.state, url: location.href, title: document.title }));
@@ -1186,6 +1808,11 @@ steps.tabs = async (s) => {
   assert.equal(await first.isVisible('#unlock-killed'), false);
   for (const page of [first, second]) assert.equal(await page.$('#rows'), null);
   assert.deepEqual([(await s.ping(second)).tickets, (await s.ping(second)).port], [0, false]);
+  // Both tabs loaded again at the same moment: how many vault workers each had to start
+  // (WebKit leaves the second of two simultaneous loads of one worker script outside the
+  // Service Worker; the shell replaces such a worker).
+  const starts = [];
+  for (const page of [first, second]) starts.push(await page.evaluate(() => window.__workers.filter((url) => url.endsWith('/vault-worker.js')).length));
 
   // 2. A tab that leaves — taken to another address — leaves no ticket behind.
   await s.unlock(first);
@@ -1243,7 +1870,7 @@ steps.tabs = async (s) => {
   }
   assert.deepEqual((await context.cookies()).filter((c) => c.name.startsWith('gclone') || c.name.startsWith('__Host')), []);
   await context.close();
-  s.note('tabs: the Lock button and Sign out reach every tab of the viewer; a tab that is taken away leaves no ticket; "reload" goes to the page of the other build only');
+  s.note(`tabs: the Lock button and Sign out reach every tab of the viewer; a tab that is taken away leaves no ticket; "reload" goes to the page of the other build only; vault workers started by two tabs that reloaded together: ${starts.join(' and ')}`);
 };
 
 steps.hardening = async (s) => {
@@ -1792,7 +2419,7 @@ steps.big = async (s) => {
 
 /** Steps that share one unlocked page, in this order; then the ones that make their own. */
 const SHARED = ['listing', 'sort', 'search', 'names', 'previews', 'media', 'download', 'recovery', 'refresh', 'history', 'keys'];
-const OWN = ['signin', 'lock', 'tabs', 'signout', 'hardening', 'unreachable', 'states', 'big'];
+const OWN = ['signin', 'lock', 'tabs', 'seal', 'planted', 'unskippable', 'second', 'recover', 'signout', 'hardening', 'unreachable', 'states', 'big'];
 
 async function runEngine(engine, playwright) {
   const stack = await startStack({ big: BIG || undefined });
@@ -1821,7 +2448,11 @@ async function runEngine(engine, playwright) {
     }
     // What the fake Drive saw of the viewer: its origin, and never a cookie or a token in an address.
     assert.deepEqual([...stack.drive.log.origins], [stack.origin]);
-    console.log(`${s.label}: OK (${((Date.now() - started) / 1000).toFixed(0)} s)`);
+    // The vault worker's question for the seal's key is the Service Worker's to answer. Where an
+    // engine lets one through to the network (a worker's first request, in Firefox), the "Worker"
+    // answers 404 and the vault worker asks again: counted, not a failure — it carries nothing.
+    const asked = stack.server.strays.filter((line) => line.startsWith('GET /seal-key')).length;
+    console.log(`${s.label}: OK (${((Date.now() - started) / 1000).toFixed(0)} s; ${asked} of the vault workers' requests for the seal's key reached the network)`);
   } catch (error) {
     console.error(`${s.label}: FAILED\n${await s.diagnose().catch((e) => `(no diagnosis: ${e})`)}`);
     throw error;

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use crate::backend::{Backend, Handle, ObjMeta, get_bounded, md5_of};
-use crate::consts::{DATA_FOLDER_MAX, DESCRIPTOR_MAX, INDEX_OBJECT_MAX};
+use crate::consts::{DATA_FOLDER_MAX, DESCRIPTOR_MAX, INDEX_OBJECT_MAX, KEYFILE_MAX};
 use crate::crypto::Keyring;
 use crate::error::{BackendError, FormatError, IndexError, StateError};
 use crate::format::{
@@ -31,6 +31,7 @@ mod resolve;
 
 pub use apply::{
     ApplyStats, HeadStore, MemIndex, apply_segment, causal_order, check_snapshot_format,
+    removal_time,
 };
 
 #[derive(Clone, Debug)]
@@ -83,6 +84,49 @@ pub struct RefreshReport {
     pub adopted: Option<String>,
     pub outbox_stuck: bool,
     pub corrupt_objects: Vec<String>,
+    /// The newest listed snapshot covers index segments this replica lacks, and the replica
+    /// could not be rebuilt from it (§5.3 `snapshot_news`): its name.
+    pub unused_snapshot: Option<String>,
+}
+
+impl RefreshReport {
+    /// Why this replica may lack index state although the refresh ended without a verdict:
+    /// segments that wait for their predecessors, listed index objects that failed
+    /// verification and were ignored, or a newer snapshot that was left unused. `gc` judges
+    /// what is dead and must not run on such a replica (§5.9); the text names the objects.
+    pub fn incomplete(&self) -> Option<String> {
+        let mut why = Vec::new();
+        if self.blocked_young > 0 {
+            why.push(format!(
+                "{} index segment(s) cannot be applied yet (their predecessors are not visible)",
+                self.blocked_young
+            ));
+        }
+        if !self.corrupt_objects.is_empty() {
+            why.push(format!(
+                "{} index object(s) failed verification and were ignored ({})",
+                self.corrupt_objects.len(),
+                self.corrupt_objects.join(", ")
+            ));
+        }
+        if let Some(name) = &self.unused_snapshot {
+            why.push(format!(
+                "snapshot {name} covers index segments this device lacks and could not be used"
+            ));
+        }
+        (!why.is_empty()).then(|| why.join("; "))
+    }
+}
+
+/// What became of the keyfiles a `passwd` retired (§2.7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetiredKeyfiles {
+    /// Moved to the trash (the store keeps them for 30 days).
+    pub trashed: u64,
+    /// Deleted for good from the vault folder …
+    pub deleted: u64,
+    /// … and from the trash, where earlier runs had left them.
+    pub deleted_from_trash: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -181,6 +225,10 @@ pub struct Vault<B: Backend> {
     /// (`Listed::snapshots_fingerprint`): `finish_mutation`'s cleanup compares it with what
     /// its last complete pass left (§5.6).
     listed_snaps: Mutex<Option<[u8; 32]>>,
+    /// What the last refresh of this process said about the replica when it may lack index
+    /// state — an error, or `RefreshReport::incomplete` (§5.9). `None`: no refresh yet, or a
+    /// clean one.
+    incomplete: Mutex<Option<String>>,
 }
 
 /// A message-only error (exit 1), shown as written.
@@ -508,6 +556,7 @@ impl<B: Backend> Vault<B> {
             journal: tokio::sync::Mutex::new(()),
             object_max: INDEX_OBJECT_MAX,
             listed_snaps: Mutex::new(None),
+            incomplete: Mutex::new(None),
         };
         // A copied or restored state directory changes its identity before it seals anything.
         if locked && vault.check_machine()? {
@@ -681,6 +730,16 @@ impl<B: Backend> Vault<B> {
         *self.device.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `Some(why)` when the last refresh of this process left a replica that may lack index
+    /// state: it failed, or it ignored index objects (`RefreshReport::incomplete`). Whoever
+    /// decides that something is dead asks this first (§5.9).
+    pub fn index_incomplete(&self) -> Option<String> {
+        self.incomplete
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The name given by the vault's `VaultInit` op; empty until the replica has applied it.
     pub fn vault_name(&self) -> String {
         self.db
@@ -775,16 +834,29 @@ impl<B: Backend> Vault<B> {
 
     /// passwd: put `kf` into the root under a pre-generated id (returned size + md5 must match,
     /// else trash it and fail), THEN trash every listed keyfile with a lower generation. Returns
-    /// the number trashed.
+    /// the number trashed. ([`Vault::put_keyfile`] and [`Vault::retire_keyfiles`] in one call.)
     pub async fn replace_keyfile(
         &self,
         kf: &crate::format::SealedObject,
     ) -> Result<u64, IndexError> {
-        let Some((generation, _)) = parse_keyfile_name(&kf.name) else {
+        let new = self.put_keyfile(kf).await?;
+        Ok(self.retire_keyfiles(&new, false).await?.trashed)
+    }
+
+    /// passwd, first half (§2.7): puts `kf` into the root under a pre-generated id — the
+    /// returned size and md5 must match, else it is trashed and the put fails — and then reads
+    /// the object back from the store and compares it byte for byte with what was sealed.
+    /// Nothing is retired before this returns: after it, the store verifiably holds a keyfile
+    /// that the caller has opened with the new passphrase.
+    pub async fn put_keyfile(
+        &self,
+        kf: &crate::format::SealedObject,
+    ) -> Result<ObjMeta, IndexError> {
+        if parse_keyfile_name(&kf.name).is_none() {
             return Err(FormatError::BadName(kf.name.clone()).into());
-        };
+        }
         let [id] = fresh_ids(&*self.backend).await?;
-        put_checked(
+        let meta = put_checked(
             &*self.backend,
             &id,
             &self.handles.root,
@@ -792,17 +864,81 @@ impl<B: Backend> Vault<B> {
             &Bytes::copy_from_slice(&kf.bytes),
         )
         .await?;
-        let mut trashed = 0;
-        for old in self.keyfiles().await? {
-            let lower = parse_keyfile_name(&old.name).is_some_and(|(g, _)| g < generation);
-            if lower && old.handle != id {
-                match self.backend.trash(&old.handle).await {
-                    Ok(()) | Err(BackendError::NotFound) => trashed += 1,
-                    Err(e) => return Err(e.into()),
-                }
+        let stored = get_bounded(&*self.backend, &id, KEYFILE_MAX).await?;
+        if stored.as_deref() != Some(&kf.bytes[..]) {
+            if let Err(e) = self.backend.trash(&id).await {
+                tracing::warn!("could not trash the damaged keyfile {}: {e}", kf.name);
+            }
+            return Err(damaged(&kf.name));
+        }
+        Ok(meta)
+    }
+
+    /// The objects under a keyfile's name in the vault root and in its trash (as far as the
+    /// store lists the trash: `Backend::list_trashed`), each highest generation first. Names
+    /// only: the device holds no passphrase and can open none of them.
+    pub async fn keyfiles_and_trashed(&self) -> Result<(Vec<ObjMeta>, Vec<ObjMeta>), IndexError> {
+        let live = self.keyfiles().await?;
+        let mut trashed: Vec<(u32, ObjMeta)> = self
+            .backend
+            .list_trashed(&self.handles.root)
+            .await
+            .map_err(not_visible)?
+            .into_iter()
+            .filter(|m| !m.is_folder && m.trashed)
+            .filter_map(|m| Some((parse_keyfile_name(&m.name)?.0, m)))
+            .collect();
+        trashed.sort_by(|a, b| (b.0, &b.1.name).cmp(&(a.0, &a.1.name)));
+        Ok((live, trashed.into_iter().map(|(_, m)| m).collect()))
+    }
+
+    /// passwd, second half (§2.7): every keyfile of the vault root with a lower generation
+    /// than `new` is retired — moved to the trash, or with `purge` deleted for good, together
+    /// with EVERY object under a keyfile's name that is in the trash already, whatever its
+    /// generation (what earlier `passwd` runs left there and what was trashed by hand, as far
+    /// as the store lists it: `Backend::list_trashed`). Nothing in the trash is a keyfile in
+    /// use, and each of them opens with an old passphrase.
+    ///
+    /// Only objects of the vault's root folder whose name is a keyfile's name are touched, and
+    /// never `new` itself — junk planted under such a name goes with them. Among the objects
+    /// that are not in the trash the generation decides: a keyfile of the same generation (a
+    /// concurrent `passwd`) or a higher one stays. The generations are names: the device
+    /// holds no passphrase and can open none of them.
+    pub async fn retire_keyfiles(
+        &self,
+        new: &ObjMeta,
+        purge: bool,
+    ) -> Result<RetiredKeyfiles, IndexError> {
+        let Some((generation, _)) = parse_keyfile_name(&new.name) else {
+            return Err(FormatError::BadName(new.name.clone()).into());
+        };
+        let lower = |m: &ObjMeta| {
+            !m.is_folder
+                && m.handle != new.handle
+                && parse_keyfile_name(&m.name).is_some_and(|(g, _)| g < generation)
+        };
+        let gone = |r: Result<(), BackendError>| match r {
+            Ok(()) | Err(BackendError::NotFound) => Ok(()),
+            Err(e) => Err(IndexError::from(e)),
+        };
+        let mut retired = RetiredKeyfiles::default();
+        for old in self.keyfiles().await?.iter().filter(|m| lower(m)) {
+            if purge {
+                gone(self.backend.delete(&old.handle).await)?;
+                retired.deleted += 1;
+            } else {
+                gone(self.backend.trash(&old.handle).await)?;
+                retired.trashed += 1;
             }
         }
-        Ok(trashed)
+        if purge {
+            let (_, trashed) = self.keyfiles_and_trashed().await?;
+            for old in trashed.iter().filter(|m| m.handle != new.handle) {
+                gone(self.backend.delete(&old.handle).await)?;
+                retired.deleted_from_trash += 1;
+            }
+        }
+        Ok(retired)
     }
 
     /// This device's current data folder (creates / rolls).

@@ -5,6 +5,10 @@
 //   page → POST /web/start → "Google" → /callback → POST /web/token → cookie
 //        → reload → POST /web/refresh → unlock → the list → POST /web/logout
 //
+// and, with the same Worker code, what it answers a Service Worker that someone who served
+// this origin before left in the browser (the update check of a script that is not `/sw.js`):
+// `Clear-Site-Data`, on which Chrome drops the registration.
+//
 //   node worker/test/e2e/signin.mjs
 //
 // Chrome only: it takes a `Secure` `__Host-` cookie on http://127.0.0.1; what Safari does
@@ -127,11 +131,31 @@ class WorkerServer extends ViewerServer {
     };
     /** What the Worker answered on its JSON routes: `[path, status, body text]`. */
     this.answers = [];
+    /** Requests for a Service Worker's script that reached the Worker: `[path, status, Clear-Site-Data]`. */
+    this.scripts = [];
+    /** true: someone else serves this origin — a page that plants a Service Worker of its own. */
+    this.hostile = false;
+  }
+
+  /** The origin in other hands: a page of theirs, and a Service Worker for the whole origin that keeps showing it. */
+  plant(res, url) {
+    const page = '<!doctype html><title>gclone</title><h1 id="planted">A page of whoever served this origin before</h1>';
+    const files = {
+      '/': ['text/html', `${page}<script src="/planted.js"></script>`],
+      '/planted.js': ['text/javascript', "navigator.serviceWorker.register('/planted-sw.js', { scope: '/' });"],
+      '/planted-sw.js': ['text/javascript', `self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', (event) => { if (event.request.mode === 'navigate') event.respondWith(new Response(${JSON.stringify(page)}, { headers: { 'Content-Type': 'text/html' } })); });`],
+    };
+    const file = files[url.pathname];
+    res.writeHead(file ? 200 : 404, { 'Content-Type': file ? file[0] : 'text/plain', 'Cache-Control': 'no-store' });
+    res.end(file ? file[1] : '');
   }
 
   async handle(req, res) {
     const url = new URL(req.url, this.origin);
     this.log.push(`${req.method} ${url.pathname}`);
+    if (this.hostile) return this.plant(res, url);
     if (url.pathname.startsWith('/a/') || url.pathname === '/sw.js') return this.asset(req, res, url);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -152,6 +176,7 @@ class WorkerServer extends ViewerServer {
     if (cookies.length) out['set-cookie'] = cookies;
     const body = Buffer.from(await answer.arrayBuffer());
     if (url.pathname.startsWith('/web/') || url.pathname === '/refresh') this.answers.push([url.pathname, answer.status, body.toString()]);
+    if (req.headers['service-worker'] === 'script') this.scripts.push([url.pathname, answer.status, answer.headers.get('clear-site-data')]);
     res.writeHead(answer.status, out);
     res.end(body);
     return undefined;
@@ -246,6 +271,35 @@ try {
   const logged = (server.workerLog || []).join('\n');
   assert.ok(logged.includes('/web/token') && !/ya29|1\/\/fake|4\/0A|@example/.test(logged), 'the Worker logs routes and statuses only');
   console.log(`chrome ${browser.version()}: sign-in round trip through the real Worker code: start → Google → /callback → token (cookie: HttpOnly, Secure, SameSite=Strict) → reload → refresh → unlock → logout; an address off the allowlist is refused and revoked`);
+
+  // --- After a change of hands (README; the audit's L6). Someone else served this origin for a while, and a
+  //     browser that came by then keeps their Service Worker: it answers `/` from the browser, so the release
+  //     that is deployed again never loads there, and a client without that browser's profile sees nothing wrong.
+  const visitor = await browser.newContext();
+  const first = await visitor.newPage();
+  server.hostile = true;
+  await first.goto(`${origin}/`);
+  await first.waitForFunction(() => navigator.serviceWorker.controller !== null);
+  server.hostile = false;
+  assert.ok((await (await fetch(`${origin}/`)).text()).includes('id="unlock-pass"'), 'the release is served again');
+  const registered = (p) => p.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).map((r) => new URL((r.active || r.waiting || r.installing).scriptURL).pathname));
+  const second = await visitor.newPage();
+  const logged0 = server.log.length;
+  await second.goto(`${origin}/`);
+  assert.equal(await second.textContent('#planted'), 'A page of whoever served this origin before', 'the planted Service Worker still answers the address');
+  assert.ok(!server.log.slice(logged0).includes('GET /'), 'the request for the page never reached the Worker');
+  // The browser asks for the planted script again — its update check, which it makes by itself after a visit and at
+  // least once a day; asked for here. The Worker has no such script: 404, and Clear-Site-Data.
+  await second.evaluate(async () => { const r = await navigator.serviceWorker.getRegistration(); try { await r.update(); } catch (_) { /* the script is gone */ } });
+  for (let i = 0; i < 100 && (await registered(second)).length > 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(await registered(second), [], 'Chrome dropped the planted registration');
+  assert.ok(server.scripts.length >= 1 && server.scripts.every(([p, status, clear]) => p === '/planted-sw.js' && status === 404 && clear === '"cache", "storage"'), `the Worker's answers to the update check: ${JSON.stringify(server.scripts)}`);
+  const third = await visitor.newPage();
+  await third.goto(`${origin}/`);
+  await third.waitForSelector('#shell[data-screen="signin"]:not([hidden])', { timeout: 30000 });
+  assert.deepEqual(await registered(third), ['/sw.js'], 'the viewer\'s own Service Worker is the only one');
+  await visitor.close();
+  console.log(`chrome ${browser.version()}: a Service Worker planted while someone else served the origin kept answering / after the release was back; the Worker answered its update check 404 with Clear-Site-Data, Chrome dropped it, and the next visit loaded the viewer`);
   console.log('OK');
 } finally {
   await browser.close();

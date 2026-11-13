@@ -14,11 +14,15 @@ use super::{
 use crate::auth::{self, AuthClient, AuthEndpoints, InteractiveOpts, LoginGrant, TokenProvider};
 use crate::backend::{AnyBackend, Backend as _, DirBackend, ObjMeta, get_all};
 use crate::config::{BackendCfg, Config, Paths, SecretStore, Secrets, secret_store};
-use crate::consts::{KEYFILE_MAX, KEYFILE_TRY_MAX, PROMPT_ATTEMPTS, TRANSFERS_DEFAULT};
+use crate::consts::{
+    KEYFILE_LOOK_ALL_MAX, KEYFILE_LOOK_MAX, KEYFILE_MAX, KEYFILE_TRY_MAX, PROMPT_ATTEMPTS,
+    TRANSFERS_DEFAULT,
+};
 use crate::crypto::{Keyring, MasterKey, Passphrase};
 use crate::error::{AuthError, BackendError, ConfigError, CryptoError, FormatError, IndexError};
-use crate::format::{KeyfilePayload, open_keyfile, seal_keyfile};
+use crate::format::{KeyfilePayload, check_keyfile, open_keyfile, seal_keyfile};
 use crate::index::{CreateParams, FoundVault, OpenParams, Vault, creation_winner};
+use crate::keystore;
 use crate::state::Db;
 use crate::types::OpDraft;
 use crate::ui::Ui;
@@ -52,6 +56,10 @@ pub struct LoginArgs {
     /// Accept a time-limited Google login (OAuth app still in Testing).
     #[arg(long)]
     pub allow_expiring_login: bool,
+    /// Try the passphrase on every keyfile of the vault, not only on the four newest (slower:
+    /// one key derivation each). For a vault whose folder holds keyfiles that are not yours.
+    #[arg(long)]
+    pub all_keyfiles: bool,
 }
 
 const DEFAULT_VAULT_NAME: &str = "gclone";
@@ -129,7 +137,9 @@ impl Session {
             data_id: found.handles.data.0.clone(),
         };
         config.save(&self.paths)?;
-        self.store.save(&self.secrets(Some(keys)))?;
+        // The keys were just opened from a keyfile, or made here: a sealed copy that this
+        // run could not open is no longer the only place they are in (§8.2).
+        self.store.save_proven(&self.secrets(Some(keys)))?;
         Ok(())
     }
 
@@ -159,7 +169,16 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
     if let Some(config) = &config {
         note_config(&paths, config);
     }
-    let secrets = store.load()?;
+    // A sealed key store that cannot be opened is "no usable secrets" for `login`, the one
+    // command that can put the key back: it says why and goes on. The sealed file is not
+    // touched until this login holds the key again (§8.2).
+    let secrets = match store.load() {
+        Err(ConfigError::KeyStoreUnavailable(why)) => {
+            ui.warn(&why);
+            None
+        }
+        loaded => loaded?,
+    };
     // Found now rather than after the sign-in: the secrets could not be saved there (§8.1).
     if let Ok(md) = std::fs::symlink_metadata(&paths.state_root)
         && !(md.is_dir() && util::is_private(&md))
@@ -215,6 +234,13 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
         drive => drive,
     };
     let cached_keys = secrets.as_ref().is_some_and(|s| !s.keys.is_empty());
+    // The login of a keyless secrets.json with the keys of secrets.sealed (an older gclone
+    // signed in on a sealed device, §8.2): this run writes the two as one file.
+    let merged = cached_keys
+        && matches!(
+            keystore::LayeredStore::new(&paths).resolve(),
+            Ok(Some(loaded)) if loaded.source == keystore::Source::Merged
+        );
     let session = Session {
         ui,
         paths,
@@ -228,7 +254,9 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
 
     // --- step B.1: a connected device that only signed in again
     if let (Some(config), true) = (&session.config, cached_keys) {
-        return relogin(&session, config, secrets).await;
+        let code = relogin(&session, config, secrets, merged).await?;
+        note_key_store(&session.ui, &session.paths);
+        return Ok(code);
     }
 
     // --- step A.4: not connected yet — keep the grant, so that it survives a later failure.
@@ -309,7 +337,22 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
             attach(&session, &found[picked]).await?
         }
     }
+    note_key_store(&session.ui, &session.paths);
     Ok(0)
+}
+
+/// A login that ended in the plain file although the owner chose the sealed store (§8.2):
+/// the sealed file could not be opened, or no key could be made in this session.
+fn note_key_store(ui: &Ui, paths: &Paths) {
+    if keystore::read_choice(paths) == keystore::Choice::Enclave
+        && std::fs::symlink_metadata(paths.secrets_file()).is_ok()
+    {
+        ui.warn(
+            "this login was saved to the plain file secrets.json although the sealed key store \
+             was chosen: the sealed file could not be opened, or the Secure Enclave could not \
+             be used in this session. `gclone keystore use enclave` moves it there.",
+        );
+    }
 }
 
 fn check_vault_name(name: &str) -> anyhow::Result<()> {
@@ -480,7 +523,12 @@ fn remove_token_cache(paths: &Paths) {
 // ---------------------------------------------------------------------------------------------
 
 /// B.1: the device is connected; check that this login (or directory) still shows its vault.
-async fn relogin(s: &Session, config: &Config, secrets: Option<Secrets>) -> anyhow::Result<i32> {
+async fn relogin(
+    s: &Session,
+    config: &Config,
+    secrets: Option<Secrets>,
+    merged: bool,
+) -> anyhow::Result<i32> {
     // On failure nothing was written: the token on file stays in use (§2.6).
     Vault::verify_visible(&*s.backend, &config.handles())
         .await
@@ -505,6 +553,16 @@ async fn relogin(s: &Session, config: &Config, secrets: Option<Secrets>) -> anyh
         return Ok(0);
     };
     if !login.fresh {
+        // The login still works and nothing is renewed — but where it lies in secrets.json
+        // without a key, with the key in secrets.sealed, the two become one file now: the
+        // save goes to secrets.json, and the sealed copy of the same keys is removed.
+        if merged && let Some(both) = &secrets {
+            s.store.save(both)?;
+            s.ui.info(
+                "The login in secrets.json and the key in secrets.sealed are one file again \
+                 (secrets.json).",
+            );
+        }
         s.ui.out("Vault unchanged.");
         return Ok(0);
     }
@@ -677,7 +735,11 @@ async fn create(s: &Session) -> anyhow::Result<()> {
                 Config::delete(&s.paths)?;
                 // Back to "signed in, not connected": the login stays, the key goes.
                 match &s.login {
-                    Some(_) => s.store.save(&s.secrets(None))?,
+                    // The keys just saved are those of the vault that lost: the one keyless
+                    // save that may take the place of sealed keys (§8.2).
+                    Some(_) => s
+                        .store
+                        .save_dropping_keys(&s.secrets(None), &s.secrets(Some(&keys)))?,
                     None => s.store.delete()?,
                 }
                 let _ = std::fs::remove_dir_all(&state_dir);
@@ -751,39 +813,98 @@ async fn lost_race(
     }
 }
 
-/// One keyfile candidate of ATTACH.
+/// One keyfile candidate of ATTACH: a well-formed keyfile (`format::check_keyfile`).
 struct Candidate {
     name: String,
     bytes: Bytes,
+    /// The passphrases that answered "wrong key" here: no pair is derived twice (§2.6).
+    tried: Vec<Zeroizing<String>>,
+}
+
+/// What ATTACH found under the keyfile names of the vault's root.
+#[derive(Default)]
+struct Keyfiles {
+    /// The well-formed keyfiles, highest generation first.
+    candidates: Vec<Candidate>,
+    /// Objects with a keyfile's name that are no keyfile: refused before any derivation.
+    refused: usize,
+    /// One of them was refused for a version this build does not read.
+    newer: Option<FormatError>,
+    /// Objects with a keyfile's name beyond the ones this login looks at.
+    unseen: usize,
 }
 
 enum Unlock {
     Opened(Box<KeyfilePayload>),
-    /// At least one candidate answered "wrong key".
+    /// Every candidate that is left has answered "wrong key" to this passphrase.
     WrongPassphrase,
+    /// As many candidates as one attempt may ask answered "wrong key"; this many were not
+    /// asked. The passphrase may be right: "wrong passphrase" would be a guess.
+    Untried(usize),
     /// No candidate is left to try.
     Unusable(FormatError),
 }
 
-/// Tries `pass` on every candidate, highest generation first. A candidate that fails with
-/// anything other than a wrong key is dropped for the rest of the command (§2.6: each
-/// (keyfile, passphrase) pair runs at most once).
-fn unlock(candidates: &mut Vec<Candidate>, pass: &Passphrase, vault_id: [u8; 16]) -> Unlock {
+/// Tries `pass` on the candidates, highest generation first, until one opens or `limit` of
+/// them have answered "wrong key" — each of those is one key derivation, and the number of
+/// well-formed keyfiles in a vault folder is up to whoever can write to it. A candidate that
+/// already refused this passphrase — every reading of it (`Passphrase::readings`) — is not
+/// asked again and does not count; one that fails with anything other than a wrong key is
+/// dropped for the rest of the command (§2.6: each (keyfile, passphrase) pair runs at most
+/// once, a passphrase being one reading of what was entered).
+fn unlock(
+    candidates: &mut Vec<Candidate>,
+    pass: &Passphrase,
+    vault_id: [u8; 16],
+    limit: usize,
+) -> Unlock {
+    // Both readings of the input (§2.6): the canonical one, and the text as typed where that
+    // is another passphrase. The memo is per reading — two spellings with one canonical form
+    // are two passphrases to a keyfile that was sealed under the text as typed.
+    let readings: Vec<(Zeroizing<String>, Passphrase)> = pass
+        .readings()
+        .into_iter()
+        .map(|reading| (reading.display(), reading))
+        .collect();
     let mut dropped = FormatError::KeyfileDamaged;
     let mut kept = Vec::new();
     let mut opened = None;
-    for c in candidates.drain(..) {
-        if opened.is_some() {
+    let (mut wrong, mut untried) = (0, 0);
+    for mut c in candidates.drain(..) {
+        let fresh: Vec<&(Zeroizing<String>, Passphrase)> = readings
+            .iter()
+            .filter(|(text, _)| !c.tried.contains(text))
+            .collect();
+        if opened.is_some() || fresh.is_empty() {
             kept.push(c);
             continue;
         }
-        match open_keyfile(&c.name, &c.bytes, pass) {
+        if wrong >= limit {
+            untried += 1;
+            kept.push(c);
+            continue;
+        }
+        // Only the readings this keyfile has not refused yet are derived, in their order.
+        let mut answer = Err(FormatError::Crypto(CryptoError::WrongKey));
+        let mut refused = Vec::new();
+        for (text, reading) in fresh {
+            answer = open_keyfile(&c.name, &c.bytes, reading);
+            if !matches!(answer, Err(FormatError::Crypto(CryptoError::WrongKey))) {
+                break;
+            }
+            refused.push(text.clone());
+        }
+        c.tried.append(&mut refused);
+        match answer {
             Ok(payload) if payload.vault_id_bytes().is_ok_and(|id| id == vault_id) => {
                 opened = Some(payload);
                 kept.push(c);
             }
             Ok(_) => tracing::warn!("keyfile {} belongs to another vault; ignored", c.name),
-            Err(FormatError::Crypto(CryptoError::WrongKey)) => kept.push(c),
+            Err(FormatError::Crypto(CryptoError::WrongKey)) => {
+                wrong += 1;
+                kept.push(c);
+            }
             Err(e) => {
                 tracing::warn!("keyfile {} is not usable ({e}); ignored", c.name);
                 if matches!(e, FormatError::KeyfileVersion(_)) {
@@ -796,34 +917,218 @@ fn unlock(candidates: &mut Vec<Candidate>, pass: &Passphrase, vault_id: [u8; 16]
     match opened {
         Some(payload) => Unlock::Opened(Box::new(payload)),
         None if candidates.is_empty() => Unlock::Unusable(dropped),
+        None if untried > 0 => Unlock::Untried(untried),
         None => Unlock::WrongPassphrase,
     }
 }
 
-/// The keyfiles ATTACH looks at: the `KEYFILE_TRY_MAX` highest generations, no more.
-async fn keyfile_candidates(s: &Session, found: &FoundVault) -> anyhow::Result<Vec<Candidate>> {
-    let mut candidates = Vec::new();
-    for meta in found.keyfiles.iter().take(KEYFILE_TRY_MAX) {
+/// The keyfiles ATTACH can try (§2.6). Every object under a keyfile's name is unauthenticated
+/// — anyone who can write to the vault folder can put objects there, under any generation —
+/// so the names only give the order, and what is fetched is bounded: at most `look_max`
+/// objects of at most `KEYFILE_MAX` bytes. An object that is no keyfile (junk, another name's
+/// content, parameters out of bounds, too large) is refused here, before any derivation, and
+/// takes no place among the candidates: planted names of higher generations do not push the
+/// real keyfile out.
+async fn keyfile_candidates(
+    backend: &AnyBackend,
+    listed: &[ObjMeta],
+    all: bool,
+) -> anyhow::Result<Keyfiles> {
+    let look_max = if all {
+        KEYFILE_LOOK_ALL_MAX
+    } else {
+        KEYFILE_LOOK_MAX
+    };
+    let mut keyfiles = Keyfiles::default();
+    let mut fetched = 0;
+    for meta in listed {
         let ObjMeta {
             name, handle, size, ..
         } = meta;
         if *size > KEYFILE_MAX {
             tracing::warn!("keyfile {name} is too large; ignored");
+            keyfiles.refused += 1;
             continue;
         }
+        if fetched >= look_max {
+            keyfiles.unseen += 1;
+            continue;
+        }
+        fetched += 1;
         tracing::debug!("reading keyfile candidate {name}");
         // One byte more than allowed is asked for, so that an object that grew is noticed.
-        match get_all(&*s.backend, handle, Some(0..KEYFILE_MAX + 1)).await {
-            Ok(bytes) if bytes.len() as u64 <= KEYFILE_MAX => candidates.push(Candidate {
+        let bytes = match get_all(backend, handle, Some(0..KEYFILE_MAX + 1)).await {
+            Ok(bytes) => bytes,
+            Err(BackendError::NotFound) => {
+                tracing::warn!("keyfile {name} disappeared; ignored");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match check_keyfile(name, &bytes) {
+            Ok(_) => keyfiles.candidates.push(Candidate {
                 name: name.clone(),
                 bytes,
+                tried: Vec::new(),
             }),
-            Ok(_) => tracing::warn!("keyfile {name} is too large; ignored"),
-            Err(BackendError::NotFound) => tracing::warn!("keyfile {name} disappeared; ignored"),
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                tracing::warn!("keyfile {name} is not usable ({e}); ignored");
+                keyfiles.refused += 1;
+                if matches!(e, FormatError::KeyfileVersion(_)) {
+                    keyfiles.newer = Some(e);
+                }
+            }
         }
     }
-    Ok(candidates)
+    Ok(keyfiles)
+}
+
+fn keyfiles_text(n: usize) -> String {
+    match n {
+        1 => "one keyfile".into(),
+        n => format!("{n} keyfiles"),
+    }
+}
+
+/// "one older keyfile was" / "3 older keyfiles were" (… not tried).
+fn older_text(n: usize) -> String {
+    match n {
+        1 => "one older keyfile was".into(),
+        n => format!("{n} older keyfiles were"),
+    }
+}
+
+/// What to do about keyfiles that hide the real one, for the messages below.
+const PLANTED_KEYFILES: &str = "Anyone who can write to the vault folder can put keyfiles of \
+    their own in front of the real one; they cost a try each and open with nothing.";
+
+/// " N more objects with keyfile names were not looked at …", or nothing.
+fn unseen_text(unseen: usize, all: bool) -> String {
+    if unseen == 0 {
+        return String::new();
+    }
+    let more = if all {
+        "remove the planted objects from the vault folder in drive.google.com".to_string()
+    } else {
+        format!("`gclone login --all-keyfiles` looks at up to {KEYFILE_LOOK_ALL_MAX}")
+    };
+    format!(
+        " {unseen} more object(s) with keyfile names were not looked at ({more}; `gclone \
+         passwd` on a connected device writes a keyfile ahead of them all)."
+    )
+}
+
+/// Asks for the passphrase and opens one of the vault's keyfiles with it (§2.6): what ATTACH
+/// does on a new device, and what `gclone keystore use enclave` does to prove that the
+/// passphrase is still the way back. `listed`: the objects under keyfile names in the vault's
+/// root. `retry_all`: the command that tries every keyfile, for the messages.
+pub(super) async fn unlock_with_passphrase(
+    ui: &Arc<Ui>,
+    backend: &AnyBackend,
+    listed: &[ObjMeta],
+    vault_id: [u8; 16],
+    passphrase_file: Option<&Path>,
+    all: bool,
+    retry_all: &str,
+) -> anyhow::Result<Box<KeyfilePayload>> {
+    let Keyfiles {
+        mut candidates,
+        refused,
+        newer,
+        unseen,
+    } = keyfile_candidates(backend, listed, all).await?;
+    if candidates.is_empty() {
+        let e = newer.unwrap_or(FormatError::KeyfileDamaged);
+        if unseen == 0 {
+            return Err(e.into());
+        }
+        // Not "the keyfile is missing": this login has not looked at all of them.
+        return Err(explained(
+            e,
+            format!(
+                "None of the {refused} object(s) with keyfile names that this login looked at \
+                 is a keyfile.{} {PLANTED_KEYFILES}",
+                unseen_text(unseen, all)
+            ),
+        ));
+    }
+    // Asking is for a person at a terminal; `--passphrase-file` gets one attempt and no question.
+    let interactive = passphrase_file.is_none();
+    let attempts = if interactive { PROMPT_ATTEMPTS } else { 1 };
+    let mut payload = None;
+    let mut last = Unlock::WrongPassphrase;
+    for attempt in 1..=attempts {
+        let mut pass = {
+            let (ui, file) = (ui.clone(), passphrase_file.map(Path::to_path_buf));
+            blocking(move || read_passphrase(&ui, file.as_deref())).await?
+        };
+        // What one attempt may cost without being asked for more: `KEYFILE_TRY_MAX` derivations.
+        let mut limit = if all { usize::MAX } else { KEYFILE_TRY_MAX };
+        let outcome = loop {
+            let (outcome, rest, pass_back) = blocking(move || {
+                let outcome = unlock(&mut candidates, &pass, vault_id, limit);
+                Ok((outcome, candidates, pass))
+            })
+            .await?;
+            (candidates, pass) = (rest, pass_back);
+            match outcome {
+                Unlock::Untried(n)
+                    if interactive
+                        && ui.confirm(&format!(
+                            "That passphrase does not open the {} newest keyfiles of this \
+                             vault. Try it on the {} older one(s) too (a key derivation each)?",
+                            candidates.len() - n,
+                            n
+                        )) =>
+                {
+                    limit = usize::MAX;
+                }
+                outcome => break outcome,
+            }
+        };
+        match outcome {
+            Unlock::Opened(p) => {
+                payload = Some(p);
+                break;
+            }
+            Unlock::Unusable(e) => return Err(e.into()),
+            Unlock::WrongPassphrase if attempt < attempts => ui.error("Wrong passphrase."),
+            Unlock::Untried(n) if attempt < attempts => ui.error(&format!(
+                "That passphrase does not open the newest keyfiles of this vault; {} not tried.",
+                older_text(n)
+            )),
+            Unlock::WrongPassphrase | Unlock::Untried(_) => {}
+        }
+        last = outcome;
+    }
+    let Some(payload) = payload else {
+        // "Wrong passphrase" is said only when it is known: every keyfile of the vault was
+        // asked. While some were not, the passphrase may be right (§2.6, §17.26).
+        return Err(match last {
+            Unlock::Untried(n) => explained(
+                ConfigError::WrongPassphrase,
+                format!(
+                    "The passphrase does not open the {} newest keyfiles of this vault, and {} \
+                     not tried.{} {PLANTED_KEYFILES} If the passphrase is right, run \
+                     `{retry_all}`: it tries every keyfile, one key derivation each.",
+                    candidates.len() - n,
+                    older_text(n),
+                    unseen_text(unseen, all)
+                ),
+            ),
+            _ if unseen > 0 => explained(
+                ConfigError::WrongPassphrase,
+                format!(
+                    "The passphrase opens none of the {} this login looked at.{} \
+                     {PLANTED_KEYFILES}",
+                    keyfiles_text(candidates.len()),
+                    unseen_text(unseen, all)
+                ),
+            ),
+            _ => ConfigError::WrongPassphrase.into(),
+        });
+    };
+    Ok(payload)
 }
 
 /// ATTACH (every later device, and a device that comes back after `logout`).
@@ -838,47 +1143,16 @@ async fn attach(s: &Session, found: &FoundVault) -> anyhow::Result<()> {
         created_date(found)
     ));
 
-    let mut candidates = keyfile_candidates(s, found).await?;
-    if candidates.is_empty() {
-        return Err(FormatError::KeyfileDamaged.into());
-    }
-    let attempts = if s.args.passphrase_file.is_some() {
-        1
-    } else {
-        PROMPT_ATTEMPTS
-    };
-    let mut tried: Vec<Zeroizing<String>> = Vec::new();
-    let mut payload = None;
-    for attempt in 1..=attempts {
-        let pass = s.passphrase(false).await?;
-        let text = pass.display();
-        // A passphrase that already failed is not run through Argon2 again.
-        let outcome = if tried.contains(&text) {
-            Unlock::WrongPassphrase
-        } else {
-            tried.push(text);
-            let vault_id = found.vault_id;
-            let (outcome, rest) = blocking(move || {
-                let outcome = unlock(&mut candidates, &pass, vault_id);
-                Ok((outcome, candidates))
-            })
-            .await?;
-            candidates = rest;
-            outcome
-        };
-        match outcome {
-            Unlock::Opened(p) => {
-                payload = Some(p);
-                break;
-            }
-            Unlock::Unusable(e) => return Err(e.into()),
-            Unlock::WrongPassphrase if attempt < attempts => s.ui.error("Wrong passphrase."),
-            Unlock::WrongPassphrase => {}
-        }
-    }
-    let Some(payload) = payload else {
-        return Err(ConfigError::WrongPassphrase.into());
-    };
+    let payload = unlock_with_passphrase(
+        &s.ui,
+        &s.backend,
+        &found.keyfiles,
+        found.vault_id,
+        s.args.passphrase_file.as_deref(),
+        s.args.all_keyfiles,
+        "gclone login --all-keyfiles",
+    )
+    .await?;
     let keys = payload.keyring()?;
     drop(payload);
 
@@ -940,7 +1214,8 @@ async fn attach(s: &Session, found: &FoundVault) -> anyhow::Result<()> {
     ));
     s.ui.out(
         "A new device trusts the vault as Google serves it; equal head values mean both devices \
-         see the same history.",
+         have applied the same history. Take the device that wrote last: the value shows \
+         agreement, not that either device is up to date.",
     );
     Ok(())
 }
@@ -1443,6 +1718,7 @@ mod tests {
 
     #[test]
     fn unlock_bounds_the_work_per_candidate() {
+        use crate::crypto::kdf::tests::argon2_runs;
         let params = crate::crypto::KdfParams {
             m_kib: 8192,
             t: 1,
@@ -1469,6 +1745,7 @@ mod tests {
         let candidate = |name: &str, bytes: &[u8]| Candidate {
             name: name.to_string(),
             bytes: Bytes::copy_from_slice(bytes),
+            tried: Vec::new(),
         };
         let all = || {
             vec![
@@ -1481,14 +1758,21 @@ mod tests {
         // A wrong passphrase: junk is dropped for good, the two real keyfiles stay.
         let mut candidates = all();
         assert!(matches!(
-            unlock(&mut candidates, &wrong, vault_id),
+            unlock(&mut candidates, &wrong, vault_id, KEYFILE_TRY_MAX),
             Unlock::WrongPassphrase
         ));
         let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, [foreign.name.as_str(), real.name.as_str()]);
+        // The same passphrase again: every candidate has answered — no derivation.
+        let before = argon2_runs();
+        assert!(matches!(
+            unlock(&mut candidates, &wrong, vault_id, KEYFILE_TRY_MAX),
+            Unlock::WrongPassphrase
+        ));
+        assert_eq!(argon2_runs(), before);
 
         // The right one: the keyfile of another vault opens and is ignored; the real one wins.
-        match unlock(&mut candidates, &right, vault_id) {
+        match unlock(&mut candidates, &right, vault_id, KEYFILE_TRY_MAX) {
             Unlock::Opened(payload) => assert_eq!(payload.generation, 1),
             _ => panic!("the real keyfile must open"),
         }
@@ -1496,10 +1780,153 @@ mod tests {
         // Only junk: nothing is left to try.
         let mut junk = vec![candidate("gclone-key-00000009-00000000", b"junk")];
         assert!(matches!(
-            unlock(&mut junk, &right, vault_id),
+            unlock(&mut junk, &right, vault_id, KEYFILE_TRY_MAX),
             Unlock::Unusable(FormatError::KeyfileDamaged)
         ));
         assert!(junk.is_empty());
+    }
+
+    /// Audit L10: well-formed keyfiles can be planted without any secret — a keyfile of any
+    /// other vault, under a higher generation. Four of them used to fill the four places, the
+    /// real keyfile was never asked, and the answer to the right passphrase was "Wrong
+    /// passphrase". Now the answer says that keyfiles were not tried, and they can be.
+    #[test]
+    fn planted_keyfiles_never_turn_the_right_passphrase_into_a_wrong_one() {
+        use crate::crypto::kdf::tests::argon2_runs;
+        let params = crate::crypto::KdfParams {
+            m_kib: 8192,
+            t: 1,
+            p: 1,
+        };
+        let vault_id = [4; 16];
+        let keys = Keyring::new(vault_id, vec![(1, MasterKey::from_bytes([1; 32]))], 1).unwrap();
+        let right = Passphrase::from_input("correct horse battery staple");
+        let real = seal_keyfile(
+            &KeyfilePayload::from_keyring(&keys, 1, "dev", 0),
+            &right,
+            params,
+        )
+        .unwrap();
+        // Six keyfiles of an attacker's own vault, under his own passphrase.
+        let his_keys = Keyring::new([9; 16], vec![(1, MasterKey::from_bytes([2; 32]))], 1).unwrap();
+        let his_pass = Passphrase::from_input("the attacker's own passphrase");
+        let planted: Vec<_> = (0..6u32)
+            .map(|i| {
+                let payload = KeyfilePayload::from_keyring(&his_keys, 0xffff_fff0 + i, "x", 0);
+                seal_keyfile(&payload, &his_pass, params).unwrap()
+            })
+            .collect();
+        let fresh = || {
+            let mut candidates: Vec<Candidate> = planted
+                .iter()
+                .rev()
+                .map(|k| Candidate {
+                    name: k.name.clone(),
+                    bytes: Bytes::copy_from_slice(&k.bytes),
+                    tried: Vec::new(),
+                })
+                .collect();
+            candidates.push(Candidate {
+                name: real.name.clone(),
+                bytes: Bytes::copy_from_slice(&real.bytes),
+                tried: Vec::new(),
+            });
+            candidates
+        };
+
+        // One attempt asks four keyfiles — four derivations — and says how many it left out.
+        let mut candidates = fresh();
+        let before = argon2_runs();
+        assert!(matches!(
+            unlock(&mut candidates, &right, vault_id, KEYFILE_TRY_MAX),
+            Unlock::Untried(3)
+        ));
+        assert_eq!(argon2_runs(), before + 4);
+        assert_eq!(candidates.len(), 7, "a wrong key drops nothing");
+        // The same passphrase once more goes on where it stopped: two planted ones, then the
+        // real keyfile — three derivations, none of them a repetition.
+        let before = argon2_runs();
+        match unlock(&mut candidates, &right, vault_id, KEYFILE_TRY_MAX) {
+            Unlock::Opened(payload) => assert_eq!(payload.generation, 1),
+            _ => panic!("the real keyfile is among the untried ones"),
+        }
+        assert_eq!(argon2_runs(), before + 3);
+
+        // On request (`--all-keyfiles`, or a yes at the terminal) one call tries them all.
+        let mut candidates = fresh();
+        assert!(matches!(
+            unlock(&mut candidates, &right, vault_id, usize::MAX),
+            Unlock::Opened(_)
+        ));
+
+        // A passphrase that really is wrong is called wrong only once every keyfile said so.
+        let wrong = Passphrase::from_input("not the passphrase at all");
+        let mut candidates = fresh();
+        assert!(matches!(
+            unlock(&mut candidates, &wrong, vault_id, KEYFILE_TRY_MAX),
+            Unlock::Untried(3)
+        ));
+        assert!(matches!(
+            unlock(&mut candidates, &wrong, vault_id, usize::MAX),
+            Unlock::WrongPassphrase
+        ));
+    }
+
+    /// A keyfile sealed under a typed passphrase of the 26-symbol shape (what gclone 0.4.0
+    /// sealed, and what is sealed now) opens with exactly that spelling. Another spelling
+    /// with the same canonical form — wrong capitals — is another passphrase to it, and the
+    /// memo of refused passphrases must not take the right one for the refused one: it used
+    /// to be keyed by the canonical form alone, and the exactly right passphrase was then
+    /// answered "Wrong passphrase" without a derivation.
+    #[test]
+    fn the_right_spelling_opens_after_a_miscased_attempt() {
+        use crate::crypto::kdf::tests::argon2_runs;
+        let params = crate::crypto::KdfParams {
+            m_kib: 8192,
+            t: 1,
+            p: 1,
+        };
+        let vault_id = [4; 16];
+        let keys = Keyring::new(vault_id, vec![(1, MasterKey::from_bytes([1; 32]))], 1).unwrap();
+        let typed = "Maple Tiger Candle Stone Wharf";
+        let set = Passphrase::set_checked(typed).unwrap();
+        assert_eq!(set.display().as_str(), typed, "set as typed");
+        let real = seal_keyfile(
+            &KeyfilePayload::from_keyring(&keys, 1, "dev", 0),
+            &set,
+            params,
+        )
+        .unwrap();
+        let mut candidates = vec![Candidate {
+            name: real.name.clone(),
+            bytes: Bytes::copy_from_slice(&real.bytes),
+            tried: Vec::new(),
+        }];
+
+        // Attempt 1, wrong capitals: both readings are derived and refused.
+        let miscased = Passphrase::from_input("maple tiger candle stone wharf");
+        let before = argon2_runs();
+        assert!(matches!(
+            unlock(&mut candidates, &miscased, vault_id, KEYFILE_TRY_MAX),
+            Unlock::WrongPassphrase
+        ));
+        assert_eq!(argon2_runs(), before + 2);
+        // The same wrong spelling again costs nothing.
+        assert!(matches!(
+            unlock(&mut candidates, &miscased, vault_id, KEYFILE_TRY_MAX),
+            Unlock::WrongPassphrase
+        ));
+        assert_eq!(argon2_runs(), before + 2);
+
+        // Attempt 2, exactly as set: the canonical form was refused already and is not
+        // derived again; the text as typed is new — one derivation, and it opens.
+        let exact = Passphrase::from_input(typed);
+        let before = argon2_runs();
+        match unlock(&mut candidates, &exact, vault_id, KEYFILE_TRY_MAX) {
+            Unlock::Opened(payload) => assert_eq!(payload.generation, 1),
+            _ => panic!("the passphrase exactly as set must open the keyfile"),
+        }
+        assert_eq!(argon2_runs(), before + 1);
     }
 
     #[test]

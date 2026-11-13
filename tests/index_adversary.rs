@@ -567,13 +567,22 @@ async fn truncated_bit_flipped_and_swapped_segments_count_as_missing() {
         // gc and other judges of "what is dead" must not run on this replica; reads still work
         assert_eq!(paths(&c), names(&["one"]), "{what}");
 
-        // the writer's replica is complete; its `repair` publishes a snapshot that carries the
-        // effects of the damaged segment, and the other device rebuilds from it
-        a.refresh().await.unwrap();
+        // the writer's replica is complete — and it notices that the store no longer holds
+        // what it published, although the name is still listed (the listed size or md5 are
+        // not those of the segment it applied). Its `repair` moves the damaged object out of
+        // the way, puts the segment back from its cache and publishes a snapshot.
+        let err = a.refresh().await.unwrap_err();
+        assert!(
+            matches!(err, IndexError::Rollback { device, seq: 3 } if device == a.device_id()),
+            "{what}: {err:?}"
+        );
         let report = a.repair(false).await.unwrap();
         assert!(report.still_missing.is_empty());
+        assert_eq!(report.republished, vec![victim.name.clone()], "{what}");
+        a.refresh().await.unwrap();
         let r = c.refresh().await.unwrap();
-        assert_eq!(r.rebuilt_from, report.snapshot, "{what}");
+        assert!(r.corrupt_objects.is_empty(), "{what}: {r:?}");
+        assert_eq!(r.adopted, report.snapshot, "{what}");
         assert_eq!(paths(&c), names(&["one", "three", "two"]), "{what}");
         assert_eq!(c.head_fingerprint().unwrap(), a.head_fingerprint().unwrap());
     }
@@ -672,11 +681,17 @@ async fn a_damaged_snapshot_falls_back_to_the_segments() {
     assert!(paths(&late).is_empty());
     w.pass_grace();
     assert!(matches!(late.refresh().await, Err(IndexError::Gap { .. })));
-    // the writer still lists its base snapshot by name (names suffice for presence); its
-    // `repair` republishes what no intact listed snapshot covers
-    a.refresh().await.unwrap();
+    // the writer's base snapshot is still listed under its name, but not with the bytes the
+    // writer accepted: a name is not presence. Its `repair` republishes the snapshot and
+    // what no intact listed snapshot covers.
+    assert!(matches!(
+        a.refresh().await,
+        Err(IndexError::Rollback { .. })
+    ));
     let report = a.repair(false).await.unwrap();
-    assert_eq!(report.republished.len(), 4);
+    assert_eq!(report.republished.len(), 5, "{:?}", report.republished);
+    assert!(report.republished.contains(&name));
+    a.refresh().await.unwrap();
     late.refresh().await.unwrap();
     assert_eq!(paths(&late), names(&["four", "one", "three", "two"]));
     assert_eq!(
@@ -923,4 +938,405 @@ async fn an_oversized_descriptor_is_never_buffered() {
         after.get_bytes - before.get_bytes,
         genuine.size + DESCRIPTOR_MAX + 1
     );
+}
+
+// --- objects overwritten or re-created under their own name (§17.26) -------------------------
+
+const DAY_MS: u64 = 86_400_000;
+
+/// The newest segment of device a is replaced under its own name — deleted and created again
+/// with other bytes of the same length, or overwritten in place. Whoever can write to the
+/// folder can do that without the key. A listed name used to count as presence, so the devices
+/// that had applied the segment went on reporting nothing: the same rollback as a deletion,
+/// without the alarm. The listed object must be the one the replica accepted.
+#[tokio::test]
+async fn a_segment_replaced_under_its_own_name_is_a_rollback_for_those_who_applied_it() {
+    type Attack =
+        for<'a> fn(&'a World, &'a ObjMeta) -> std::pin::Pin<Box<dyn Future<Output = ()> + 'a>>;
+    let attacks: [(&str, Attack); 3] = [
+        ("deleted and created again", |w, tip| {
+            Box::pin(async move {
+                assert!(w.mem.hard_delete(&tip.handle));
+                w.plant(&tip.name, vec![0xAA; tip.size as usize]).await;
+            })
+        }),
+        // The same, as an object for which the store reports NO md5 (on Drive: a Google-native
+        // file, which any token holder can create). "Same size and no md5 to compare" used to
+        // count as the accepted object: no alarm, and `repair` republished nothing.
+        ("deleted and created again without an md5", |w, tip| {
+            Box::pin(async move {
+                assert!(w.mem.hard_delete(&tip.handle));
+                let planted = w.plant(&tip.name, vec![0xAA; tip.size as usize]).await;
+                w.mem.strip_md5(&planted);
+            })
+        }),
+        ("overwritten in place", |w, tip| {
+            Box::pin(async move { w.mem.tamper(&tip.handle, |b| b.fill(0xAA)) })
+        }),
+    ];
+    for (what, attack) in attacks {
+        let (w, a) = three_files().await;
+        let b = w.join("b").await;
+        let c = w.join("c").await; // c has applied a/1..4
+        a.commit_ops(vec![put("four", 4)]).await.unwrap(); // a/5
+        b.refresh().await.unwrap(); // b has applied a/5
+        let tip = w.segment(a.device_id(), 5);
+        attack(&w, &tip).await;
+        assert_eq!(w.segment(a.device_id(), 5).size, tip.size, "{what}");
+
+        // The writer and the device that applied it: the alarm, and an unchanged replica.
+        for v in [&a, &b] {
+            let before = (paths(v), v.head_fingerprint().unwrap());
+            let err = v.refresh().await.unwrap_err();
+            assert!(
+                matches!(err, IndexError::Rollback { device, seq: 5 } if device == a.device_id()),
+                "{what}: {err:?}"
+            );
+            assert!(v.index_incomplete().is_some(), "{what}");
+            assert_eq!((paths(v), v.head_fingerprint().unwrap()), before);
+        }
+        // A device that never applied it sees an object that fails verification.
+        let r = c.refresh().await.unwrap();
+        assert_eq!(r.corrupt_objects, vec![tip.name.clone()], "{what}");
+        assert_eq!(paths(&c), names(&["one", "three", "two"]), "{what}");
+
+        // `repair` on a device that holds the segment puts it back under its name; the
+        // impostor leaves the listing.
+        let report = b.repair(false).await.unwrap();
+        assert_eq!(report.republished, vec![tip.name.clone()], "{what}");
+        let now = w.segment(a.device_id(), 5);
+        assert_ne!(now.handle, tip.handle, "{what}");
+        for v in [&a, &b, &c] {
+            let r = v.refresh().await.unwrap();
+            assert!(r.corrupt_objects.is_empty(), "{what}: {r:?}");
+            assert!(v.index_incomplete().is_none(), "{what}");
+            assert_eq!(paths(v), names(&["four", "one", "three", "two"]), "{what}");
+        }
+        assert_eq!(a.head_fingerprint().unwrap(), c.head_fingerprint().unwrap());
+    }
+}
+
+/// The comparison needs the bytes the replica accepted. Without the cached copy the listed
+/// object is read once and compared by its hash — a genuine object passes (and is cached
+/// again), an impostor of the same length does not.
+#[tokio::test]
+async fn presence_without_a_cached_copy_reads_the_listed_object() {
+    let (w, a) = three_files().await;
+    let b = w.join("b").await;
+    let tip = w.segment(a.device_id(), 4);
+    let cached = w.cache("b").join(&tip.name);
+    assert!(cached.exists());
+
+    std::fs::remove_file(&cached).unwrap();
+    let gets = w.mem.counters().get;
+    b.refresh().await.unwrap();
+    assert!(cached.exists(), "the genuine object is back in the cache");
+    assert_eq!(w.mem.counters().get, gets + 1);
+    // … and the refresh after that compares two listings again.
+    b.refresh().await.unwrap();
+    assert_eq!(w.mem.counters().get, gets + 1);
+
+    std::fs::remove_file(&cached).unwrap();
+    assert!(w.mem.hard_delete(&tip.handle));
+    w.plant(&tip.name, vec![0x55; tip.size as usize]).await;
+    let err = b.refresh().await.unwrap_err();
+    assert!(
+        matches!(err, IndexError::Rollback { seq: 4, .. }),
+        "{err:?}"
+    );
+    assert!(!cached.exists(), "an impostor never reaches the cache");
+}
+
+/// The whole index — snapshot and segments — replaced under the same names with the same
+/// sizes. Every device that had applied it used to report nothing and to go on publishing.
+#[tokio::test]
+async fn the_whole_index_replaced_under_the_same_names_is_a_rollback() {
+    let (w, a) = three_files().await;
+    let b = w.join("b").await;
+    let snapshot = a.write_snapshot().await.unwrap();
+    a.commit_ops(vec![put("four", 4)]).await.unwrap();
+    b.refresh().await.unwrap();
+    a.refresh().await.unwrap();
+    assert_eq!(b.refresh().await.unwrap().adopted, None);
+    let before = w.listed("");
+    for m in &before {
+        assert!(w.mem.hard_delete(&m.handle));
+        w.plant(&m.name, vec![0x00; m.size as usize]).await;
+    }
+    for v in [&a, &b] {
+        let err = v.refresh().await.unwrap_err();
+        assert!(matches!(err, IndexError::Rollback { .. }), "{err:?}");
+        // nothing is published on top of it (mutating commands stop at this verdict)
+        assert_eq!(paths(v), names(&["four", "one", "three", "two"]));
+    }
+    // One repair gives everything back that the cache holds and no listed snapshot covers.
+    let report = a.repair(false).await.unwrap();
+    assert!(report.republished.contains(&snapshot), "{report:?}");
+    for v in [&a, &b, &w.device("fresh").await] {
+        let r = v.refresh().await.unwrap();
+        assert!(r.corrupt_objects.is_empty(), "{r:?}");
+        assert_eq!(paths(v), names(&["four", "one", "three", "two"]));
+    }
+
+    // Once more, with objects for which the store reports no md5 (Google-native files): a
+    // size alone is not the object a replica accepted — not for a segment, not for the base
+    // snapshot, not in `repair`.
+    for m in &w.listed("") {
+        assert!(w.mem.hard_delete(&m.handle));
+        let planted = w.plant(&m.name, vec![0x00; m.size as usize]).await;
+        w.mem.strip_md5(&planted);
+    }
+    assert!(w.listed("").iter().all(|m| m.md5.is_none()));
+    for v in [&a, &b] {
+        let err = v.refresh().await.unwrap_err();
+        assert!(matches!(err, IndexError::Rollback { .. }), "{err:?}");
+        assert!(v.index_incomplete().is_some());
+    }
+    let report = a.repair(false).await.unwrap();
+    assert!(report.republished.contains(&snapshot), "{report:?}");
+    assert!(report.republished.len() >= 2, "{report:?}");
+    for v in [&a, &b, &w.device("fresh-2").await] {
+        let r = v.refresh().await.unwrap();
+        assert!(r.corrupt_objects.is_empty(), "{r:?}");
+        assert_eq!(paths(v), names(&["four", "one", "three", "two"]));
+    }
+}
+
+/// The other side of the md5 rule: where the store reports no md5 for the GENUINE object, it
+/// is still that object — shown by reading it and hashing it here, on every refresh that
+/// needs to know (no store of gclone's lists its files without an md5; this keeps one that
+/// did from being a permanent false alarm).
+#[tokio::test]
+async fn a_genuine_object_listed_without_an_md5_is_judged_by_its_content() {
+    let (w, a) = three_files().await;
+    let b = w.join("b").await;
+    let snapshot = a.write_snapshot().await.unwrap();
+    a.commit_ops(vec![put("four", 4)]).await.unwrap();
+    b.refresh().await.unwrap();
+    a.refresh().await.unwrap();
+    for m in &w.listed("") {
+        w.mem.strip_md5(&m.handle);
+    }
+    for v in [&a, &b] {
+        let gets = w.mem.counters().get;
+        let r = v.refresh().await.unwrap();
+        assert!(r.corrupt_objects.is_empty(), "{r:?}");
+        assert!(v.index_incomplete().is_none());
+        assert!(w.mem.counters().get > gets, "the content was read");
+    }
+    // Nothing is missing, so nothing is republished.
+    let report = a.repair(false).await.unwrap();
+    assert!(report.republished.is_empty(), "{report:?}");
+    assert_eq!(
+        w.listed("c-").len() + w.listed("s-").len(),
+        w.listed("").len()
+    );
+    let _ = snapshot;
+}
+
+// --- gc on a replica that knows it is incomplete (§5.9, §17.26) -------------------------------
+
+/// A blob record and a file on it, published by `v`; the blob object itself is planted in a
+/// data folder so that an orphan sweep can see it.
+async fn file_on_a_blob(w: &World, v: &V, path: &str, tag: u8) -> (gclone::types::BlobRec, Handle) {
+    let entry = file(tag);
+    let loc = entry.loc.clone().unwrap();
+    let folder = v.data_folder().await.unwrap();
+    let id = w.net.new_ids(1).await.unwrap().remove(0);
+    let bytes = vec![tag; loc.clen as usize];
+    w.net
+        .put(
+            &id,
+            &folder,
+            &gclone::format::blob_name(&loc.blob),
+            PutBody::Small(Bytes::from(bytes.clone())),
+        )
+        .await
+        .unwrap();
+    let stored = w.net.stat(&id).await.unwrap().unwrap();
+    let rec = gclone::types::BlobRec {
+        id: loc.blob,
+        file_id: id.0.clone(),
+        clen: loc.clen,
+        md5: stored.md5.unwrap(),
+        created_ms: stored.created_ms,
+    };
+    v.commit_ops(vec![OpDraft::Blob(rec.clone()), put(path, tag)])
+        .await
+        .unwrap();
+    (rec, id)
+}
+
+fn refused(result: Result<gclone::sync::GcReport, gclone::error::SyncError>, needle: &str) {
+    match result {
+        Err(gclone::error::SyncError::Index(IndexError::Incomplete(why))) => {
+            assert!(why.contains(needle), "{why}")
+        }
+        other => panic!("gc must refuse, naming {needle}: {other:?}"),
+    }
+}
+
+/// `gc` used to run on a replica whose refresh had ignored an index object: the segment that
+/// gives a blob its head fails verification for device c, c knows nothing of the file, and
+/// fifteen days later its orphan sweep trashes the blob of a file that is live on device a.
+/// All three steps refuse, the object is named, and nothing is trashed.
+#[tokio::test]
+async fn gc_refuses_on_a_replica_that_ignored_an_index_object() {
+    let (w, a) = world().await;
+    let c = w.join("c").await;
+    let (rec, blob) = file_on_a_blob(&w, &a, "precious", 9).await;
+    let tip = w.segment(a.device_id(), 2);
+    assert!(w.mem.hard_delete(&tip.handle));
+    w.plant(&tip.name, vec![0x42; tip.size as usize]).await;
+    w.mem.advance_ms(15 * DAY_MS);
+
+    let report = c.refresh().await.unwrap();
+    assert_eq!(report.corrupt_objects, vec![tip.name.clone()]);
+    assert_eq!(report.blocked_young, 0);
+    assert!(report.incomplete().unwrap().contains(&tip.name));
+    assert!(c.blob(&rec.id).unwrap().is_none(), "c never saw the record");
+    for (dry_run, orphans, purge) in [
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        refused(
+            gclone::sync::gc(&c, dry_run, orphans, purge).await,
+            &tip.name,
+        );
+    }
+    let meta = w.net.stat(&blob).await.unwrap().unwrap();
+    assert!(!meta.trashed, "the blob of a's live file is where it was");
+
+    // The writer notices the replacement and repairs; then c may collect — and finds nothing.
+    assert!(matches!(
+        a.refresh().await,
+        Err(IndexError::Rollback { .. })
+    ));
+    a.repair(false).await.unwrap();
+    c.refresh().await.unwrap();
+    assert!(c.head("precious").unwrap().is_some());
+    let swept = gclone::sync::gc(&c, false, true, true).await.unwrap();
+    assert_eq!((swept.dead_blobs, swept.orphans, swept.purged), (0, 0, 0));
+    assert!(!w.net.stat(&blob).await.unwrap().unwrap().trashed);
+}
+
+/// The other state in which a refresh returns `Ok` on a replica that knows of index state it
+/// does not have: the newest snapshot covers segments this device lacks, and the device
+/// cannot be rebuilt from it — a segment it applied, which the snapshot does not cover, is
+/// in neither its cache nor the listing. The report names the snapshot and `gc` refuses.
+#[tokio::test]
+async fn gc_refuses_while_a_newer_snapshot_is_left_unused() {
+    let (w, a) = three_files().await;
+    let b = w.join("b").await;
+    let c = w.join("c").await;
+    let t0 = w.net.now_ms();
+
+    // b publishes x two hours "later"; c applies it, then loses its cached copy.
+    w.mem.set_now_ms(t0 + 7_200_000);
+    b.commit_ops(vec![put("from-b", 20)]).await.unwrap();
+    let x = w.segment(b.device_id(), 1);
+    c.refresh().await.unwrap();
+    assert!(paths(&c).contains(&"from-b".to_owned()));
+    std::fs::remove_file(w.cache("c").join(&x.name)).unwrap();
+
+    // a, which has not seen x, writes a/5 and a snapshot that covers it; a/5 itself is gone.
+    w.mem.set_now_ms(t0);
+    let (rec, blob) = file_on_a_blob(&w, &a, "four", 4).await;
+    let snapshot = a.write_snapshot().await.unwrap();
+    assert!(w.mem.hard_delete(&w.segment(a.device_id(), 5).handle));
+
+    // The listing lags for x (the youngest object); `stat` still finds it.
+    w.mem.set_now_ms(t0 + 7_200_000);
+    w.net.set_list_lag_ms(3_600_000);
+    let report = c.refresh().await.unwrap();
+    assert_eq!(report.unused_snapshot.as_deref(), Some(snapshot.as_str()));
+    assert!(report.rebuilt_from.is_none() && report.corrupt_objects.is_empty());
+    assert_eq!(report.blocked_young, 0);
+    assert!(!paths(&c).contains(&"four".to_owned()));
+    assert!(c.blob(&rec.id).unwrap().is_none());
+    for (orphans, purge) in [(false, false), (true, false), (true, true)] {
+        refused(gclone::sync::gc(&c, false, orphans, purge).await, &snapshot);
+    }
+    assert!(!w.net.stat(&blob).await.unwrap().unwrap().trashed);
+
+    // Once x is listed again the snapshot is usable, and gc runs.
+    w.net.set_list_lag_ms(0);
+    let report = c.refresh().await.unwrap();
+    assert_eq!(report.rebuilt_from.as_deref(), Some(snapshot.as_str()));
+    assert_eq!(report.unused_snapshot, None);
+    assert!(paths(&c).contains(&"four".to_owned()));
+    gclone::sync::gc(&c, false, true, true).await.unwrap();
+    assert!(!w.net.stat(&blob).await.unwrap().unwrap().trashed);
+}
+
+// --- the time a removal counts from (§5.2.2, §17.26) -----------------------------------------
+
+/// The restore window, the gc grace and the pruning of history run from the time a version was
+/// removed, and that time used to be the store's creation time of the segment object alone.
+/// Whoever can write to the folder can delete an authentic segment and create it again under
+/// its name with a creation time of his choosing: forty days back, and every device that had
+/// not applied the original would call the version long dead. The writer's own `created_ms`
+/// is inside the AEAD; the later of the two counts.
+#[tokio::test]
+async fn a_replanted_segment_with_an_old_creation_time_does_not_shorten_the_grace_periods() {
+    use gclone::consts::{GC_GRACE_MS, RESTORE_WINDOW_MS};
+    let (w, a) = world().await;
+    let now = w.net.now_ms();
+    let (_, _) = file_on_a_blob(&w, &a, "doc", 1).await;
+    let b = w.join("b").await;
+    let head = a.head("doc").unwrap().unwrap();
+    a.commit_ops(vec![OpDraft::Del {
+        path: "doc".into(),
+        base: head.stamp,
+        effect: None,
+    }])
+    .await
+    .unwrap();
+    let del = w.segment(a.device_id(), 3);
+    let bytes = w.mem.read(&del.handle).unwrap().to_vec();
+
+    // The attacker: delete the object, create it again with createdTime = 40 days ago.
+    assert!(w.mem.hard_delete(&del.handle));
+    w.mem.set_now_ms(now - 40 * DAY_MS);
+    w.plant(&del.name, bytes).await;
+    w.mem.set_now_ms(now);
+    assert_eq!(w.segment(a.device_id(), 3).created_ms, now - 40 * DAY_MS);
+
+    a.refresh().await.unwrap(); // the same bytes under the same name: present
+    b.refresh().await.unwrap(); // an authentic segment: applied
+    let on_a = a.removed_versions("doc").unwrap();
+    let on_b = b.removed_versions("doc").unwrap();
+    // Both count from the true time (the mem clock started at the wall clock, which is also
+    // what the writer sealed into the segment).
+    for removed in [&on_a, &on_b] {
+        assert_eq!(removed.len(), 1);
+        assert!(
+            removed[0].removed_ms.abs_diff(now) < 600_000,
+            "removed {} ms from now",
+            removed[0].removed_ms.abs_diff(now)
+        );
+    }
+    assert!(now.saturating_sub(on_b[0].removed_ms) < RESTORE_WINDOW_MS);
+    assert!(b.dead_blobs(now).unwrap().is_empty());
+    assert!(b.dead_blobs(now + GC_GRACE_MS - DAY_MS).unwrap().is_empty());
+    // The grace still ends — thirty days after the true removal.
+    assert_eq!(b.dead_blobs(now + GC_GRACE_MS + DAY_MS).unwrap().len(), 1);
+
+    // The store can make a removal look later, never earlier.
+    let seg = SegmentV1 {
+        vault_id: VAULT,
+        device: DeviceId([3; 8]),
+        seq: 1,
+        lamport: 1,
+        prev: None,
+        seen: Vec::new(),
+        created_ms: 5_000,
+        host: String::new(),
+        ops: Vec::new(),
+    };
+    assert_eq!(gclone::index::removal_time(&seg, 4_000), 5_000);
+    assert_eq!(gclone::index::removal_time(&seg, 6_000), 6_000);
 }

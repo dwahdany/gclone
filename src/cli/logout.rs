@@ -4,8 +4,8 @@ use super::{GlobalOpts, blocking, lock_state, note_config, note_secrets, test_en
 use crate::auth;
 use crate::config::{BackendCfg, Config, Paths, secret_store};
 use crate::error::ConfigError;
+use crate::keystore;
 use crate::state::Db;
-use crate::util;
 
 #[derive(clap::Args, Clone, Debug)]
 #[command(after_help = "\
@@ -29,27 +29,6 @@ pub struct LogoutArgs {
 const REVOKE_WARNING: &str = "This ends the Google login of ALL your gclone devices; each needs \
     `gclone login` again. It is unverified whether the vault stays visible after a new sign-in — \
     keep a web download of the vault folder first.";
-
-/// `true` = the file was there.
-fn remove_file(path: &std::path::Path) -> std::io::Result<bool> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// What a login can leave in the state root besides `secrets.json`: the cached access token,
-/// and temp copies of either file from a write that was killed before its rename (a temp copy
-/// of `secrets.json` holds the refresh token and the cached key). Removed by every `logout`,
-/// signed in or not, and BEFORE `secrets.json`: if the command stops half-way, the next
-/// `logout` still finds the device signed in and finishes. `true` = something was there.
-fn remove_login_leftovers(paths: &Paths) -> std::io::Result<bool> {
-    let token = remove_file(&paths.token_file())?;
-    let temps = util::remove_atomic_leftovers(&paths.token_file())?
-        + util::remove_atomic_leftovers(&paths.secrets_file())?;
-    Ok(token || temps > 0)
-}
 
 async fn confirm(g: &GlobalOpts, question: &'static str) -> anyhow::Result<bool> {
     let ui = ui_for(g);
@@ -78,12 +57,17 @@ pub async fn run(g: &GlobalOpts, args: LogoutArgs) -> anyhow::Result<i32> {
              to revoke",
         ));
     }
-    // Only a revoke needs what is inside the file: a plain logout must also get rid of a
-    // secrets file that strict loading refuses.
-    let signed_in = std::fs::symlink_metadata(paths.secrets_file()).is_ok();
+    // Only a revoke needs what is inside the files: a plain logout must also get rid of a
+    // secrets file that strict loading refuses, and of a sealed one that does not open.
+    // Signed in = `secrets.json` or `secrets.sealed` exists (§8.2).
+    let signed_in = std::fs::symlink_metadata(paths.secrets_file()).is_ok()
+        || std::fs::symlink_metadata(paths.sealed_file()).is_ok();
     if !signed_in && !args.forget {
-        // No login on file — but nothing of an earlier one may stay behind either.
-        let leftovers = remove_login_leftovers(&paths)?;
+        // No login on file — but nothing of an earlier one may stay behind either: the cached
+        // access token, and temp copies of any of the files from a write that was killed
+        // before its rename (a temp copy of `secrets.json` holds the refresh token and the
+        // cached key).
+        let leftovers = keystore::remove_leftovers(&paths)?;
         if args.revoke {
             return Err(ConfigError::NotLoggedIn.into());
         }
@@ -163,7 +147,9 @@ pub async fn run(g: &GlobalOpts, args: LogoutArgs) -> anyhow::Result<i32> {
         revoked = Some(auth::revoke(&auth::http_client()?, &ep, &token).await?);
     }
 
-    remove_login_leftovers(&paths)?;
+    // Under the secrets lock: the cached access token and the temp copies first, then
+    // `secrets.json`, then `secrets.sealed` — if the command stops half-way, the next `logout`
+    // still finds the device signed in and finishes.
     store.delete()?;
     if args.forget {
         Config::delete(&paths)?;

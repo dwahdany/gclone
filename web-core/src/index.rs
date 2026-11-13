@@ -5,4 +5,5 @@
 pub mod apply;
 pub use apply::{
     ApplyStats, HeadStore, MemIndex, apply_segment, causal_order, check_snapshot_format,
+    removal_time,
 };

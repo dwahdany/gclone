@@ -554,12 +554,14 @@ pub fn read_new_passphrase(ui: &Ui, file: Option<&Path>) -> anyhow::Result<Passp
     if let Some(file) = file {
         // Same minimum as at the prompt, so an empty line is refused: a passphrase is generated
         // only where it can be shown to a person.
-        return Passphrase::set_checked(&passphrase_line(file)?).with_context(|| {
+        let pass = Passphrase::set_checked(&passphrase_line(file)?).with_context(|| {
             format!(
                 "the passphrase in {} cannot be used (an empty line does not generate one)",
                 file.display()
             )
-        });
+        })?;
+        note_exact_spelling(ui, &pass);
+        return Ok(pass);
     }
     if !ui.is_tty() {
         return Err(no_terminal());
@@ -589,18 +591,37 @@ pub fn read_new_passphrase(ui: &Ui, file: Option<&Path>) -> anyhow::Result<Passp
         };
         if pass.char_count() < PASSPHRASE_WARN_CHARS {
             ui.warn(
-                "Anyone who can read the vault folder, Google included, can try guesses offline. \
-                 Prefer five or more random words, or the generated passphrase.",
+                "This passphrase is short. Anyone who can read the vault folder, Google \
+                 included, can try guesses against it offline, for as long as they like — and \
+                 changing the passphrase later does not take a weak one back (the old keyfile \
+                 stays good for whoever copied it). Prefer five or more random words, or the \
+                 generated passphrase (26 characters, 130 bits).",
             );
             if !ui.confirm("Use this passphrase anyway?") {
                 continue;
             }
         }
-        let again = Passphrase::from_input(&prompt_secret(ui, "Repeat:")?);
+        // Compared as it is set: a typed passphrase is exact in case and spacing (§2.6).
+        let again = Passphrase::for_setting(&prompt_secret(ui, "Repeat:")?);
         if again.display() == pass.display() {
+            note_exact_spelling(ui, &pass);
             return Ok(pass);
         }
         ui.error("the two entries differ");
+    }
+}
+
+/// §2.6: a passphrase that is set in the shape of a generated one, but not in the form gclone
+/// displays, is a typed passphrase — kept exactly as typed, so that gclone 0.4.0 and a hosted
+/// viewer of that version open the keyfile with it too. Said once, where it is set: the shape
+/// invites the assumption that case and grouping do not matter.
+fn note_exact_spelling(ui: &Ui, pass: &Passphrase) {
+    if pass.looks_generated() {
+        ui.warn(
+            "This passphrase has the shape of a generated one (26 letters and digits) but is \
+             not written the way gclone displays one: it is kept exactly as entered. Enter it \
+             with the same capitals, spaces and hyphens every time.",
+        );
     }
 }
 

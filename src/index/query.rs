@@ -27,6 +27,12 @@ fn subtree(prefix: &str) -> (String, String) {
     (format!("{prefix}/"), format!("{prefix}0"))
 }
 
+/// The order of the removed versions of one path, newest removal first: by the stamp of the
+/// superseding op (`by`), then — one op can supersede several heads — by the version's own
+/// stamp. Never by `removed_ms`: see [`Vault::removed_versions`].
+const NEWEST_REMOVAL_FIRST: &str =
+    "by_l DESC, by_d DESC, by_i DESC, st_l DESC, st_d DESC, st_i DESC, hash DESC";
+
 pub(super) fn removed_all(
     c: &Connection,
     cond: &str,
@@ -358,12 +364,15 @@ impl<B: Backend> Vault<B> {
         Ok(())
     }
 
-    /// Newest first.
+    /// Newest first — in the order the versions were superseded, not by their times (§5.2.2):
+    /// the stamp `by` of the superseding op is causal (a device that saw a removal supersedes
+    /// with a greater lamport), while `removed_ms` is a wall-clock value that a writer with a
+    /// wrong clock, or the store, can move. `removed_ms` only bounds the windows.
     pub fn removed_versions(&self, path: &str) -> Result<Vec<RemovedVersion>, IndexError> {
         Ok(self.db.read(|c| {
             removed_all(
                 c,
-                "WHERE path = ? ORDER BY removed_ms DESC, st_l DESC, st_d DESC, st_i DESC, hash DESC",
+                &format!("WHERE path = ? ORDER BY {NEWEST_REMOVAL_FIRST}"),
                 &[text(path)],
             )
         })?)
@@ -376,17 +385,16 @@ impl<B: Backend> Vault<B> {
         prefix: &str,
         since_ms: u64,
     ) -> Result<Vec<RemovedVersion>, IndexError> {
-        const ORDER: &str =
-            "ORDER BY path, removed_ms DESC, st_l DESC, st_d DESC, st_i DESC, hash DESC";
+        let order = format!("ORDER BY path, {NEWEST_REMOVAL_FIRST}");
         let since = Value::Integer(to_i(since_ms)?);
         Ok(self.db.read(|c| {
             if prefix.is_empty() {
-                return removed_all(c, &format!("WHERE removed_ms >= ?1 {ORDER}"), &[since]);
+                return removed_all(c, &format!("WHERE removed_ms >= ?1 {order}"), &[since]);
             }
             let (lo, hi) = subtree(prefix);
             removed_all(
                 c,
-                &format!("WHERE path > ?1 AND path < ?2 AND removed_ms >= ?3 {ORDER}"),
+                &format!("WHERE path > ?1 AND path < ?2 AND removed_ms >= ?3 {order}"),
                 &[text(lo), text(hi), since],
             )
         })?)

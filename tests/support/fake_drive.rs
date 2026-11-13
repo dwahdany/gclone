@@ -229,6 +229,8 @@ struct Obj {
     created_ms: u64,
     trashed: bool,
     abusive: bool,
+    /// A Google-native file (`make_native`): no md5 in its metadata, no content to download.
+    native: bool,
     /// Listings started before this number do not show the object (`set_list_lag`).
     visible_from_list: u64,
 }
@@ -315,6 +317,9 @@ struct State {
     counter: u64,
     lists_started: u64,
     list_lag: u32,
+    /// The `Date` header of every answer is this far from the machine's clock (0: the HTTP
+    /// server's own header).
+    date_skew_ms: i64,
     page_cap: Option<usize>,
     reject_page_token_once: bool,
     faults: HashMap<Route, VecDeque<Fault>>,
@@ -370,6 +375,7 @@ impl State {
             counter: 0,
             lists_started: 0,
             list_lag: 0,
+            date_skew_ms: 0,
             page_cap: None,
             reject_page_token_once: false,
             faults: HashMap::new(),
@@ -636,7 +642,10 @@ impl State {
                             "createdTime": rfc3339(obj.created_ms), "trashed": self.effectively_trashed(id) });
         if obj.mime != FOLDER_MIME {
             v["size"] = obj.data.len().to_string().into();
-            v["md5Checksum"] = obj.md5.clone().into();
+            // Drive computes an md5 for binary content only.
+            if !obj.native {
+                v["md5Checksum"] = obj.md5.clone().into();
+            }
         }
         v
     }
@@ -687,6 +696,7 @@ impl State {
             created_ms: now_ms(),
             trashed: false,
             abusive: false,
+            native: false,
             visible_from_list: self.lists_started + u64::from(self.list_lag) + 1,
         };
         self.order.push(meta.id.clone());
@@ -991,7 +1001,7 @@ impl State {
                 None => State::not_found(id),
             };
         };
-        if obj.mime == FOLDER_MIME {
+        if obj.mime == FOLDER_MIME || obj.native {
             return Resp::envelope(
                 403,
                 "fileNotDownloadable",
@@ -1631,7 +1641,13 @@ struct Responder(Arc<Mutex<State>>);
 impl Respond for Responder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.handle(request).into_template()
+        let template = state.handle(request).into_template();
+        if state.date_skew_ms == 0 {
+            return template;
+        }
+        let at = std::time::UNIX_EPOCH
+            + Duration::from_millis(now_ms().saturating_add_signed(state.date_skew_ms));
+        template.insert_header("date", httpdate::fmt_http_date(at).as_str())
     }
 }
 
@@ -1943,6 +1959,12 @@ impl FakeDrive {
         self.st().strip_completion_once = true;
     }
 
+    /// Every answer from now on carries a `Date` header that is `ms` away from this
+    /// machine's clock (positive: the server's clock runs ahead). 0 restores the real one.
+    pub fn set_date_skew_ms(&self, ms: i64) {
+        self.st().date_skew_ms = ms;
+    }
+
     /// New objects invisible for that many list calls.
     pub fn set_list_lag(&self, lists: u32) {
         self.st().list_lag = lists;
@@ -1961,6 +1983,16 @@ impl FakeDrive {
     pub fn mark_abusive(&self, id: &str) {
         if let Some(obj) = self.st().objects.get_mut(id) {
             obj.abusive = true;
+        }
+    }
+
+    /// Turns the object into a Google-native file (a Google Doc): its metadata keeps the name
+    /// and reports a size, but carries no `md5Checksum`, and its content cannot be downloaded
+    /// (403 `fileNotDownloadable`). Any token holder can create such a file under any name.
+    pub fn make_native(&self, id: &str) {
+        if let Some(obj) = self.st().objects.get_mut(id) {
+            obj.native = true;
+            obj.mime = "application/vnd.google-apps.document".into();
         }
     }
 

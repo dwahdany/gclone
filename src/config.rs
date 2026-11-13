@@ -71,9 +71,80 @@ impl Paths {
         self.state_root.join("secrets.json")
     }
 
+    /// `<state root>/secrets.sealed` — the secrets sealed by this Mac's Secure Enclave (§8.2).
+    pub fn sealed_file(&self) -> PathBuf {
+        self.state_root.join("secrets.sealed")
+    }
+
+    /// `<state root>/keystore.json` — the choice made with `gclone keystore use` (§8.2).
+    pub fn keystore_file(&self) -> PathBuf {
+        self.state_root.join("keystore.json")
+    }
+
+    /// `<state root>/keystore-trial.json` — the Secure Enclave trial's key and record (§8.2).
+    pub fn trial_file(&self) -> PathBuf {
+        self.state_root.join("keystore-trial.json")
+    }
+
+    /// `<state root>/keystore-trial.lock` — the kernel lock around every change of the trial's
+    /// record (§8.2): held for the read-change-write alone, never across a call into the
+    /// Secure Enclave.
+    pub fn trial_lock(&self) -> PathBuf {
+        self.state_root.join("keystore-trial.lock")
+    }
+
+    /// `<state root>/backup-note.due` — an empty marker: the once-only note about older
+    /// backups became due in a run without a terminal and is still owed (§8.1).
+    pub fn backup_note_file(&self) -> PathBuf {
+        self.state_root.join("backup-note.due")
+    }
+
+    /// `<state root>/secrets.lock` — the kernel lock of whoever writes or moves secrets (§8.3).
+    pub fn secrets_lock(&self) -> PathBuf {
+        self.state_root.join("secrets.lock")
+    }
+
     /// `<state root>/token.json` — per login, not per vault.
     pub fn token_file(&self) -> PathBuf {
         self.state_root.join("token.json")
+    }
+
+    /// Whether this device holds secrets, for a process that watches for a sign-out while it
+    /// runs (§8.3): `secrets.json`, else `secrets.sealed`, else `secrets.json` once more — a
+    /// move between the two creates the new file before it removes the old one, so three looks
+    /// cover one move. With nothing found, the secrets lock is tried without waiting: busy
+    /// means somebody is changing the sign-in right now (`Busy`: look again later); free, both
+    /// files are looked at once more under it.
+    pub fn secrets_presence(&self) -> SecretsPresence {
+        let (plain, sealed) = (self.secrets_file(), self.sealed_file());
+        let look = || -> Option<SecretsPresence> {
+            let first = FileStamp::of(&plain);
+            if first.is_some() {
+                return Some(SecretsPresence::Present(first, FileStamp::of(&sealed)));
+            }
+            let sealed_stamp = FileStamp::of(&sealed);
+            if sealed_stamp.is_some() {
+                return Some(SecretsPresence::Present(None, sealed_stamp));
+            }
+            FileStamp::of(&plain).map(|again| SecretsPresence::Present(Some(again), None))
+        };
+        if let Some(found) = look() {
+            return found;
+        }
+        // A reader never creates the lock file: without it no move has ever happened here.
+        let Ok(lock) = std::fs::File::open(self.secrets_lock()) else {
+            return look().unwrap_or(SecretsPresence::Absent);
+        };
+        match lock.try_lock_shared() {
+            Ok(()) => look().unwrap_or(SecretsPresence::Absent),
+            Err(std::fs::TryLockError::WouldBlock) => SecretsPresence::Busy,
+            Err(std::fs::TryLockError::Error(_)) => look().unwrap_or(SecretsPresence::Absent),
+        }
+    }
+
+    /// `secrets_presence()` as a yes or no; a busy lock counts as present.
+    pub fn secrets_present(&self) -> bool {
+        !matches!(self.secrets_presence(), SecretsPresence::Absent)
     }
 
     pub fn state_dir(&self, vault_id_hex: &str) -> PathBuf {
@@ -87,6 +158,41 @@ impl Paths {
     pub fn index_cache_dir(&self, v: &str) -> PathBuf {
         self.state_dir(v).join("index-cache")
     }
+}
+
+/// What tells one version of a file from the next without reading it: device, inode,
+/// modification time (seconds, nanoseconds) and size.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FileStamp(u64, u64, i64, i64, u64);
+
+impl FileStamp {
+    /// `None`: there is nothing at `path` (a symlink is not followed).
+    pub fn of(path: &Path) -> Option<FileStamp> {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::symlink_metadata(path).ok()?;
+        Some(FileStamp(
+            md.dev(),
+            md.ino(),
+            md.mtime(),
+            md.mtime_nsec(),
+            md.size(),
+        ))
+    }
+
+    /// Device and inode: which file it is, whatever was written to it since.
+    pub fn file_id(&self) -> (u64, u64) {
+        (self.0, self.1)
+    }
+}
+
+/// [`Paths::secrets_presence`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SecretsPresence {
+    /// The stamps of `secrets.json` and `secrets.sealed`; at least one is there.
+    Present(Option<FileStamp>, Option<FileStamp>),
+    /// Neither was found while another gclone holds the secrets lock.
+    Busy,
+    Absent,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -202,13 +308,31 @@ impl Secrets {
     }
 }
 
-fn parse_json<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T, ConfigError> {
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
+    what: &str,
+    bytes: &[u8],
+) -> Result<T, ConfigError> {
     #[derive(Deserialize)]
     struct Version {
         version: u32,
     }
-    // serde_json's message never quotes the document: it names a position and what it expected.
-    let bad = |e: serde_json::Error| ConfigError::Json(format!("{what}: {e}"));
+    // serde_json's own message can quote the document — `invalid type: string "<the value>",
+    // expected u32` — and in secrets.json the value in the wrong place may be the key or the
+    // refresh token. Only the kind of the failure and its position are reported.
+    let bad = |e: serde_json::Error| {
+        use serde_json::error::Category;
+        let kind = match e.classify() {
+            Category::Io => "cannot be read",
+            Category::Syntax => "is not valid JSON",
+            Category::Data => "has a value of the wrong type or lacks a field",
+            Category::Eof => "ends early",
+        };
+        ConfigError::Json(format!(
+            "{what} {kind} (line {}, column {})",
+            e.line(),
+            e.column()
+        ))
+    };
     let version: Version = serde_json::from_slice(bytes).map_err(bad)?;
     if version.version != FILE_VERSION {
         return Err(ConfigError::Version(version.version));
@@ -216,14 +340,17 @@ fn parse_json<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Resul
     serde_json::from_slice(bytes).map_err(bad)
 }
 
-fn to_json<T: Serialize>(what: &str, value: &T) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
+pub(crate) fn to_json<T: Serialize>(
+    what: &str,
+    value: &T,
+) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| ConfigError::Json(format!("cannot encode {what}: {e}")))?;
     bytes.push(b'\n');
     Ok(Zeroizing::new(bytes))
 }
 
-fn remove_if_present(path: &Path) -> Result<(), ConfigError> {
+pub(crate) fn remove_if_present(path: &Path) -> Result<(), ConfigError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -276,14 +403,27 @@ pub trait SecretStore: Send + Sync {
     /// `None` = no secrets file (never logged in, or logged out).
     fn load(&self) -> Result<Option<Secrets>, ConfigError>;
     fn save(&self, s: &Secrets) -> Result<(), ConfigError>;
+    /// `save` for secrets whose keys were opened from a keyfile in this run: the passphrase
+    /// was just proven, so a sealed copy that this run could not open is no longer the only
+    /// place the key is in and may go (§8.2).
+    fn save_proven(&self, s: &Secrets) -> Result<(), ConfigError> {
+        self.save(s)
+    }
+    /// `save` for secrets that take the place of `dropped`, which this run saved a moment ago
+    /// and which holds keys that are known to be of no use any more (the vault that lost a
+    /// creation race, §2.6): the one save that may replace sealed keys — exactly those of
+    /// `dropped` — by a document without keys (§8.2).
+    fn save_dropping_keys(&self, s: &Secrets, dropped: &Secrets) -> Result<(), ConfigError> {
+        let _ = dropped;
+        self.save(s)
+    }
     /// logout; absent = Ok. Also removes what an interrupted `save` left behind (temp copies).
     fn delete(&self) -> Result<(), ConfigError>;
 }
 
-/// 0600 JSON via `util::write_atomic` in a 0700 directory (`util::create_dir_private`). `load`
-/// is strict (§8.1): directory and file must pass `util::is_private`, the file is opened
-/// `O_NOFOLLOW` — else `ConfigError::InsecurePermissions(path)`. It checks JSON and `version`,
-/// and does NOT validate `auth_url` (§8.2).
+/// The plain store: 0600 JSON via `util::write_atomic` in a 0700 directory
+/// (`util::create_dir_private`). `load` is strict (§8.1, [`read_private`]). It checks JSON and
+/// `version`, and does NOT validate `auth_url` (§8.2).
 pub struct FileSecretStore {
     pub path: PathBuf,
 }
@@ -293,48 +433,61 @@ impl FileSecretStore {
         self.path.parent().unwrap_or(Path::new("."))
     }
 
-    fn insecure(path: &Path) -> ConfigError {
-        ConfigError::InsecurePermissions(path.display().to_string())
-    }
-
-    /// The directory itself (`lstat`: a symlink in its place is not accepted) must be private.
     fn check_dir(&self) -> Result<(), ConfigError> {
-        let md = std::fs::symlink_metadata(self.dir())?;
-        if md.is_dir() && util::is_private(&md) {
-            Ok(())
-        } else {
-            Err(Self::insecure(self.dir()))
-        }
+        check_private_dir(self.dir())
+    }
+}
+
+/// The strict read of §8.1 for a file in the state root (`secrets.json`, `secrets.sealed`):
+/// the directory and the file must pass `util::is_private`, the file is opened `O_NOFOLLOW`
+/// — else `ConfigError::InsecurePermissions(path)` — and is at most `FILE_MAX` bytes. `None`:
+/// there is no such file. `what` names the file in messages.
+pub(crate) fn read_private(
+    path: &Path,
+    what: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, ConfigError> {
+    let insecure = |p: &Path| ConfigError::InsecurePermissions(p.display().to_string());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path);
+    let file = match file {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // O_NOFOLLOW on a symlink: whatever it points to is not this device's secrets file.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(insecure(path)),
+        Err(e) => return Err(e.into()),
+    };
+    // Nothing is read before both checks passed, and nothing is repaired silently.
+    check_private_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let md = file.metadata()?;
+    if !md.is_file() || !util::is_private(&md) {
+        return Err(insecure(path));
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(FILE_MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > FILE_MAX {
+        return Err(ConfigError::Json(format!("{what} is too large")));
+    }
+    Ok(Some(bytes))
+}
+
+/// The directory itself (`lstat`: a symlink in its place is not accepted) must be private.
+pub(crate) fn check_private_dir(dir: &Path) -> Result<(), ConfigError> {
+    let md = std::fs::symlink_metadata(dir)?;
+    if md.is_dir() && util::is_private(&md) {
+        Ok(())
+    } else {
+        Err(ConfigError::InsecurePermissions(dir.display().to_string()))
     }
 }
 
 impl SecretStore for FileSecretStore {
     fn load(&self) -> Result<Option<Secrets>, ConfigError> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&self.path);
-        let file = match file {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            // O_NOFOLLOW on a symlink: whatever it points to is not this device's secrets file.
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(Self::insecure(&self.path));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        // Nothing is read before both checks passed, and nothing is repaired silently.
-        self.check_dir()?;
-        let md = file.metadata()?;
-        if !md.is_file() || !util::is_private(&md) {
-            return Err(Self::insecure(&self.path));
+        match read_private(&self.path, "secrets.json")? {
+            Some(bytes) => Ok(Some(parse_json("secrets.json", &bytes)?)),
+            None => Ok(None),
         }
-        let mut bytes = Zeroizing::new(Vec::new());
-        file.take(FILE_MAX + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > FILE_MAX {
-            return Err(ConfigError::Json("secrets.json is too large".into()));
-        }
-        Ok(Some(parse_json("secrets.json", &bytes)?))
     }
 
     fn save(&self, s: &Secrets) -> Result<(), ConfigError> {
@@ -354,11 +507,10 @@ impl SecretStore for FileSecretStore {
     }
 }
 
-/// MVP: always `FileSecretStore`.
+/// The device's key store (§8.2): `secrets.json`, or `secrets.sealed` where the owner moved
+/// the secrets into this Mac's Secure Enclave. Reading finds them wherever they are.
 pub fn secret_store(p: &Paths) -> Box<dyn SecretStore> {
-    Box::new(FileSecretStore {
-        path: p.secrets_file(),
-    })
+    Box::new(crate::keystore::LayeredStore::new(p))
 }
 
 #[cfg(test)]
@@ -370,6 +522,13 @@ mod tests {
         Paths {
             config_dir: root.join("config"),
             state_root: root.join("state"),
+        }
+    }
+
+    /// The plain store by itself; the layered store over it is tested in `crate::keystore`.
+    fn file_store(p: &Paths) -> FileSecretStore {
+        FileSecretStore {
+            path: p.secrets_file(),
         }
     }
 
@@ -394,6 +553,10 @@ mod tests {
         assert_eq!(p.config_file(), Path::new("/x/config/config.json"));
         assert_eq!(p.secrets_file(), Path::new("/x/state/secrets.json"));
         assert_eq!(p.token_file(), Path::new("/x/state/token.json"));
+        assert_eq!(p.sealed_file(), Path::new("/x/state/secrets.sealed"));
+        assert_eq!(p.keystore_file(), Path::new("/x/state/keystore.json"));
+        assert_eq!(p.trial_file(), Path::new("/x/state/keystore-trial.json"));
+        assert_eq!(p.secrets_lock(), Path::new("/x/state/secrets.lock"));
         assert_eq!(p.state_dir("ab"), Path::new("/x/state/ab"));
         assert_eq!(p.db_file("ab"), Path::new("/x/state/ab/state.db"));
         assert_eq!(
@@ -506,7 +669,7 @@ mod tests {
     fn directory_vault_secrets_have_no_login_fields_and_load() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
-        let store = secret_store(&p);
+        let store = file_store(&p);
         assert!(store.load().unwrap().is_none());
         store.save(&dir_secrets()).unwrap();
         assert_eq!(mode(&p.secrets_file()), 0o600);
@@ -532,7 +695,7 @@ mod tests {
     fn delete_removes_temp_copies_of_an_interrupted_save() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
-        let store = secret_store(&p);
+        let store = file_store(&p);
         store.save(&dir_secrets()).unwrap();
         let copy = p.state_root.join(".secrets.json.tmp-0011223344556677");
         std::fs::copy(p.secrets_file(), &copy).unwrap();
@@ -552,7 +715,7 @@ mod tests {
     #[test]
     fn loading_never_validates_the_auth_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = secret_store(&paths(tmp.path()));
+        let store = file_store(&paths(tmp.path()));
         let mut s = dir_secrets();
         s.auth_url = Some("http://example.com".into());
         s.refresh_token = Some("rt".into());
@@ -562,6 +725,46 @@ mod tests {
             back.endpoints(),
             Err(ConfigError::Auth(crate::error::AuthError::BadAuthUrl(_)))
         ));
+    }
+
+    /// A secret that sits where another type is expected — a hand-edited or damaged file —
+    /// must not come back in the error message: serde_json's own text quotes the value it
+    /// did not expect.
+    #[test]
+    fn a_parse_error_never_quotes_the_file() {
+        const KEY: &str = "S3CR3T-master-key-AAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        const TOKEN: &str = "1//0S3CR3T-refresh-token";
+        let cases = [
+            // the key where the version number belongs
+            format!(r#"{{"version": "{KEY}"}}"#),
+            // the token where a number belongs
+            format!(r#"{{"version": 1, "keys": [], "min_epoch": "{TOKEN}"}}"#),
+            // the key where a list belongs
+            format!(r#"{{"version": 1, "keys": "{KEY}", "refresh_token": "{TOKEN}"}}"#),
+            // cut off in the middle of the token
+            format!(r#"{{"version": 1, "refresh_token": "{TOKEN}"#),
+            // not JSON at all
+            format!("{KEY} {TOKEN}"),
+        ];
+        for text in cases {
+            let err = match parse_json::<Secrets>("secrets.json", text.as_bytes()) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{text} must not parse"),
+            };
+            assert!(!err.contains("S3CR3T"), "{err}");
+            assert!(
+                err.contains("secrets.json") && err.contains("line 1, column "),
+                "{err}"
+            );
+        }
+        let err = parse_json::<Secrets>("secrets.json", br#"{"version": "x"}"#)
+            .err()
+            .expect("a version that is no number");
+        assert_eq!(
+            err.to_string(),
+            "invalid configuration file: secrets.json has a value of the wrong type or lacks a \
+             field (line 1, column 15)"
+        );
     }
 
     #[test]
@@ -584,7 +787,7 @@ mod tests {
     fn strict_loading_refuses_open_permissions() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
-        let store = secret_store(&p);
+        let store = file_store(&p);
         store.save(&dir_secrets()).unwrap();
 
         for file_mode in [0o644, 0o640, 0o604] {
@@ -621,7 +824,7 @@ mod tests {
     fn a_symlink_in_place_of_the_secrets_file_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
-        let store = secret_store(&p);
+        let store = file_store(&p);
         store.save(&dir_secrets()).unwrap();
         let elsewhere = tmp.path().join("elsewhere.json");
         std::fs::rename(p.secrets_file(), &elsewhere).unwrap();
@@ -636,10 +839,46 @@ mod tests {
     fn secrets_reject_other_versions() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
-        let store = secret_store(&p);
+        let store = file_store(&p);
         let mut s = dir_secrets();
         s.version = 3;
         store.save(&s).unwrap();
         assert!(matches!(store.load(), Err(ConfigError::Version(3))));
+    }
+
+    /// What the watchers of `gclone web` and `serve restic --port` ask (§8.3).
+    #[test]
+    fn secrets_presence_sees_either_file_and_a_busy_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        assert_eq!(p.secrets_presence(), SecretsPresence::Absent);
+        assert!(!p.secrets_present());
+        std::fs::create_dir_all(&p.state_root).unwrap();
+        assert!(!p.secrets_present());
+        assert!(!p.secrets_lock().exists(), "a reader creates no lock file");
+
+        std::fs::write(p.secrets_file(), b"{}").unwrap();
+        let SecretsPresence::Present(Some(plain), None) = p.secrets_presence() else {
+            panic!("secrets.json alone");
+        };
+        std::fs::write(p.sealed_file(), b"{}").unwrap();
+        assert!(matches!(
+            p.secrets_presence(),
+            SecretsPresence::Present(Some(s), Some(_)) if s == plain
+        ));
+        std::fs::remove_file(p.secrets_file()).unwrap();
+        assert!(matches!(
+            p.secrets_presence(),
+            SecretsPresence::Present(None, Some(_))
+        ));
+        std::fs::remove_file(p.sealed_file()).unwrap();
+
+        // Nothing there while a writer holds the lock: not "signed out" yet.
+        let lock = std::fs::File::create(p.secrets_lock()).unwrap();
+        lock.lock().unwrap();
+        assert_eq!(p.secrets_presence(), SecretsPresence::Busy);
+        assert!(p.secrets_present());
+        lock.unlock().unwrap();
+        assert_eq!(p.secrets_presence(), SecretsPresence::Absent);
     }
 }

@@ -12,7 +12,7 @@
     "deploy": "node scripts/check-config.mjs && node scripts/check-release.mjs && wrangler deploy",
     "deploy:dev": "node scripts/check-config.mjs && node scripts/stub-dist.mjs && node scripts/check-dist.mjs --not-a-release && wrangler deploy",
     "test": "node scripts/check-config.mjs && node scripts/stub-dist.mjs && node --test scripts/check-config.selftest.mjs scripts/stub-dist.selftest.mjs scripts/check-dist.selftest.mjs scripts/release-bundle.selftest.mjs scripts/setup.selftest.mjs scripts/custom-domain.selftest.mjs && vitest run",
-    "test:viewer": "node --test test/viewer/token.node.mjs test/viewer/drive.node.mjs test/viewer/loader.node.mjs",
+    "test:viewer": "node --test test/viewer/token.node.mjs test/viewer/drive.node.mjs test/viewer/loader.node.mjs test/viewer/seal.node.mjs",
     "test:browser": "node test/e2e/run.mjs chrome webkit firefox && node test/e2e/signin.mjs && node test/e2e/local.mjs chrome webkit firefox",
     "smoke": "node scripts/smoke.mjs",
     "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test/tsconfig.json"

@@ -124,6 +124,8 @@ impl Device {
             ("GCLONE_STATE_DIR".to_string(), dir(&self.state)),
             ("GCLONE_TEST_FAST_KDF".to_string(), "1".to_string()),
             ("GCLONE_TEST_FAST_PACER".to_string(), "1".to_string()),
+            // No Secure Enclave trial in a spawned gclone (§8.2); see tests/keystore.rs.
+            ("GCLONE_KEYSTORE_TRIAL".to_string(), "0".to_string()),
             ("HOME".to_string(), dir(&self.home)),
             ("TZ".to_string(), "UTC".to_string()),
         ];
@@ -793,6 +795,112 @@ impl Drop for Listening {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The listener and the key store (§8.2, §8.3): `gclone keystore use` moves the secrets under
+/// a running listener, which is no sign-out; a listener started on a sealed device reads the
+/// login from `secrets.sealed` and writes nothing but the token cache; and the trial of a
+/// device on the plain file runs from `serve restic` too, writing its record and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_listener_and_the_key_store() {
+    let fake = FakeDrive::start().await;
+    let lab = Lab::new();
+    let mut d = lab.signed_in(&fake, "a").await;
+    d.env
+        .push(("GCLONE_TEST_KEYSTORE_SEALER".into(), "fake".into()));
+    let names = |d: &Device| {
+        let mut names: Vec<String> = std::fs::read_dir(&d.state)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let request = |l: &Listening| {
+        http.post(format!("http://127.0.0.1:{}/main/?create=true", l.port))
+            .basic_auth("gclone", Some(l.token.clone()))
+            .send()
+    };
+    let enclave = [
+        "keystore",
+        "use",
+        "enclave",
+        "--yes",
+        "--skip-passphrase-check",
+    ];
+
+    let mut l = Listening::start(&d, &[]);
+    assert_eq!(request(&l).await.unwrap().status(), 200);
+    for _ in 0..2 {
+        d.run(&enclave).ok();
+        assert!(!d.secrets_file().exists());
+        // Longer than the watcher's interval.
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert_eq!(wait(&mut l.child, Duration::ZERO), None, "still serving");
+        assert_eq!(request(&l).await.unwrap().status(), 200);
+        d.run(&["keystore", "use", "file"]).ok();
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert_eq!(wait(&mut l.child, Duration::ZERO), None, "still serving");
+    }
+    drop(l);
+
+    // Started on a sealed device: the login comes out of secrets.sealed, and the only file
+    // the server writes is the token cache.
+    d.run(&enclave).ok();
+    let _ = std::fs::remove_file(d.state.join("token.json"));
+    let before = names(&d);
+    assert!(
+        before.contains(&"secrets.sealed".to_string())
+            && !before.contains(&"secrets.json".to_string())
+    );
+    let sealed_before = std::fs::read(d.state.join("secrets.sealed")).unwrap();
+    let mut l = Listening::start(&d, &[]);
+    assert_eq!(request(&l).await.unwrap().status(), 200);
+    let mut expected = before.clone();
+    expected.push("token.json".into());
+    expected.sort();
+    assert_eq!(names(&d), expected);
+    assert_eq!(
+        std::fs::read(d.state.join("secrets.sealed")).unwrap(),
+        sealed_before
+    );
+    // `gclone logout` of the sealed device ends it: exit 4.
+    d.run(&["logout"]).ok();
+    assert_eq!(wait(&mut l.child, Duration::from_secs(10)), Some(4));
+    assert!(l.stderr().contains("this device was signed out: stopped"));
+
+    // A device on the plain file, with the trial on: `serve restic` is a run like any other —
+    // it is the run a scheduler makes — and writes the trial's record, and nothing else new.
+    let mut t = lab.signed_in(&fake, "b").await;
+    t.env
+        .push(("GCLONE_TEST_KEYSTORE_SEALER".into(), "fake".into()));
+    t.env.push(("GCLONE_KEYSTORE_TRIAL".into(), "1".into()));
+    t.env.push(("GCLONE_TEST_SESSION".into(), "0x2".into()));
+    let _ = std::fs::remove_file(t.state.join("token.json"));
+    let before = names(&t);
+    let secrets_before = std::fs::read(t.secrets_file()).unwrap();
+    let l = Listening::start(&t, &[]);
+    assert_eq!(request(&l).await.unwrap().status(), 200);
+    let mut expected = before.clone();
+    expected.extend([
+        "keystore-trial.json".to_string(),
+        // the lock every change of the record is made under (§8.2)
+        "keystore-trial.lock".to_string(),
+        "token.json".to_string(),
+    ]);
+    expected.sort();
+    assert_eq!(names(&t), expected);
+    assert_eq!(std::fs::read(t.secrets_file()).unwrap(), secrets_before);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(t.state.join("keystore-trial.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        record["ok"][0]["session"], "0x2",
+        "the scheduler's session is in the record"
+    );
 }
 
 /// B5.

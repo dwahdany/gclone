@@ -17,7 +17,7 @@ use crate::crypto::{
     HEADER_LEN, KdfParams, KdfPreamble, Keyring, MasterKey, PREAMBLE_LEN, Passphrase, StreamType,
     TAG_LEN, ciphertext_len, derive_pass_key, open_all, seal_all,
 };
-use crate::error::FormatError;
+use crate::error::{CryptoError, FormatError};
 use crate::util;
 
 pub const KEYFILE_PREFIX: &str = "gclone-key-";
@@ -30,6 +30,15 @@ const KEYFILE_MIN: usize = PREAMBLE_LEN + HEADER_LEN + TAG_LEN;
 pub struct KeyfileKey {
     pub epoch: u32,
     pub key: String,
+}
+
+/// The base64 text of a master key is wiped when its holder goes (best effort, §4: what was
+/// copied out of it by a move or a clone is the copy's to wipe).
+impl Drop for KeyfileKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.key.zeroize();
+    }
 }
 
 /// `gen` is a reserved keyword in edition 2024: the Rust identifier is `generation`
@@ -146,8 +155,33 @@ pub fn seal_keyfile(
     })
 }
 
+/// What `open_keyfile` checks before it derives a key, in its order (§2.6): the name parses,
+/// `36 + 76 ≤ len ≤ KEYFILE_MAX`, `BLAKE3(bytes)` matches the name's `h8`, and the KDF preamble
+/// is within bounds. An object that passes is a **well-formed** keyfile: it can be tried, at
+/// the cost its preamble names — returned with the generation of its name. Anything else can
+/// never open, whatever the passphrase, and is refused without any work; whoever picks the
+/// keyfiles to try (ATTACH, the hosted viewer) uses this so that a planted object under a
+/// keyfile's name takes no place among the candidates.
+///
+/// Nothing here is authenticated: the generation is a number from a name, and the hash is an
+/// accidental-corruption check — the name is as unauthenticated as the bytes.
+pub fn check_keyfile(name: &str, bytes: &[u8]) -> Result<(u32, KdfPreamble), FormatError> {
+    let (generation, h8) = parse_keyfile_name(name).ok_or(FormatError::KeyfileDamaged)?;
+    if bytes.len() < KEYFILE_MIN || bytes.len() as u64 > KEYFILE_MAX {
+        return Err(FormatError::KeyfileDamaged);
+    }
+    if blake3::hash(bytes).as_bytes()[..4] != h8 {
+        return Err(FormatError::KeyfileDamaged);
+    }
+    Ok((generation, KdfPreamble::decode(&bytes[..PREAMBLE_LEN])?))
+}
+
 /// Open order and errors of §2.6 (size, name, h8, KDF bounds — before any Argon2 allocation —,
 /// Argon2id, commit → `Crypto(WrongKey)`, chunks, JSON, generation/keys). Blocking.
+///
+/// A passphrase that gclone before 0.5.0 normalised differently (`Passphrase::legacy`: an
+/// input of the 26-symbol generated shape that is not in its canonical form) is tried a
+/// second time as those versions used it, after the first try answered "wrong key".
 ///
 /// The caller still has to compare `payload.vault_id` with the vault it is attaching to.
 pub fn open_keyfile(
@@ -155,19 +189,16 @@ pub fn open_keyfile(
     bytes: &[u8],
     pass: &Passphrase,
 ) -> Result<KeyfilePayload, FormatError> {
-    let (generation, h8) = parse_keyfile_name(name).ok_or(FormatError::KeyfileDamaged)?;
-    if bytes.len() < KEYFILE_MIN || bytes.len() as u64 > KEYFILE_MAX {
-        return Err(FormatError::KeyfileDamaged);
-    }
-    // An accidental-corruption check, not an authentication: the name is as unauthenticated as
-    // the bytes.
-    if blake3::hash(bytes).as_bytes()[..4] != h8 {
-        return Err(FormatError::KeyfileDamaged);
-    }
-    let (preamble, stream) = bytes.split_at(PREAMBLE_LEN);
-    let preamble = KdfPreamble::decode(preamble)?;
-    let key = derive_pass_key(pass, &preamble)?;
-    let json = open_all(&key, StreamType::Bundle, stream)?;
+    let (generation, preamble) = check_keyfile(name, bytes)?;
+    let stream = &bytes[PREAMBLE_LEN..];
+    let open = |pass: &Passphrase| {
+        let key = derive_pass_key(pass, &preamble)?;
+        Ok::<_, FormatError>(open_all(&key, StreamType::Bundle, stream)?)
+    };
+    let json = match (open(pass), pass.legacy()) {
+        (Err(FormatError::Crypto(CryptoError::WrongKey)), Some(legacy)) => open(&legacy)?,
+        (opened, _) => opened?,
+    };
     let payload = parse_payload(&json)?;
     if payload.generation != generation {
         return Err(FormatError::KeyfileDamaged);
@@ -337,6 +368,92 @@ pub(crate) mod tests {
         assert!(matches!(
             seal_keyfile(&huge, &pass, SMALL),
             Err(FormatError::BadEntry(_))
+        ));
+        assert_eq!(argon2_runs(), before);
+    }
+
+    /// §2.6: a second derivation is spent only on an input of the 26-symbol shape that is not
+    /// in its canonical form — the one input that gclone before 0.5.0 normalised differently
+    /// — and only after the first answered "wrong key".
+    #[test]
+    fn the_older_normalisation_is_tried_second_and_only_where_it_differs() {
+        let typed = "maple tiger candle stone wharf";
+        let now = Passphrase::from_input(typed);
+        let then = now
+            .legacy()
+            .expect("gclone before 0.5.0 used this text as typed");
+        assert_eq!(then.display().as_str(), typed);
+        assert!(then.legacy().is_none());
+        let payload = kat_payload();
+
+        // Sealed as 0.4.0 sealed it: the canonical form fails, the typed text opens.
+        let old = seal_keyfile(&payload, &then, SMALL).unwrap();
+        let before = argon2_runs();
+        assert!(open_keyfile(&old.name, &old.bytes, &now).unwrap() == payload);
+        assert_eq!(argon2_runs(), before + 2);
+        // Sealed as it is sealed now: the first derivation opens it.
+        let new = seal_keyfile(&payload, &now, SMALL).unwrap();
+        let before = argon2_runs();
+        assert!(open_keyfile(&new.name, &new.bytes, &now).unwrap() == payload);
+        assert_eq!(argon2_runs(), before + 1);
+
+        // One derivation for every other input, right or wrong.
+        for other in [
+            "correct horse battery staple",
+            "MAP1E-T1GER-CAND1-EST0N-EWHARF", // canonical already: nothing to try second
+            "7K2M9-QXA41-TBZR8-D0HNW",        // the 20-symbol shape never had two forms
+            "7k2m9 qxa41 tbzr8 d0hnw",
+        ] {
+            let pass = Passphrase::from_input(other);
+            assert!(pass.legacy().is_none(), "{other}");
+            let before = argon2_runs();
+            assert!(matches!(
+                open_keyfile(&old.name, &old.bytes, &pass),
+                Err(FormatError::Crypto(CryptoError::WrongKey))
+            ));
+            assert_eq!(argon2_runs(), before + 1, "{other}");
+        }
+        // A wrong passphrase of the 26-symbol shape costs two — and no more.
+        let wrong = Passphrase::from_input("maple tiger candle stone whart");
+        let before = argon2_runs();
+        assert!(matches!(
+            open_keyfile(&old.name, &old.bytes, &wrong),
+            Err(FormatError::Crypto(CryptoError::WrongKey))
+        ));
+        assert_eq!(argon2_runs(), before + 2);
+    }
+
+    /// `check_keyfile` is every check `open_keyfile` makes before it derives a key.
+    #[test]
+    fn a_well_formed_keyfile_is_recognised_without_any_derivation() {
+        let sealed = seal_keyfile(
+            &kat_payload(),
+            &Passphrase::from_input(KAT_PASSPHRASE),
+            SMALL,
+        )
+        .unwrap();
+        let before = argon2_runs();
+        let (generation, preamble) = check_keyfile(&sealed.name, &sealed.bytes).unwrap();
+        assert_eq!((generation, preamble.params), (3, SMALL));
+        let renamed = keyfile_name(4, &sealed.hash);
+        assert_eq!(check_keyfile(&renamed, &sealed.bytes).unwrap().0, 4);
+        for (name, bytes) in [
+            ("gclone-key-00000003", &sealed.bytes[..]),
+            ("gclone-key-00000003-00000000", &sealed.bytes[..]), // the name's hash
+            (sealed.name.as_str(), &sealed.bytes[..40]),
+            (sealed.name.as_str(), b"junk"),
+        ] {
+            assert!(matches!(
+                check_keyfile(name, bytes),
+                Err(FormatError::KeyfileDamaged)
+            ));
+        }
+        let mut costly = sealed.bytes.clone();
+        costly[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        let name = keyfile_name(3, blake3::hash(&costly).as_bytes());
+        assert!(matches!(
+            check_keyfile(&name, &costly),
+            Err(FormatError::KdfParams)
         ));
         assert_eq!(argon2_runs(), before);
     }

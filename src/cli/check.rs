@@ -68,6 +68,24 @@ fn orphan_notes(orphans: u64, recent: u64) -> Vec<String> {
     notes
 }
 
+/// What `check` says when the vault folder holds more than one object under a keyfile's name
+/// (`keyfiles`: highest generation first).
+fn keyfiles_note(keyfiles: &[crate::backend::ObjMeta]) -> Option<String> {
+    if keyfiles.len() < 2 {
+        return None;
+    }
+    let names: Vec<&str> = keyfiles.iter().map(|m| m.name.as_str()).collect();
+    Some(format!(
+        "{} objects under a keyfile's name are in the vault folder: {}. Each that is a keyfile \
+         attaches new devices with its own passphrase — an OLD passphrase among them, if a \
+         `gclone passwd` was interrupted before it retired the old keyfile. Run `gclone passwd` \
+         again (it retires every lower generation); an object nobody of yours put there can \
+         be deleted in drive.google.com.",
+        keyfiles.len(),
+        names.join(", ")
+    ))
+}
+
 pub async fn run(g: &GlobalOpts, args: CheckArgs) -> anyhow::Result<i32> {
     let what = what(&args)?;
     let ctx = open_ctx(g, OpenOpts::read_only()).await?;
@@ -105,6 +123,19 @@ pub async fn run(g: &GlobalOpts, args: CheckArgs) -> anyhow::Result<i32> {
     }
     for note in orphan_notes(report.orphans, report.orphans_recent) {
         ctx.ui.info(&note);
+    }
+    // More than one keyfile in the vault folder: each opens with its own passphrase. A
+    // `gclone passwd` that was killed between writing the new keyfile and retiring the old
+    // one leaves exactly this, and nothing else would ever say so (§2.7).
+    if matches!(what, What::Blobs) {
+        match vault.keyfiles().await {
+            Ok(keyfiles) => {
+                if let Some(warning) = keyfiles_note(&keyfiles) {
+                    ctx.ui.warn(&warning);
+                }
+            }
+            Err(e) => tracing::debug!("the keyfiles could not be listed: {e}"),
+        }
     }
     for name in &report.missing {
         ctx.ui.error(&format!("missing: {name}"));

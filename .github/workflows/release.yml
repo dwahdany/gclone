@@ -1,8 +1,18 @@
 name: Release
 
-# A tag v<version> builds the binaries and publishes them as a GitHub Release:
+# A tag v<version> builds the binaries and puts them into a DRAFT GitHub Release:
 #   gclone-<target>.tar.gz (one file inside: gclone) for each target, and SHA256SUMS.
-# install.sh installs from exactly these names.
+# install.sh installs from exactly these names. Each archive is signed with a build-provenance attestation in the
+# job that built it; install.sh verifies it where the GitHub CLI is at hand (SHA256SUMS, made further down in this
+# same run, only shows a damaged download), and the release job verifies it once more before anything is uploaded.
+#
+# This workflow does NOT publish. The release stays a draft - invisible to install.sh and to everybody without write
+# access - until the owner runs scripts/release-sign-macos.sh <tag> on a Mac: that script verifies every asset of the
+# draft against its attestation, adds gclone-aarch64-apple-darwin-signed.tar.gz (the attested macOS binary with a
+# Developer ID signature, proven identical apart from the signature), extends SHA256SUMS, and publishes. The signing
+# identity never leaves that Mac and no secret of it is known to GitHub (docs/SPEC.md §17.28, README "Publishing a release").
+# Immutable releases must be switched on for the repository (Settings → General → Releases) BEFORE the tag is
+# pushed: a published release then cannot have its files replaced. The script refuses to run where they are off.
 #
 # The release also carries the hosted viewer's files, gclone-viewer-<version>.tar.gz: what `wrangler deploy` uploads
 # as the auth Worker's static assets (worker/README.md, "Deploying the viewer"). That bundle is the code a
@@ -39,6 +49,11 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      # For the attestation of the archive (the last step but one).
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -126,6 +141,14 @@ jobs:
           mkdir dist
           tar -czf "dist/gclone-$TARGET.tar.gz" -C "target/$TARGET/release" gclone
           ls -l dist
+
+      # Signed by GitHub for this repository, this workflow file, this ref and this commit - here, in the job that
+      # built the bytes, before they become an artifact that other jobs of the run can reach. Stored outside the
+      # release's files: `gh attestation verify gclone-<target>.tar.gz --repo … --signer-workflow …/release.yml
+      # --source-ref refs/tags/<tag>` (install.sh does that).
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/gclone-${{ matrix.target }}.tar.gz
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -302,30 +325,46 @@ jobs:
         run: node worker/test/e2e/signin.mjs
 
   release:
-    name: publish
-    # Only the push of a tag publishes; a run by hand never does, also not with a tag as its ref.
+    name: draft release
+    # Only the push of a tag makes a release; a run by hand never does, also not with a tag as its ref.
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [build, viewer-bundle, viewer-test]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      # To read the attestations that the build jobs made.
+      attestations: read
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: gclone-*
           merge-multiple: true
+      # The archives were workflow artifacts on their way here, and other jobs of this run ran npm install scripts and
+      # a package manager. Each one goes into the release only if it is, byte for byte, what its build job attested:
+      # built by this workflow, on this tag, from this commit.
+      - name: Every archive is what its build job attested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for archive in dist/gclone-*.tar.gz; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          done
       # The pattern above also takes the viewer bundle (artifact gclone-viewer): it is one more gclone-*.tar.gz.
       - name: Checksums
         working-directory: dist
         run: |
           sha256sum gclone-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
-      # gh uploads to a draft and publishes it when every file is there: install.sh never sees
-      # a release without its files. The notes name the viewer's build id, which the viewer's info
-      # panel shows; SHA256SUMS is a convenience for it, the attestation is what the deploy verifies.
-      - name: Publish the release
+      # A DRAFT, and the job stops there: nothing is public yet, and install.sh does not see a draft. The owner's
+      # scripts/release-sign-macos.sh verifies the draft, adds the signed macOS archive and publishes (see the head of
+      # this file). The notes name the viewer's build id, which the viewer's info panel shows; SHA256SUMS is a
+      # convenience for it, the attestation is what the deploy verifies. The first line of the notes is replaced when
+      # the release is published.
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -333,5 +372,14 @@ jobs:
           VIEWER_BUILD: ${{ needs.viewer-bundle.outputs.build }}
         run: |
           test -f "dist/gclone-viewer-$VIEWER_VERSION.tar.gz"
-          notes="Hosted viewer: \`gclone-viewer-$VIEWER_VERSION.tar.gz\`, build \`$VIEWER_BUILD\`. Deploy it with \`node scripts/fetch-viewer.mjs $GITHUB_REF_NAME\` in \`worker/\`, which verifies its build-provenance attestation (worker/README.md)."
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "$notes" --generate-notes dist/gclone-*.tar.gz dist/SHA256SUMS
+          draft="DRAFT until signed: this release is not published yet. \`scripts/release-sign-macos.sh $GITHUB_REF_NAME\` on the owner's Mac verifies these files, adds the signed macOS archive and publishes."
+          viewer="Hosted viewer: \`gclone-viewer-$VIEWER_VERSION.tar.gz\`, build \`$VIEWER_BUILD\`. Deploy it with \`node scripts/fetch-viewer.mjs $GITHUB_REF_NAME\` in \`worker/\`, which verifies its build-provenance attestation (worker/README.md)."
+          notes=$(printf '%s\n\n%s\n' "$draft" "$viewer")
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes "$notes" --generate-notes dist/gclone-*.tar.gz dist/SHA256SUMS
+          {
+            echo "### Draft release $GITHUB_REF_NAME"
+            echo "Not published. On the owner's Mac: \`scripts/release-sign-macos.sh $GITHUB_REF_NAME\`"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

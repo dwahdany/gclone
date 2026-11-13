@@ -172,6 +172,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -264,6 +265,7 @@ dependencies = [
  "block-buffer",
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -451,6 +453,7 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -646,7 +649,9 @@ dependencies = [
  "bytes",
  "caseless",
  "chacha20poly1305",
+ "cipher",
  "clap",
+ "core-foundation",
  "etcetera",
  "filetime",
  "futures-util",
@@ -660,10 +665,12 @@ dependencies = [
  "libc",
  "md-5",
  "open",
+ "poly1305",
  "postcard",
  "reqwest",
  "rpassword",
  "rusqlite",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -687,11 +694,13 @@ dependencies = [
  "blake3",
  "caseless",
  "chacha20poly1305",
+ "cipher",
  "gclone",
  "getrandom 0.4.3",
  "hkdf",
  "httpdate",
  "libc",
+ "poly1305",
  "postcard",
  "rusqlite",
  "serde",
@@ -858,6 +867,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -1345,6 +1355,7 @@ checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
  "cpufeatures",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

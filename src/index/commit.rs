@@ -21,7 +21,7 @@ use crate::format::{
     IndexName, Op, SegmentV1, op_from_draft, open_segment, parse_index_name, seal_segment,
     seal_snapshot,
 };
-use crate::index::apply::{ApplyStats, apply_segment};
+use crate::index::apply::{ApplyStats, apply_segment, removal_time};
 use crate::path;
 use crate::state::tables::{self, AppliedRow, OutboxRow, SqlStore};
 use crate::types::{
@@ -165,13 +165,14 @@ pub(super) fn tips(refs: impl IntoIterator<Item = SegRef>) -> BTreeMap<DeviceId,
 }
 
 /// Applies `seg` (§5.2.2) and records it: `applied`, the rollback mark, the lamport clock and
-/// the writer's last-seen time. One step of a transaction.
+/// the writer's last-seen time. One step of a transaction. Removals count from
+/// `removal_time`: the listed creation time alone is the store's word (§17.26).
 pub(super) fn apply_and_record(
     c: &Connection,
     seg: &SegmentV1,
     row: &AppliedRow,
 ) -> Result<ApplyStats, IndexError> {
-    let stats = apply_segment(&mut SqlStore(c), seg, row.created_ms)?;
+    let stats = apply_segment(&mut SqlStore(c), seg, removal_time(seg, row.created_ms))?;
     tables::applied_insert(c, row)?;
     tables::hw_raise(c, &row.seg_ref())?;
     raise_lamport(c, seg.lamport)?;
@@ -311,7 +312,12 @@ impl<B: Backend> Vault<B> {
             lamport,
             prev,
             seen,
-            created_ms: util::now_ms(),
+            // The store-synchronised clock (Drive: this machine's clock corrected by the
+            // `Date` header), not the machine's own: `removed_ms` is the later of this value
+            // and the store's creation time (`removal_time`), so a device whose clock runs
+            // ahead would push its removals into the future, and one whose clock runs behind
+            // would leave them to the store's time alone, which a folder-writer chooses.
+            created_ms: self.backend.now_ms(),
             host: util::hostname(),
             ops,
         };

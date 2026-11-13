@@ -13,6 +13,7 @@ pub mod check;
 pub mod context;
 pub mod copy;
 pub mod gc;
+pub mod keystore;
 pub mod login;
 pub mod logout;
 pub mod ls;
@@ -38,7 +39,8 @@ pub struct GlobalOpts {
     /// Less output.
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
-    /// copy and sync only: NDJSON events on stdout, one final {"event":"summary",…}.
+    /// copy and sync only: NDJSON events on stdout, one final {"event":"summary",…}
+    /// (`gclone keystore --json` prints one JSON object).
     #[arg(long, global = true)]
     pub json: bool,
 }
@@ -83,6 +85,11 @@ pub enum Command {
     Logout(logout::LogoutArgs),
     /// Set a new passphrase (writes a new keyfile)
     Passwd(passwd::PasswdArgs),
+    /// Where this device keeps its login and key: the plain file, or this Mac's Secure Enclave
+    ///
+    /// Without a subcommand: where the secrets are, the choice made with `keystore use`, what
+    /// the Secure Enclave trial has seen, and whether the state folder is left out of backups.
+    Keystore(keystore::KeystoreArgs),
     /// Show login, vault, head fingerprint and devices
     Status(status::StatusArgs),
     /// Show storage and vault statistics
@@ -285,10 +292,16 @@ fn not_configured(auth_url_known: bool) -> String {
     )
 }
 
-/// `--json` is implemented by `copy` and `sync`. Every other command would print nothing on
+/// `--json` is implemented by `copy`, `sync` and the bare `keystore`. Every other command would print nothing on
 /// stdout and exit 0 — a script could not tell that from "no entries" (§7.1).
 fn json_supported(command: &Command) -> bool {
-    matches!(command, Command::Copy(_) | Command::Sync(_))
+    matches!(
+        command,
+        Command::Copy(_)
+            | Command::Sync(_)
+            // one JSON object: where the secrets are and what the trial has seen (§7.3)
+            | Command::Keystore(keystore::KeystoreArgs { command: None })
+    )
 }
 
 /// The user-facing text of a failure (§2.8). Typed errors are found anywhere in the chain.
@@ -316,10 +329,13 @@ pub(crate) fn describe(e: &anyhow::Error) -> String {
                     .into();
             }
             ConfigError::InsecurePermissions(path) => {
-                let file = hints
-                    .secrets_file
-                    .clone()
-                    .unwrap_or_else(|| std::path::PathBuf::from(path));
+                // The refused file itself where it is one of the two secrets files; the
+                // state directory was refused otherwise.
+                let refused = std::path::PathBuf::from(path);
+                let file = match refused.file_name().and_then(|n| n.to_str()) {
+                    Some("secrets.json" | "secrets.sealed") => refused,
+                    _ => hints.secrets_file.clone().unwrap_or(refused),
+                };
                 let dir = file.parent().unwrap_or(&file).display().to_string();
                 return format!(
                     "Refusing to use {path}: it is readable by others. Fix with `chmod 700 \
@@ -329,6 +345,16 @@ pub(crate) fn describe(e: &anyhow::Error) -> String {
                 );
             }
             ConfigError::WrongPassphrase => return "Wrong passphrase.".into(),
+            // The text says what failed and what to do — not always `gclone login` (§8.2).
+            ConfigError::KeyStoreUnavailable(text) => return text.clone(),
+            ConfigError::KeyStoreBusy => {
+                return format!(
+                    "another gclone is changing this device's sign-in (login, logout or \
+                     `keystore use`). Nothing was changed: run the command again when it is \
+                     done (waited {} seconds).",
+                    crate::keystore::WRITER_WAIT.as_secs()
+                );
+            }
             _ => {}
         }
     }
@@ -465,13 +491,15 @@ pub(crate) fn describe(e: &anyhow::Error) -> String {
 async fn dispatch(g: &GlobalOpts, command: Command) -> anyhow::Result<i32> {
     if g.json && !json_supported(&command) {
         return Err(usage(
-            "--json is supported by copy and sync only; this command has no JSON output",
+            "--json is supported by copy, sync and `gclone keystore` only; this command has no \
+             JSON output",
         ));
     }
     match command {
         Command::Login(a) => login::run(g, a).await,
         Command::Logout(a) => logout::run(g, a).await,
         Command::Passwd(a) => passwd::run(g, a).await,
+        Command::Keystore(a) => keystore::run(g, a).await,
         Command::Status(a) => status::run(g, a).await,
         Command::About(a) => about::run(g, a).await,
         Command::Copy(a) => copy::run(g, a).await,
@@ -526,6 +554,8 @@ pub async fn run() -> i32 {
     crate::ui::init_logging(cli.global.verbose);
     install_interrupt_handler();
     let g = cli.global;
+    // The once-only notes of the key store are for a person: not with -q, not with --json.
+    crate::keystore::set_notes_enabled(!g.quiet && !g.json);
     // `login` is the fix itself; `serve` has restic at its stdin, not a person.
     let no_offer = matches!(cli.command, Command::Login(_) | Command::Serve(_));
     let (code, failure) = report(dispatch(&g, cli.command).await);
@@ -586,6 +616,15 @@ mod tests {
             "gclone logout --revoke --forget --yes",
             "gclone passwd --passphrase-file f",
             "gclone status -q",
+            "gclone keystore",
+            "gclone keystore --json",
+            "gclone keystore check",
+            "gclone keystore check --new-trial",
+            "gclone keystore use enclave",
+            "gclone keystore use enclave --passphrase-file /dev/fd/3 --yes --all-keyfiles",
+            "gclone keystore use enclave --skip-passphrase-check --yes",
+            "gclone keystore use file",
+            "gclone keystore use file --discard-sealed",
             "gclone about",
             "gclone copy ./a :b -n --checksum --force --exclude *.tmp --exclude node_modules/ --transfers 2 --reset-pair",
             "gclone sync :b ./a --dry-run --keep-pair --max-delete 5 --yes",
@@ -642,6 +681,9 @@ mod tests {
             ("gclone sync a :b --json", true),
             ("gclone --json ls", false),
             ("gclone status --json", false),
+            ("gclone keystore --json", true),
+            ("gclone keystore check --json", false),
+            ("gclone keystore use file --json", false),
             ("gclone restore --list :p --json", false),
             ("gclone login --json", false),
             ("gclone --json serve restic --stdio main", false),
@@ -684,6 +726,10 @@ mod tests {
             "gclone serve restic --stdio --port 8765 main",
             "gclone serve restic --addr 0.0.0.0 --port 8765",
             "gclone serve rclone",
+            "gclone keystore use",
+            "gclone keystore use keychain",
+            "gclone keystore use enclave --skip-passphrase-check --passphrase-file f",
+            "gclone keystore frobnicate",
         ] {
             let args: Vec<&str> = argv.split(' ').collect();
             assert!(

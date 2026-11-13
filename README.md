@@ -49,13 +49,67 @@ repository on Drive, beside the vault ([Back up with restic](#back-up-with-resti
 tested with the real restic against the fake Google Drive — **it, too, has not run against
 the real Google Drive yet**.
 
+0.5.0 also adds a second place for a Mac's login and key: a file that only that Mac's Secure
+Enclave can open ([Where a device keeps its key](#where-a-device-keeps-its-key)). It was run
+with the real Secure Enclave of one Mac (Apple silicon, macOS 27) from a terminal; **not
+yet across a restart or a system update, and not from ssh or a daemon** — which is what the
+built-in trial and `gclone keystore check` are for. Nothing moves there on its own: the
+plain file stays until you run `gclone keystore use enclave`. Releases are now published
+from a draft by a script on the maintainer's Mac that also signs the macOS build
+([Publishing a release](#publishing-a-release)); **that script has only run against a fake
+release so far**. For this first release made that way the order matters: the tag is pushed
+alone, and `main` only after the release is published — until then `main` keeps the
+previous `install.sh`, which installs old and new releases alike.
+
 ## Install
 
 Prebuilt binaries for Linux (x86_64 and aarch64) and macOS on Apple silicon are attached to
 this repository's GitHub Releases. The Linux ones are static: they need no particular
 distribution or libc, and run inside WSL2 as well. `install.sh` picks the build for the
-machine, checks it against the release's `SHA256SUMS` and puts it into `~/.local/bin` — no
-sudo, nothing else is touched.
+machine, checks it and puts it into `~/.local/bin` — no sudo, nothing else is touched.
+
+What "checks it" is worth depends on whether the [GitHub CLI](https://cli.github.com) is
+installed and signed in (`gh auth login`):
+
+- **With `gh`**: the script verifies the archive's **build-provenance attestation**
+  (`gh attestation verify`) — GitHub's signed statement, kept outside the release's files,
+  that exactly these bytes were built by this repository's release workflow on the release's
+  tag. A release whose files were replaced afterwards is refused.
+- **Without `gh`**: the archive is checked against the release's `SHA256SUMS` only, and the
+  script says so in one line. That shows a damaged download. It does not show a replaced
+  release: the checksum list comes from the same place as the archive.
+- **How new `gh` has to be**: **2.68.0** for the attestation (the script asks for the release's
+  tag with `--source-ref`, which older versions do not know), **2.75.0** to check in addition
+  that a signed macOS archive is a file of the published release (`gh release verify-asset`).
+  An older `gh` counts as "too old": the script says which check it left out and goes on as
+  without `gh` — or stops, under `--require-attestation`. `gh --version` shows yours.
+
+Neither helps against someone who controls the repository itself: they can publish a
+malicious release that is attested correctly, or change `install.sh`, which the command
+below pipes into `sh`. To read the script first, download it instead of piping it.
+
+**On a Mac**, a release can also carry a **signed build**
+(`gclone-aarch64-apple-darwin-signed.tar.gz`): the very binary the release workflow built
+and attested, with a Developer ID signature added on the maintainer's Mac. Where a release
+has one, `install.sh` installs it, after checking that
+
+- the signature is valid and comes from an Apple-issued Developer ID certificate, with the
+  hardened runtime and nothing else — no entitlements, no other flag;
+- the signed binary is the unsigned one of the same release apart from the signature (it
+  removes both signatures and compares the rest byte for byte);
+- with `gh`: the unsigned archive is what the release workflow attested, and the signed
+  archive is a file of the published release (`gh release verify-asset`);
+- **the signer did not change**: if the gclone already installed is signed, the new one has
+  to be signed by the same team under the same identifier. Replacing a signed gclone with an
+  unsigned one — or with one signed by somebody else — stops, unless you pass
+  `--allow-signer-change`.
+
+The first signed install has nothing to compare with and trusts the signer it finds; the
+script prints the team identifier. `--unsigned` installs the unsigned, attested build
+instead. The signature buys a stable code identity on macOS and a check that an update comes
+from the same signer; it is **not** what protects the key (see
+[Where a device keeps its key](#where-a-device-keeps-its-key)), and the same limit applies:
+whoever controls the repository controls the script.
 
 There is **no prebuilt binary for Intel Macs**: `install.sh` says so there and stops.
 [Build from source](#building-from-source) instead — gclone itself runs on them.
@@ -72,10 +126,14 @@ For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a sig
 
 Options go after `sh -s --`, or into the environment: `--version v0.5.0` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
-`--repo OWNER/NAME` (`GCLONE_REPO`). If `~/.local/bin` is not on your `PATH`, the script says
+`--repo OWNER/NAME` (`GCLONE_REPO`), `--require-attestation` (install nothing that `gh` did
+not verify), `--no-attestation` (checksum only: releases before 0.5.0 carry no attestation
+of the binaries, so with a signed-in `gh` an older version installs only with this), and on
+a Mac `--unsigned` (`GCLONE_UNSIGNED=1`) and `--allow-signer-change`
+(`GCLONE_ALLOW_SIGNER_CHANGE=1`). If `~/.local/bin` is not on your `PATH`, the script says
 so and names the line to add and the file it goes into (on Debian and Ubuntu, logging in again
 is enough). It needs `curl` (`wget` is enough for a public repository), `tar`, `gzip` and
-`sha256sum` (or `shasum` / `openssl`).
+`sha256sum` (or `shasum` / `openssl`); `gh` is optional.
 
 A `GITHUB_TOKEN` / `GH_TOKEN` in the environment, or a `gh` login, is used when there is one.
 If GitHub refuses it (stale, expired, or for another repository), the script says so and
@@ -83,7 +141,8 @@ downloads without it, which is all a public repository needs.
 
 Without GitHub — release archives copied to the machine, or built by hand —
 `sh install.sh --base-url DIR` installs from a directory (a path, `file:///…` or `https://…`)
-that holds `gclone-<target>.tar.gz` and `SHA256SUMS`.
+that holds `gclone-<target>.tar.gz` and `SHA256SUMS` (checksum only: a directory is not a
+GitHub release).
 
 Android/Termux and Intel Macs have no prebuilt binary (the script refuses there): build from
 source — on Android, inside Termux.
@@ -140,15 +199,18 @@ On a machine where `cargo` is a rustup shim without a toolchain, use nix:
 
 ### Publishing a release
 
-`.github/workflows/release.yml` builds, tests and publishes the binaries when a tag `v<version>`
-is pushed (the tag must match `version` in `Cargo.toml`): `gclone-<target>.tar.gz` for
+`.github/workflows/release.yml` builds and tests the binaries when a tag `v<version>` is pushed
+(the tag must match `version` in `Cargo.toml`) and puts them into a **draft** release: `gclone-<target>.tar.gz` for
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`, plus
 `SHA256SUMS` (no `x86_64-apple-darwin`: Intel Macs build from source). Set the repository
 variable `GCLONE_DEFAULT_AUTH_URL`
 (Settings → Secrets and variables → Actions → Variables) to your auth URL first; it is not a
 secret — it is readable in the binary — and without it the binaries simply have no built-in
-URL. `SHA256SUMS` guards against a damaged or swapped download, not against someone who can
-publish releases in the repository.
+URL. Each archive is signed with a GitHub **build-provenance attestation** in the job that
+builds it, and the release job verifies every attestation again before it creates the draft;
+`install.sh` verifies it on the installing machine when `gh` is there. `SHA256SUMS` guards
+against a damaged download only. None of it guards against someone who can push to the
+repository: they can publish a release of their own.
 
 The same run builds the hosted viewer's files, `gclone-viewer-<version>.tar.gz` (what the auth
 Worker serves as static files), in a job of its own that installs no npm package, and signs
@@ -156,8 +218,111 @@ that tarball with a GitHub **build-provenance attestation**. The Worker's deploy
 the attestation — not `SHA256SUMS` — before they use the bundle
 ([`worker/README.md`, "Deploying the viewer"](worker/README.md#deploying-the-viewer)). The
 bundle is then tested in three browsers before anything is published; a failure there stops
-the whole release. Turn on the repository setting "immutable releases", so that a published
-file cannot be replaced.
+the whole release.
+
+**The workflow does not publish.** A draft is invisible to `install.sh` and to everyone
+without write access. Publishing is one command on the maintainer's Apple-silicon Mac, from a
+checkout that has the tag:
+
+```sh
+git fetch --tags
+scripts/release-sign-macos.sh v0.5.0
+```
+
+It verifies every file of the draft against its attestation and `SHA256SUMS`, signs a copy of
+the attested macOS binary with the Developer ID identity of that Mac (hardened runtime, no
+entitlements), proves that the signed binary is the attested one apart from the signature,
+runs it, adds `gclone-aarch64-apple-darwin-signed.tar.gz` and its line in `SHA256SUMS`,
+downloads the whole draft again and checks it once more, and publishes after you type
+`publish v0.5.0`. Then it verifies the published release (`gh release verify`,
+`gh release verify-asset`, `install.sh --require-attestation`). It refuses to go on as soon as
+anything does not verify, and until it publishes it can simply be run again — also after an
+upload that was cut off (the draft may then be without `SHA256SUMS` or without the signed
+archive; the script makes both again from the attested archives).
+
+After publishing nothing can be changed, so the last step tells two things apart. *"THE
+PUBLISHED RELEASE COULD NOT BE VERIFIED YET"*: a question to GitHub was not answered (a
+network error, a rate limit, an attestation that is not served yet). That is not a verdict;
+run
+
+```sh
+scripts/release-sign-macos.sh --verify-published v0.5.0
+```
+
+which needs no draft and no signing identity, changes nothing, and can be repeated: it
+downloads every file of the published release and checks all of the above again. *"THE
+PUBLISHED RELEASE DOES NOT VERIFY"* is only said when a published file is another one than
+the one that was checked — that cannot be repaired, and means a new patch release.
+
+The script uses the system's own `tar`, `file`, `otool`, `lipo` and `codesign` whatever
+`PATH` says, so it also runs from inside a nix shell. What it needs and what you should know
+before the first signed release:
+
+- **Immutable releases must be on** (below) — the script checks and stops otherwise.
+- **Exactly one identity of type "Developer ID Application"** in the keychain, or its hash in
+  `GCLONE_SIGN_IDENTITY`. Other identity types beside it are ignored.
+- **Keep that identity in a keychain of its own that is locked except while the script
+  runs.** With the identity in the login keychain, *every program running as you can sign as
+  you, silently* — `codesign` asks nobody — and such a binary would pass every "same signer"
+  check. One-time setup (the file name and the password are yours to choose; the identity is
+  exported from Keychain Access as a `.p12` first, and removed from the login keychain
+  afterwards):
+
+  ```sh
+  security create-keychain gclone-signing.keychain-db
+  security set-keychain-settings -lut 900 gclone-signing.keychain-db    # locks itself after 15 minutes
+  security import DeveloperID.p12 -k gclone-signing.keychain-db -T /usr/bin/codesign
+  security set-key-partition-list -S apple-tool:,apple: -s gclone-signing.keychain-db
+  export GCLONE_SIGN_KEYCHAIN=~/Library/Keychains/gclone-signing.keychain-db
+  ```
+
+  With `GCLONE_SIGN_KEYCHAIN` set, the script unlocks that keychain at the start (it asks for
+  its password on the terminal) and locks it again on every way out.
+- **The signature publishes who you are, for good.** The certificate inside every signed
+  binary carries the team identifier, the certificate's name and — for an individual
+  developer account — the name registered with Apple. Anyone reads it with `codesign -dvv`,
+  and an immutable release cannot be withdrawn. The script writes none of it into the
+  repository; the binary carries it all the same. If you do not want that, do not sign:
+  publish the draft as it is (`gh release edit <tag> --draft=false --latest`, after removing
+  the first paragraph of its notes) — `install.sh` then installs the attested build, and the
+  key store works exactly the same. A Mac that already has a signed gclone will then ask for
+  `--allow-signer-change`.
+- **Notarization** is optional: with `GCLONE_NOTARY_PROFILE` set to a
+  `xcrun notarytool store-credentials` profile the script submits the binary and requires
+  "Accepted". Without it Gatekeeper calls a browser download "Unnotarized Developer ID";
+  installs through `install.sh` are not affected.
+- The identifier `io.github.dwahdany.gclone` is reserved for what this script signs. Sign
+  nothing else with it — and never anything with an entitlement.
+- `scripts/release-sign-macos.sh --selftest` runs the whole procedure against a fake release
+  directory, a fake `gh` and an ad hoc signature, including the cases it has to refuse. It
+  touches neither GitHub nor a keychain; run it before a release day.
+
+**Order on a release day** — the tag first, `main` last:
+
+```sh
+git push origin v0.5.0                 # the tag ALONE: it carries the commit and starts release.yml
+#   … wait for the workflow: a draft release
+scripts/release-sign-macos.sh v0.5.0   # verify, sign, publish
+#   … deploy the viewer (worker/README.md)
+git push origin main                   # only now
+```
+
+Why `main` waits: the install one-liner pipes `install.sh` from `main`, the `install.sh` of
+0.5.0 refuses a release whose binaries have no attestation when `gh` is signed in, and until
+the draft is published the *latest* release is still the previous one — which has none.
+With `main` pushed together with the tag, every install with a signed-in `gh` would fail for
+the hour the workflow runs and until you have signed. The old `install.sh` installs old and
+new releases alike, so nothing is lost by leaving it on `main` a little longer. Then deploy
+the viewer ([`worker/README.md`](worker/README.md#deploying-the-viewer)).
+
+**Before the first release, in the repository's settings:** turn on **immutable releases**
+(a published file cannot be replaced and a release's tag cannot be moved; the Worker's deploy
+scripts check for it with `gh release verify-asset` and refuse a release that is not
+immutable), and under Advanced Security **Dependabot alerts** and **Dependabot security
+updates**. `.github/dependabot.yml` and the weekly `.github/workflows/audit.yml`
+(`cargo audit` on both lockfiles) only do their part once those are on. An advisory for a TLS
+crate or for the encryption path is a reason to release again, reinstall on every device and
+redeploy the viewer: the binaries are static and nothing updates itself.
 
 ## One-time setup
 
@@ -269,11 +434,22 @@ Open the address in any browser — this machine's (gclone opens it for you when
 phone's — enter the code, choose your Google account and approve. The terminal continues by
 itself a few seconds later; a code is good for 30 minutes, and Ctrl-C stops the login. gclone
 then finds no vault, asks for a new passphrase (leave it empty and it generates a strong one —
-recommended) and creates the vault, a folder named `gclone` in your Drive.
+26 characters, 130 bits, shown once — recommended) and creates the vault, a folder named
+`gclone` in your Drive.
 
 **Store the passphrase in your password manager.** It is needed once on every new device and
 cannot be recovered. It is also the only thing that protects the vault against Google and
-Cloudflare, so prefer the generated one.
+Cloudflare, so prefer the generated one — and choose it well the first time: `gclone passwd`
+changes the passphrase for future devices, but it cannot take back a weak one (see
+[If a passphrase or a device's key file leaked](#if-a-passphrase-or-a-devices-key-file-leaked)).
+A generated passphrase can be typed in any case and with any spacing (`O` reads as `0`, `I`
+and `L` as `1`) — from gclone 0.5.0 on, in the CLI and in a hosted viewer deployed from
+0.5.0; gclone 0.4.0 and a viewer still on 0.4.0 want the 26-character one exactly as it was
+displayed (`XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX`), so deploy the new viewer before you rely on
+sloppy typing there. Anything else is taken exactly as typed. That includes a passphrase of
+your own that merely *looks* like a generated one — 26 letters and digits without a `u`,
+five short words for instance: it is kept exactly as you entered it when you set it
+(gclone says so at that moment), capitals and spaces included, on every version.
 
 ## Adding a device
 
@@ -308,11 +484,17 @@ Compare with `gclone status` on a device you trust (run it there now): head 7QK2
 ```
 
 Do compare it: a new device trusts the vault as Google serves it, and equal head values on two
-devices mean both see the same history.
+devices mean both have applied the same index history. Take the device that **wrote last** as
+the reference, and run `gclone status` there *after* the new device attached. What the value
+is and is not: eight characters (40 bits) computed from the index objects' hashes — nothing
+secret goes into it, so Google can compute it too. It shows that the new device was not handed
+an *older* state than the reference device has. It does not show that the reference device is
+itself current (a device can be kept on an old state by withholding the newest objects from
+it), and it is a comparison for a person to make, not an authentication.
 
 Useful options: `--device-name NAME` (default: the host name; give two machines with the same
 host name different names), `--passphrase-file PATH` (first line of the file; never pass a
-passphrase as an argument). The auth URL is needed once per device; it is remembered and
+passphrase as an argument), `--all-keyfiles` (below). The auth URL is needed once per device; it is remembered and
 survives `gclone logout`. Running `gclone login` again on a connected device repairs whatever
 is missing (an expired login, an interrupted attach) and changes nothing else. If the vault's
 index is incomplete at that moment (a gap or a rollback), the login still completes and tells
@@ -324,9 +506,20 @@ from before 0.2.0 that is attached to none does not create one unless asked with
 `--new-vault`.) A sign-in that cannot see the vault the device is attached to (the wrong
 account) is not kept, and nothing on the device changes.
 
+**If the passphrase is refused although it is right.** A new device tries the passphrase on
+the vault's four newest keyfiles (the passphrase-wrapped copies of the key; each try costs
+about a second and 256 MiB). Anyone who can write to the vault folder can put keyfiles of
+their own in front of the real one. gclone ignores the ones that are no keyfiles at all, and
+when more real-looking keyfiles exist than it tried it does not say "Wrong passphrase" — it
+says how many were not tried, asks at a terminal whether to try them, and
+`gclone login --all-keyfiles` tries every one. `gclone passwd` on a device that is still
+connected removes the cause: it writes a keyfile ahead of all others and retires the rest.
+
 Nothing is ever copied between devices: each has its own Google login (refresh token), and the
 vault key is unlocked on each device with the passphrase. Never copy `secrets.json` from one
-machine to another.
+machine to another. (A Mac's `secrets.sealed` cannot be copied at all in any useful sense: it
+opens only on the Mac that made it — see
+[Where a device keeps its key](#where-a-device-keeps-its-key).)
 
 Google drops a device's login after six months without use (one `gclone login` brings it
 back; `gclone status` warns after 150 idle days). For rarely used machines, a monthly cron job
@@ -360,7 +553,7 @@ gclone restore -r :Archive/tmp              # bring back every deleted file unde
 gclone restore --list :Documents/notes.txt  # one file: versions overwritten or deleted in the last 25 days
 gclone restore :Documents/notes.txt --version 2
 
-gclone status                               # login, vault, head fingerprint, devices, pending changes
+gclone status                               # login, vault, head fingerprint, devices, pending changes, key store
 gclone about                                # storage use, dead space, index shape
 gclone check                                # every blob present, right size and md5 (cheap)
 gclone check --download [:PATH]             # download and authenticate every file
@@ -368,7 +561,12 @@ gclone check ~/Photos :Photos               # compare a local tree with the vaul
 gclone gc                                   # trash data unreferenced for more than 30 days
 gclone gc --purge                           # ...and delete for good what gc trashed earlier
 gclone repair                               # republish missing index objects from this device's cache
-gclone passwd                               # new passphrase (for future devices)
+gclone passwd                               # new passphrase (for future devices); the old keyfile goes to the trash
+gclone passwd --purge-old                   # ...and the old keyfiles are deleted for good, trash included
+gclone keystore                             # where this device keeps its login and key; the Secure Enclave trial (macOS)
+gclone keystore check                       # can this session (cron, ssh, a LaunchAgent) use the Secure Enclave? exit 0 = yes
+gclone keystore use enclave                 # macOS: move the key out of the plain file (checks the passphrase first)
+gclone keystore use file                    # ...and back
 gclone logout                               # remove this device's login and cached key
 ```
 
@@ -462,6 +660,38 @@ How `mv`, `rm` and `restore` behave (all three change only the index; no data mo
   replacing the current one (which stays restorable). Several paths can be given. Empty
   directories are not restored.
 
+How `gc`, `repair` and `passwd` behave:
+
+- **`gc` runs only on a complete index.** It is the one command that judges what is dead, so
+  it does nothing (exit code 3, in all three steps: plain, `--orphans`, `--purge`) whenever
+  this device knows that its view of the vault may be incomplete: the index has a gap or was
+  rolled back, a segment still waits for its predecessors, **an index object failed
+  verification and was ignored**, or a newer snapshot could not be used. The message names
+  the object. Run `gclone repair` on a device that has seen it; an object that no device has
+  (a planted or destroyed one) has to be removed from the vault's `index` folder in
+  drive.google.com before `gc` runs again. `gc` also does nothing (exit code 5) while
+  Google's clock and this device's are more than a day apart, because every age it judges by
+  is measured on Google's clock.
+- **`repair`** puts back what this device's local index cache holds and the vault no longer
+  does — also an index object that still stands under its name but with other bytes (it was
+  overwritten or replaced; the impostor goes to the trash) — and then publishes a snapshot of
+  everything this device knows. Any device that has applied the missing objects can repair
+  the vault for all.
+- **`passwd`** needs no old passphrase (the device already has the key). It writes a new
+  keyfile, reads it back from the vault and compares it, and only then retires the old one:
+  into the Drive trash by default, where it — and the old passphrase with it — keeps working
+  for 30 more days, which is also your way back if the new passphrase gets lost together with
+  the last connected device. `--purge-old` (or a yes to the question at a terminal, which is
+  asked **before** anything is written — Ctrl-C there changes nothing) deletes the old
+  keyfiles for good instead, together with **every** keyfile in the Drive trash, whatever
+  put it there: that is the choice when an old passphrase may have leaked. It says "gone …
+  trash included" only after listing the folder and its trash again, and names what is
+  left otherwise. If `passwd` is ever cut off between writing the new keyfile and retiring
+  the old one, `gclone check` warns that two keyfiles are in the vault folder; running
+  `gclone passwd` again settles it. **Neither changes the vault's
+  key**; what a passphrase change can and cannot do is the next section's subject:
+  [If a passphrase or a device's key file leaked](#if-a-passphrase-or-a-devices-key-file-leaked).
+
 Not synced: symlinks, special files, names that are not UTF-8 (counted and reported),
 permission bits other than "executable or not", directory mtimes, extended attributes. A
 download that replaces an existing file keeps that file's permission bits (a `chmod 600` file
@@ -552,18 +782,42 @@ Worker's secrets, the domain — can serve a page that takes the passphrase, and
 file.** No header, hash or integrity attribute changes that, because the same party serves
 them. What limits it:
 
-- The viewer's files are built by the release workflow, signed with a build-provenance
-  attestation, and the deploy scripts verify that before they upload anything. Afterwards
-  `verify-deployed` compares what the host serves with the release, from any machine, at any
-  time. That finds an accident, a stale deployment or a changed file — not a Worker that
-  answers one visitor differently.
+- The viewer's **static files** are built by the release workflow, signed with a
+  build-provenance attestation, and the deploy scripts verify that before they upload
+  anything. Afterwards `verify-deployed` compares what the host serves with the release, from
+  any machine, at any time. That finds an accident, a stale deployment or a changed file — not
+  a Worker that answers one visitor differently.
+- **The Worker's own code is outside that signature.** The attestation covers the files the
+  browser loads; the script that serves the page — it answers `/` and the sign-in routes, and
+  sets every header of the page — is bundled by `wrangler` on your machine, from your
+  checkout, with the npm packages of the deploy toolchain. Nothing signs it and nothing
+  compares what was uploaded with the release. Deploy it from a clean checkout of the tag
+  (the deploy scripts check the commit and list local changes), on a machine you trust.
+- **A check of the host says nothing about a browser.** If someone else served your viewer's
+  address even briefly, a browser that visited then can keep *their* page — it survives the
+  redeploy, and `verify-deployed` cannot see it. What to do:
+  [After a change of hands](#after-a-change-of-hands-the-hosted-viewer).
 - A device that never opens the hosted viewer is exposed exactly as before.
 
 If you would rather not extend that trust, do not set the viewer up; `gclone web` over SSH
 ([above](#browse-the-vault-in-your-browser)) covers a machine you can reach.
 
-The second thing you trust is the browser you use it in: an extension or anything else that
-runs script in the page can read every file while the vault is unlocked.
+The second thing you trust is the browser you use it in. An extension, or anything else that
+runs script in the viewer's page, sees what the page sees: **the passphrase, whenever it is
+typed or filled in while the script is there, and every name and the contents of every file
+for as long as the vault is unlocked.** What it cannot take after the unlock is a key: the
+keys stay in workers the page cannot read, and the per-file keys that the page's channel
+carries cross it encrypted to the Service Worker (before 0.5.0 they did not, and such a
+script could collect the key of every file in milliseconds and decrypt the vault later).
+So a script that is **gone before the passphrase is entered again** carries away only what
+it actually read. Two things it can still do, said plainly: it can **keep that tab from
+locking or signing out** — the Lock button, the idle lock and Sign out are code of the page
+it runs in — and then it keeps the open vault for as long as the tab lives; and if it is
+still there the next time the passphrase is entered in that tab (it can show you the
+page's own unlock screen when you press Lock), it has the passphrase. **If anything about
+the page looks wrong, close the tab or the browser instead of pressing Lock, and do not
+type the passphrase into that tab again.** All of this is a limit on the damage, not a
+defence: use the viewer in a browser profile whose extensions you trust.
 
 **Three habits against phishing.** The viewer gives a web page a reason to ask for the vault
 passphrase, and that is new: a page that only *looks* like the viewer can get a Google token
@@ -609,7 +863,8 @@ every browser session at once — a lost phone — put a new `SEAL_KEY` on the W
   `drive.file`; that the viewer never does is a property of its code.)
 - Every visit is a fresh device: the viewer trusts the vault state it is served and cannot
   notice a rollback between visits. The info panel shows the **head fingerprint**; compare
-  it with `gclone status` on a device when it matters.
+  it with `gclone status` on the device that wrote last when it matters (what the value does
+  and does not prove: [Adding a device](#adding-a-device)).
 - The index is downloaded on every unlock and kept in memory: measured to 100,000 files
   (15 MB per visit, about 100 MiB of memory). Above 64 MiB of index the viewer asks before
   it loads; much larger vaults may not open on a phone.
@@ -788,19 +1043,42 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   the master key, the object's purpose and a fresh random salt; chunk position and a final
   flag are authenticated, so truncation, reordering and splicing are detected. File contents
   are additionally pinned by BLAKE3 hashes inside the authenticated index.
+  Keys are wiped from memory when their holders are dropped, as far as that goes: it is best
+  effort — copies made when a key is moved or handed to a library are not all covered — and
+  it protects nothing on a device whose `secrets.json` holds the key in the clear anyway.
 - **The passphrase** wraps the master key in a *keyfile* stored in the vault (Argon2id,
-  256 MiB, t = 3). That keyfile is what Google or Cloudflare could attack offline, so the
-  passphrase is the root of confidentiality against them: the generated passphrase (100 bits)
-  is out of reach, a weak typed one is not. `gclone passwd` writes a new keyfile but does not
-  re-encrypt anything — it does not help against someone who already copied the old keyfile.
-- **What Google learns**: the number and sizes of objects (files of 1 MiB or more to within
-  0.03 %; smaller files are hidden in packs), when you write, which device wrote index
-  objects, IP addresses and your account. Not names, tree shape, mtimes, hashes or contents.
-- **What Google can do**: modify, swap, truncate, replay or delete objects. Every modification
-  is detected. A rollback of the journal or withheld journal objects are detected by every
-  device that has seen newer state (`gclone status`, and a warning on every command). A
-  **fresh** device trusts the first state it is served — that is what the head fingerprint
-  comparison at `login` is for. Deletion is a denial of service: detected, not prevented.
+  256 MiB, t = 3). That keyfile is what Google or Cloudflare could attack offline, for as long
+  as they like — Google keeps every version it ever held — so the passphrase is the root of
+  confidentiality against them: the generated passphrase (26 characters, 130 bits; 20
+  characters and 100 bits when it was generated by gclone before 0.5.0) is out of reach, a
+  weak typed one is not, and the only rule gclone enforces on a typed one is its length.
+  `gclone passwd` writes a new keyfile under a new passphrase and retires the old one — into
+  the Drive trash for 30 days, or for good with `--purge-old`. It re-encrypts nothing and
+  changes no key: it does not help against someone who already copied an old keyfile.
+- **What Google learns** (and anyone else who can read the vault folder — a phished login, a
+  browser signed in to the hosted viewer): **the exact size of every file and the number of
+  files**; the order in which the files of one upload were sorted; when you write; which
+  device uploaded what (device ids are in the names of index objects and data folders); how
+  many commits there were and how often the passphrase was changed (counters in object
+  names); IP addresses and your account. Small files are packed together, which saves
+  requests — it does **not** hide their sizes: each file in a pack begins with a recognisable
+  unencrypted header, so the pack can be split into its members without any key. The length
+  of an index object also grows with the lengths of the paths in it. Sizes in sequence can
+  be enough to recognise a known set of files — a public repository's checkout, a published
+  album. **Not** learned: names, the tree, modification times, hashes, contents.
+- **What Google can do**: modify, swap, truncate, replay, delete or withhold objects, and
+  choose their creation times. Every changed byte is detected, in file data and in the index.
+  A rollback of the index — objects that a device has applied are deleted, or overwritten or
+  re-created under the same name — is detected by every device that had applied them
+  (`gclone status`, a warning on every read-only command, exit code 3 on every other). What
+  is **not** detected: the *newest* objects withheld from a device before anything it is shown
+  refers to them — that device simply stays on the older state, and two devices can be kept
+  on different states — and a **fresh** device, which trusts the first state it is served.
+  The head fingerprint compared between devices is the check for both (what it proves:
+  [Adding a device](#adding-a-device)). Deletion is a denial of service: detected, not
+  prevented. Creation times cannot shorten the 25-day restore window or the 30-day `gc`
+  grace: a removal counts from the later of Google's time and the time the removing device
+  sealed into the index.
 - **The auth Worker / Cloudflare** sees the OAuth client secret and the refresh and access
   tokens that pass through it, so it has the same reach as Google and no more: ciphertext and
   deletion. It never sees the passphrase, the master key or any file data — **as long as you
@@ -812,9 +1090,13 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
 - **On the device** the refresh token and the cached master key sit in plaintext in
   `secrets.json` (mode 0600; gclone refuses to use it if it or its directory is accessible to
   others). Anyone who can read that file as you has the vault. At-rest protection is disk
-  encryption. Treat the file like an SSH private key: never copy it to another machine, and
-  exclude the state directory from backups that leave the machine (gclone itself never
-  uploads its configuration or state directory, even when you sync your whole home).
+  encryption. Treat the file like an SSH private key: never copy it to another machine.
+  gclone keeps its state directory out of Time Machine backups and marks it for other backup
+  tools, and never uploads its configuration or state directory itself, even when you sync
+  your whole home. **On a Mac you can move the key out of the plain file**, into a file that
+  only that Mac's Secure Enclave can open: `gclone keystore use enclave` —
+  [Where a device keeps its key](#where-a-device-keeps-its-key) says what that does and does
+  not protect against.
 - **Login phishing.** The sign-in is Google's device-code flow, and starting one needs no
   credentials. Someone can therefore start a login of *their own* and try to talk you into
   entering *their* code at `google.com/device`; the allowlist does not help, because the
@@ -829,8 +1111,13 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
 - **The hosted viewer** moves the decryption into a browser, and the page that does it is
   served by the Worker: whoever controls the Worker, its secrets or the domain can take the
   passphrase from anyone who uses it. That is accepted, optional, and limited by a signed
-  release bundle that the deployed files can be compared with. In the browser the keys exist
-  in memory only; the long-lived Google credential is sealed in a cookie that scripts cannot
+  release bundle that the deployed *static files* can be compared with — the Worker's own
+  script is not part of that signature, and what a hostile host left in a browser outlives
+  the redeploy ([After a change of hands](#after-a-change-of-hands-the-hosted-viewer)). In the
+  browser the keys exist in memory only, in workers the page cannot read; a script in the page
+  reads files while the vault is unlocked — and can keep its tab unlocked for as long as the
+  tab lives — but gets no key, and gets the passphrase only if it is there when the
+  passphrase is entered; the long-lived Google credential is sealed in a cookie that scripts cannot
   read; file names stay out of the address, the title and the history; vault files are
   served as untrusted content exactly as in `gclone web`. See
   [Browse from any browser](#browse-from-any-browser-the-hosted-viewer) and §1.3 and §7.5 of
@@ -844,6 +1131,114 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   [Browse the vault in your browser](#browse-the-vault-in-your-browser) for what it does not
   protect against.
 
+### Where a device keeps its key
+
+A connected device holds two secrets: its Google login (a refresh token) and the vault's
+master key. They are one small document, and there are two places for it.
+
+**The plain file** — `secrets.json` in `~/.local/state/gclone`, mode 0600. This is the
+default everywhere and the only store on Linux. *What a copy is worth:* everything. Whoever
+obtains the file — from a backup, a synced folder, a disk image, another program's bug that
+reads files — has the vault key for good (it cannot be changed, see below) and the login
+until you revoke it.
+
+**The sealed file (Macs with a Secure Enclave)** — `secrets.sealed`, the same document
+encrypted to a key that lives in that Mac's Secure Enclave and cannot leave it. *What a copy
+is worth:* nothing, anywhere but on that Mac. gclone opens it without a prompt, in a
+terminal, from a LaunchAgent and from cron alike; it needs no Keychain and no signature.
+
+What the sealed file does **not** stop: **a program running as you on that Mac.** Such a
+program can ask the Secure Enclave exactly as gclone does — or simply run
+`gclone copy : /somewhere`, or `gclone passwd` and read the new keyfile. It is protection for
+the file at rest and in copies, not a wall between your programs.
+
+What it costs: **if the Mac is erased, repaired (a new logic board) or restored onto other
+hardware, the sealed file is dead, and the passphrase is the only way back for that device**
+(`gclone login`, as on a new device). That is why the move checks your passphrase first.
+
+**The trial.** Before you decide, gclone finds out whether the Secure Enclave works wherever
+you run gclone. On a Mac it keeps a Secure Enclave key that seals a random test value —
+never your secrets — and opens it in every run. `gclone status` shows what it has seen:
+
+```
+Key store    plain file secrets.json (0600) — Secure Enclave trial: 2 of 3 days, no restart seen yet
+Key store    plain file secrets.json (0600) — Secure Enclave trial complete: `gclone keystore use enclave`
+```
+
+"Complete" means it worked on three different days, after a restart, and never failed.
+`gclone keystore` shows the details — which sessions were seen (a terminal has "graphic
+access", cron has not) and every failure. If gclone runs from a scheduler, run
+`gclone keystore check` from that scheduler once: it exits 0 when the Secure Enclave is
+usable right there. The trial changes nothing and decides nothing; a Mac whose owner does
+nothing stays on the plain file. It also never holds a command up: its step is given two
+seconds, and one that does not come back is written down as a failure and not tried again in
+that session for a day. A session that cannot make a Secure Enclave key at all — some
+schedulers' — is reported as that session (`no Secure Enclave key could be made in session
+0x2 … on <date>`), not as a Mac without a Secure Enclave, and the trial starts in the first
+session that can; it then keeps that failure on its record, so "complete" waits until you
+have looked at it (`gclone keystore`, then `gclone keystore check --new-trial`). If you run
+gclone unattended and want none of this: `gclone keystore use file`, or
+`GCLONE_KEYSTORE_TRIAL=0` in the scheduler's environment.
+
+**The move** is one command, run by you at a terminal:
+
+```sh
+gclone keystore use enclave
+```
+
+It proves this device's key against the vault, asks for your passphrase and checks that it
+opens the vault's keyfile (not sure of it? `gclone passwd` on this device sets a new one
+first), tells you what the trial has and has not seen, seals the secrets, reads them back
+through the Secure Enclave, and only then removes `secrets.json`. `--passphrase-file PATH`
+and `--yes` make it scriptable.
+
+**The way back** needs no passphrase:
+
+```sh
+gclone keystore use file
+```
+
+It writes `secrets.json` — byte for byte the file there was — reads it back and then removes
+`secrets.sealed`. It also records that you want the plain file: no trial, no hint.
+
+**Older gclone on the same Mac.** gclone 0.4.0 and older know only `secrets.json`. After the
+move they say "not signed in" — and **their `gclone logout` does not sign the device out**
+(they see nothing to remove; `secrets.sealed` stays). Use the new binary to sign out. If
+something on that Mac still starts an older gclone — restic starts whatever `gclone` is first
+on its `PATH` — update it first, or stay on the plain file; `keystore use enclave` lists the
+other `gclone` binaries it finds. A `gclone web` of an older version that is running stops
+when the move happens.
+
+**Scheduling on macOS.** A LaunchAgent of the logged-in user and cron both work with the
+sealed file (measured). ssh sessions and LaunchDaemons are expected to, and were not
+measured: `gclone keystore check` from there tells. Before the first login after a restart
+nothing runs at all with FileVault on (the disk is locked); a Mac without FileVault that
+runs gclone before anyone logs in should stay on the plain file. If a sealed device ever
+says *"The Secure Enclave cannot be used in this session"*, the key is fine — run gclone
+from a session of the logged-in user, and do **not** sign in again. If it says *"the stored
+key cannot be used any more"* (it has then tried the key twice, and a new key worked), the
+Mac's Secure Enclave no longer has the key: `gclone login` with the passphrase puts it back.
+That login never throws the sealed file away before it has the key again: if you get the
+passphrase wrong or give up, the file is exactly what it was — and should the Secure Enclave
+have recovered meanwhile, the device simply works again, with the new login in `secrets.json`
+beside the sealed key (`gclone keystore` says so, and a `gclone login` that completes makes
+them one file).
+
+If `gclone status` ever warns about *plain copies of this device's login and key* in the
+state folder: a write was interrupted at some point and left a temporary copy behind.
+`gclone keystore use enclave` (or `use file`, whichever store you use) removes them; while
+they are there, a copy of the state folder is not worthless elsewhere.
+
+**Backups.** Whichever store is in use, gclone keeps its state folder out of backups as far
+as it can: on a Mac the folder is excluded from Time Machine (gclone says so once), and on
+every system it carries a `CACHEDIR.TAG`, which restic, borg and tar honour when asked to
+(`--exclude-caches`; restic also `--exclude-if-present CACHEDIR.TAG`). Linux has no mark
+that backup tools honour unasked: add one of those flags, or exclude
+`~/.local/state/gclone`. **Backups made before this version still contain `secrets.json`
+with the vault key in plain** — delete it from them if they leave your hands; the key cannot
+be changed afterwards. A sealed file in a backup is useless elsewhere, and a restored Mac
+signs in again with `gclone login` and the passphrase.
+
 ### Lost or stolen device
 
 Run `gclone logout --revoke` on any other device (or remove the app at
@@ -851,7 +1246,90 @@ Run `gclone logout --revoke` on any other device (or remove the app at
 devices at once; afterwards run `gclone login` on each device you keep. Whether the vault
 stays visible to the app after a revoke and a new sign-in is unverified (day-0 row 3) — keep a
 web download of the vault folder first. The thief still holds the master key the device had
-cached: data it could already download stays exposed, because re-keying is not implemented.
+cached, and the revoke does not change that: see the next section.
+
+### If a passphrase or a device's key file leaked
+
+**There is no re-keying yet.** A vault has one master key for its whole life. `gclone passwd`
+wraps that same key under a new passphrase; nothing is re-encrypted. So:
+
+- Whoever holds **the master key** — a copy of a device's `secrets.json` (a stolen unlocked
+  device, malware, a backup of `~/.local/state/gclone` made before gclone kept that folder
+  out of backups; a copy of a Mac's `secrets.sealed` is *not* one) — can decrypt every object of the
+  vault that they can get hold of, **including everything uploaded later**, for as long as
+  the vault exists. Nothing gclone can do takes the key back.
+- Whoever holds **a passphrase together with a keyfile it opens** — any keyfile generation,
+  also one that was retired since — has the master key. A passphrase alone is worth nothing
+  without a keyfile; keyfiles are in the vault folder, so Google holds every version there
+  ever was, and so does anyone who downloaded the folder or held a login for it.
+
+What limits the damage is whether that party can also get the **ciphertext**: Google, anyone
+with the Google account's login, and whoever controls the auth Worker can; a thief whose
+login was revoked cannot fetch anything new (what they already downloaded stays readable).
+
+What to do, most complete first:
+
+1. **The only full remedy: a new vault.** It gets a new key, and what you upload to it is out
+   of the old key's reach.
+   1. Make sure you have every file in plaintext: `gclone sync :PATH ~/somewhere` (or
+      `copy`) for everything that exists only in the vault.
+   2. If a device or its login is involved: `gclone logout --revoke` on a device you trust
+      (ends the Google login of every device).
+   3. On **every** device: `gclone logout --forget`.
+   4. On one device: `gclone login --new-vault` and a **new** passphrase (leave the prompt
+      empty for a generated one); `gclone login` on the others.
+   5. Upload again (`gclone copy` / `sync`).
+   6. Delete the old vault folder in drive.google.com, and empty the Drive trash.
+
+   This protects what you upload from now on. **What was in the old vault stays exposed** to
+   whoever has the old key and a copy of the old ciphertext — deleting the folder removes it
+   from your Drive, not from a copy someone made, and not from Google's own backups.
+2. **A passphrase leaked, and you believe nobody had access to the vault folder yet**:
+   `gclone passwd --purge-old` with a new passphrase. The old keyfiles are deleted from the
+   account — the ones in the vault folder and **every** keyfile in the Drive trash, also one
+   you moved there by hand — so the leaked passphrase opens nothing that can still be fetched
+   there. The command lists the folder and its trash again afterwards and says "gone" only
+   if that is what it sees. It is worthless against anyone who already copied a keyfile — and against Google,
+   which may keep deleted files in its backups. If in doubt, take remedy 1.
+3. **Only a device's Google login leaked** (a phished code, a token) and not its key: remove
+   the app at <https://myaccount.google.com/permissions> or `gclone logout --revoke`, then
+   `gclone login` on each device. The login reached ciphertext and the keyfile, not the key —
+   it is as good as your passphrase is strong.
+
+### After a change of hands (the hosted viewer)
+
+If someone else may have served your viewer's address — your Cloudflare account or its deploy
+token was in other hands, the domain's DNS was changed, the Worker was replaced — then for
+that time they could serve a page of their own: one that takes the passphrase. Taking the
+host back is not the end of it, because **a browser that opened the viewer in that time can
+keep their page**: a page can install a Service Worker that answers the viewer's address from
+inside the browser from then on, without asking the host. It survives your redeploy, a
+browser restart and an ordinary reload, and it shows their page under the real address.
+`verify-deployed` asks the host, not your browsers, and reports everything in order.
+
+1. **Take the host back and rotate**: the Cloudflare credentials, both Google client secrets,
+   `SEAL_KEY`. Deploy the release again from a clean checkout of the tag
+   ([`worker/README.md`](worker/README.md), "Deploying the viewer"), then run
+   `node scripts/verify-deployed.mjs https://<host> <tag>`.
+2. **In every browser that had the viewer open in that time — every phone, laptop and
+   browser profile — clear the site's data before you type the passphrase there again.**
+   It is under the browser's settings for the site ("site data", "cookies and site data",
+   "website data"); the menu paths are in [`docs/AUTH.md`](docs/AUTH.md), "If something is
+   lost or stolen". Then close every tab of the viewer and open it from your bookmark.
+   If you are not sure which browsers that was: all of them.
+3. **If the passphrase was typed into the viewer in that time**, whoever served the page has
+   it — and with the access the page had, the vault's key:
+   [the section above](#if-a-passphrase-or-a-devices-key-file-leaked) applies.
+
+Two things help without being a substitute for step 2. The Worker answers a browser that asks
+for the script of any Service Worker but the viewer's own with `Clear-Site-Data`, which makes
+Chrome drop such a worker the next time it checks it for an update — after a visit that
+still showed the other page (browsers built on Chrome should do the same; only Chrome was
+tested); Firefox ignores that header on this
+request, Safari's engine kept the worker when we tested it, and a worker whose script was
+placed among the viewer's static files is never asked of the Worker. And the viewer's page
+removes Service Workers that are not its own whenever it loads — which a foreign worker for
+the whole address is there to prevent.
 
 A lost phone or laptop that was only **signed in to the hosted viewer** holds no key — the
 viewer stores none, and it locks by the clock. What it holds is a session: ciphertext and the
@@ -867,6 +1345,16 @@ can be unlocked, treat it like the stolen device above.
 - Tested on macOS and, in containers, on Linux; no Windows (WSL2 runs the Linux binary — keep
   the synced directories inside the Linux file system, not under `/mnt/c`); no FUSE mount; no
   shared drives; no sharing between users.
+- **The sealed key store** ([Where a device keeps its key](#where-a-device-keeps-its-key)) is
+  for Macs with a Secure Enclave; Linux keeps the plain 0600 file (no desktop keyring is used:
+  on a headless machine there is none to rely on after a reboot). It protects copies of the
+  file, not against programs running as you. Not measured yet: a sealed file across a
+  restart or a macOS update, ssh sessions, daemons, a locked screen — the trial and
+  `gclone keystore check` exist to find out on your Mac before you depend on it. Nothing is
+  ever moved there automatically, so a Mac whose owner never runs `gclone keystore use enclave`
+  stays on the plain file. The access token cache (`token.json`, valid for about an hour)
+  stays a plain file. There is still no way to change the vault key: a `secrets.json` that
+  was copied or backed up in the past stays a key to the vault.
 - `gclone web` is a viewer, not a file manager: read-only, no thumbnails, no list of deleted
   files (`gclone restore --list` has it), and what the browser cannot show (HEIC outside
   Safari, most video containers) is a download. A folder cannot be bookmarked or opened in a
@@ -888,9 +1376,20 @@ can be unlocked, treat it like the stolen device above.
   propagated.
 - When two devices upload the same content with different modification times, the vault
   keeps the first uploader's time and the other device keeps its own until it syncs down.
-- No re-keying: the master key cannot be rotated, so a leaked passphrase + keyfile copy or a
-  stolen unlocked device is permanent for the data that existed then. No per-device
-  revocation either (Google revokes all devices' logins or none).
+- No re-keying: the master key cannot be rotated. A leaked passphrase + keyfile copy, or the
+  key file of a stolen unlocked device, stays good for as long as the vault exists — for the
+  data that was there, and for everything uploaded afterwards that the holder can still
+  fetch (Google, the holder of the Google account, whoever controls the auth Worker). The
+  only full remedy is a new vault
+  ([If a passphrase or a device's key file leaked](#if-a-passphrase-or-a-devices-key-file-leaked)).
+  No per-device revocation either (Google revokes all devices' logins or none).
+- File sizes and the number of files are not hidden — not for small files either
+  ([Security model](#security-model-in-brief)).
+- A new device looks at no more than 32 objects with keyfile names (1024 with
+  `gclone login --all-keyfiles`). Someone who can write to the vault folder can plant more
+  than that and lock new devices out until `gclone passwd` runs on a connected device or
+  the planted objects are removed in drive.google.com. That is a denial of service; it
+  discloses nothing.
 - No way back in when the passphrase is forgotten **and** no connected device is left (a
   connected device can always set a new one with `gclone passwd`).
 - The index is critical state and cannot be rebuilt from the data blobs alone. Its redundancy
@@ -974,16 +1473,25 @@ can be unlocked, treat it like the stolen device above.
 |---|---|---|
 | `config.json` — which vault, the auth Worker URL (no secrets) | `$GCLONE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/gclone`, else `~/.config/gclone` | 0600 |
 | `secrets.json` — this device's refresh token and the cached master key | `$GCLONE_STATE_DIR`, else `$XDG_STATE_HOME/gclone`, else `~/.local/state/gclone` | 0600 |
+| `secrets.sealed` — the same, sealed by the Mac's Secure Enclave, **instead of** `secrets.json` after `gclone keystore use enclave` | same directory | 0600 |
+| `keystore.json` — which of the two you chose with `gclone keystore use` (no secret) | same directory | 0600 |
+| `keystore-trial.json` — macOS: the Secure Enclave trial's own key, test value and record (no secret of the vault) | same directory | 0600 |
+| `keystore-trial.lock` — macOS: an empty lock file for changes of that record; `backup-note.due` — an empty marker while the one-time note about older backups is still owed to a terminal | same directory | 0600 |
+| `secrets.lock`, `CACHEDIR.TAG` — a lock file; the mark that keeps the folder out of backups | same directory | 0600 |
 | `token.json` — cached access token | same directory | 0600 |
 | `state.db`, `lock`, `index-cache/` — the index replica and sync state | `<state root>/<vault id>/` | 0600 / 0700 |
 
-`gclone serve restic` reads `secrets.json` and `token.json`, writes only `token.json`, and
-uses neither `config.json` nor a vault's state: it takes no lock, and runs beside any other
+`gclone serve restic` reads the secrets (`secrets.json` or `secrets.sealed`) and `token.json`,
+writes only `token.json` — and, on a Mac that is still on the plain file, the trial's record —
+and uses neither `config.json` nor a vault's state: it takes no lock, and runs beside any other
 gclone command.
 
-`gclone logout` deletes `secrets.json` and `token.json` (and temp copies of them that an
-interrupted write may have left in that directory); `gclone logout --forget` also deletes
-`config.json` and the vault's state directory. `state.db` contains plaintext paths and hashes
+`gclone logout` deletes `secrets.json`, `secrets.sealed` and `token.json` (and temp copies of
+them that an interrupted write may have left in that directory); `gclone logout --forget` also
+deletes `config.json` and the vault's state directory. `keystore.json`, `keystore-trial.json`,
+`secrets.lock` and `CACHEDIR.TAG` stay: none of them holds a secret. The state folder is left
+out of Time Machine backups (macOS) and marked with `CACHEDIR.TAG`
+([Where a device keeps its key](#where-a-device-keeps-its-key)). `state.db` contains plaintext paths and hashes
 and is as sensitive as the synced files themselves.
 
 ## Exit codes
@@ -994,7 +1502,7 @@ and is as sensitive as the synced files themselves.
 | 1 | other error — also a remote path that does not exist |
 | 2 | usage error |
 | 3 | integrity: crypto failure, index gap or rollback, vault trashed or missing, the vault needs a newer gclone, `check` found damage |
-| 4 | fixed by `gclone login`: not connected, signed out, wrong passphrase, expired login, Worker problems |
+| 4 | fixed by `gclone login`: not connected, signed out, wrong passphrase, expired login, Worker problems — and a sealed key store that cannot be opened (the message says whether `gclone login` is the fix or the session is) |
 | 5 | a safety guard refused; the message names the flag that answers it (`--yes`, a higher `--max-delete`, `--force`, `--keep-pair` / `--reset-pair`) |
 | 6 | partial: some files were skipped or failed |
 | 75 | temporary failure: quota or rate limit, index changes could not be published yet |
@@ -1008,7 +1516,7 @@ has exit codes only for its start and end:
 | 0 | `--stdio`: restic closed the connection; `--port`: Ctrl-C, SIGTERM or SIGHUP |
 | 1 | `--port`: the port is in use, on 127.0.0.1 or on [::1]; `--stdio`: the connection to restic broke in a way that is not "closed" |
 | 2 | usage: a bad repository name, `--stdio` on a terminal |
-| 4 | not signed in, or an unsafe `secrets.json`; `--port`: the device was signed out while it ran |
+| 4 | not signed in, an unsafe `secrets.json`, or a sealed key store that does not open; `--port`: the device was signed out while it ran |
 | 130 | `--port` only: a second Ctrl-C |
 
 ## Day-0 checklist (before the first real use)
@@ -1033,6 +1541,7 @@ verified by any automated test (§2.9). After the one-time setup:
 | ☐ | 5 | The first real `gclone login` succeeds: Google's device-code endpoint accepts the client with `openid email drive.file` (verified 2026-11-12), and the token answer after the consent carries an **ID token** with the verified e-mail address and a refresh token, with a `scope` that holds nothing but `openid`, `email` / `…/auth/userinfo.email` and `…/auth/drive.file`. | No ID token → every login ends right after the approval with "Sign-in was not completed (Google approved the sign-in, but its answer carried no ID token …)" — the Worker's `403 grant_unusable`; it fails closed, because it cannot apply the allowlist. The Worker then has to ask Google's userinfo endpoint instead. Login refused with `scope_not_allowed` naming a harmless scope → Google spells a granted scope differently; add it to `ALLOWED_SCOPES` in `worker/src/google.ts`. |
 | ☐ | 7 | Sustained create rate; does session initiation count against it? | Tune the pack size and the pacer's start rate. |
 | ☐ | 11 | A trashed file is still downloadable by ID. | Affects self-heal wording only. For `serve restic`: a file that another machine deleted answers "not found" one listing earlier — nothing breaks. |
+| ☐ | 14 | `gclone passwd`, then `gclone passwd --purge-old`: the second run reports "1 in the Drive trash", and the keyfile the first run trashed is gone from the trash in drive.google.com. | Google does not list an app's trashed files to it: `--purge-old` then deletes the keyfiles that are still in the folder only — empty the Drive trash by hand after a `passwd`. |
 
 `gclone serve restic` adds nothing to the table but leans on rows 2, 7, 8 and 11: its first
 real run — `restic init`, a backup from two machines, `restic check --read-data`, a
@@ -1050,7 +1559,11 @@ cargo test --locked                  # everything; no network, no credentials (r
 cargo clippy --locked --all-targets
 cargo fmt --check
 cd worker && npm ci && npm run typecheck && npm test
-sh tests/install/test.sh             # install.sh against a fake release and a fake GitHub (python3, curl)
+sh tests/install/test.sh             # install.sh against a fake release and a fake GitHub (python3, curl; on a Mac
+                                     # also the signed build: codesign and cc)
+bash tests/release/selftest.sh       # macOS: scripts/release-sign-macos.sh against a fake release and a fake gh
+                                     # (needs target/release/gclone; runs inside or outside a nix shell —
+                                     # the script takes the system's tar, file and codesign either way)
 
 # the hosted viewer (needs the wasm target and wasm-bindgen: web-core/README.md)
 sh web-core/build.sh                 # the read path as WebAssembly → web-core/pkg/
@@ -1064,7 +1577,11 @@ Rust part on Linux and on macOS, with the Rust version pinned in `rust-toolchain
 runs with `-D warnings`: bump the version deliberately). The browser suite runs on macOS only
 (Playwright's WebKit there is the one whose media stack matches Safari), with the installed
 Google Chrome, on the bundle that the Linux job built. The workflows pin every action to a
-commit; `.github/dependabot.yml` proposes the updates.
+commit; `.github/dependabot.yml` proposes the updates — of the actions, of both Cargo
+lockfiles and of the Worker's npm toolchain, a version only once it is two weeks old.
+`.github/workflows/audit.yml` runs `cargo audit` over both lockfiles every week and on every
+push to `main`; a red run there is about a dependency, not about your change, and an advisory
+for a TLS crate or for the encryption path means: update, release, reinstall, redeploy.
 
 (With nix: `nix-shell -p cargo rustc clippy rustfmt restic --run '…'` and
 `nix-shell -p nodejs --run '…'`; for the wasm build
@@ -1074,6 +1591,14 @@ so.)
 
 - `Cargo.lock` is committed; build with `--locked`. Dependencies are compiled with
   `opt-level = 3` in dev and test builds too: the keyfile KDF is Argon2id at 256 MiB.
+- The key store ([Where a device keeps its key](#where-a-device-keeps-its-key)): a debug build
+  uses no Secure Enclave and runs no trial; the tests select a stand-in with
+  `GCLONE_TEST_KEYSTORE_SEALER=fake`. On a Mac with a Secure Enclave, `cargo test` also runs two
+  tests against the real one (names starting with `hardware_`; they make keys that are stored
+  nowhere); elsewhere those print `SKIPPED: no Secure Enclave on this machine` and pass.
+  `GCLONE_REQUIRE_ENCLAVE=1` turns that skip into a failure — set it on the Mac that signs
+  releases. `GCLONE_TEST_OLD_GCLONE=/path/to/gclone-0.4.0 cargo test --test keystore` also runs
+  the released 0.4.0 binary beside the new files.
 - Property tests use a seeded PRNG (`tests/support/prng.rs`). A failing case prints its seed;
   re-run it with `GCLONE_TEST_SEED=<seed> cargo test …`.
 - `tests/cli_e2e.rs` spawns the debug binary, over directory vaults and against a fake Google
@@ -1107,12 +1632,16 @@ so.)
 Cargo.toml, Cargo.lock      manifest and committed lock file
 build.rs                    hands the target triple to `gclone --version`
 install.sh                  installer of the released binaries (tests: tests/install/)
+scripts/release-sign-macos.sh   the maintainer's release day: verify the draft release, sign the macOS build,
+                            publish (self-test: tests/release/, against a fake release and a fake gh)
 rust-toolchain.toml         the Rust version of CI and of the release binaries (for rustup)
 .github/workflows/          ci.yml (fmt, clippy, tests, Worker, install.sh, the wasm core, the viewer and its
-                            browser suite), release.yml (binaries and the attested viewer bundle on a tag)
+                            browser suite), release.yml (attested binaries and the attested viewer bundle in a
+                            DRAFT release on a tag), audit.yml (cargo audit on both lockfiles: weekly and on
+                            every push)
 .github/scripts/            install-wasm-bindgen.sh: the command in the lockfile's version;
                             install-restic.sh: a pinned, checksummed restic for the tests
-.github/dependabot.yml      keeps the pinned actions current
+.github/dependabot.yml      proposes updates: the pinned actions, both Cargo lockfiles, the Worker's npm toolchain
 docs/SPEC.md                the implementation spec (design contract, errata in §17)
 src/lib.rs, src/main.rs     module declarations; main → cli::run
 src/{consts,types,error,util,path,ui}.rs    shared: constants, plain types, errors + exit codes,
@@ -1130,9 +1659,14 @@ src/restic/                 `gclone serve restic`: restic's REST protocol in fro
 web-core/                   the read path for the hosted viewer: a crate of its own that includes src/ files by
                             path and builds to WebAssembly (build.sh → pkg/); tests against the native binary
 src/config.rs, src/cli/     local configuration; one file per command (serve.rs: `serve restic`)
-tests/                      integration tests; cli_e2e.rs and web.rs drive the binary, live.rs is opt-in;
+src/keystore/               where a device keeps its secrets: the plain file or the Secure Enclave store, the
+                            moves between them, the trial, the backup exclusion (macos.rs: the framework calls)
+tests/                      integration tests; cli_e2e.rs, web.rs and keystore.rs drive the binary, live.rs is
+                            opt-in;
                             restic_http.rs (the protocol, in process) and restic_e2e.rs (the binary, and the
                             real restic against the fake Drive)
+tests/vectors/              frozen known-answer vectors: the stream container and the formats (stream_v1.json),
+                            keyfiles sealed by gclone 0.4.0 (passphrase_v0_4_0.json)
 tests/support/              seeded PRNG for property tests, the fake Google Drive + auth Worker, an HTTP/2
                             test client
 worker/                     the auth Worker (TypeScript); see worker/README.md

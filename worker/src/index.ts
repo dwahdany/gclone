@@ -81,6 +81,13 @@ export const defaultDeps: Deps = {
 export const BODY_MAX = 8192,
   RATE_LIMIT_RETRY_AFTER_S = 60;
 
+/** The only Service Worker this origin has: the viewer's, a static file that the asset layer serves. */
+export const SERVICE_WORKER_PATH = "/sw.js";
+/** What a request for any other Service Worker's script is answered with, besides its 404 (or whatever the path
+ *  answers): the browser is told to drop this site's storage — which includes its Service Worker registrations — and
+ *  its cache. Not `"cookies"`: that would clear the whole registrable domain (as in `/web/logout`). */
+export const CLEAR_SITE_DATA = '"cache", "storage"';
+
 /** Hosts that are served over plain http: development only. A network attacker cannot make a browser reach the
  *  deployed page under one of these names. */
 const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
@@ -133,9 +140,31 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
   } catch {
     reply = fail(500, "internal_error", "The sign-in helper failed unexpectedly.");
   }
+  if (foreignServiceWorker(request)) reply.response.headers.set("Clear-Site-Data", CLEAR_SITE_DATA);
   // The only log line: never a body, a query string, a header, a cookie or a secret.
   console.log(JSON.stringify({ route: path, status: reply.response.status, error: reply.error }));
   return reply.response;
+}
+
+/** A browser fetching the script of a Service Worker that is not the viewer's: it installs or — far more likely —
+ *  checks for an update of one that was registered while someone else served this origin (README.md, "After a change
+ *  of hands"). The honest deployment registers `/sw.js` and nothing else, and that file never reaches this code.
+ *  Browsers send `Service-Worker: script` with the request for a Service Worker's own script; Firefox sends it for
+ *  the scripts that one imports as well, which `Sec-Fetch-Dest` tells apart (`script`, not `serviceworker`) — the
+ *  viewer's Service Worker imports its files, and a file of a deployment that has not arrived yet must not clear
+ *  anything. A request without `Sec-Fetch-Dest` is taken by the first header alone.
+ *  What the answer achieves depends on the browser (measured, §17.27): Chrome drops the registration and the site's
+ *  data; Firefox ignores `Clear-Site-Data` on this request; WebKit clears storage and keeps the registration. It is an
+ *  aid, not the remedy — that is clearing the site's data by hand in every browser. */
+function foreignServiceWorker(request: Request): boolean {
+  if (request.headers.get("service-worker") !== "script") return false;
+  const destination = request.headers.get("sec-fetch-dest");
+  if (destination !== null && destination !== "serviceworker") return false;
+  try {
+    return new URL(request.url).pathname !== SERVICE_WORKER_PATH;
+  } catch {
+    return true;
+  }
 }
 
 async function dispatch(request: Request, url: URL, route: Route | undefined, env: Env, deps: Deps): Promise<Reply> {

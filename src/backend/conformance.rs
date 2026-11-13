@@ -273,6 +273,17 @@ pub async fn run<B: Backend>(b: B) {
         (stat_size(&small_data), Some(md5_of(&small_data)))
     );
     assert_eq!(names(&b.list(folder).await.unwrap()), ["big.bin", "sub"]);
+    // … and listed as what the trash holds of this folder: direct children only
+    let in_trash = b.list_trashed(folder).await.unwrap();
+    assert_eq!(names(&in_trash), ["small.bin"]);
+    assert_eq!(in_trash[0].handle, *small);
+    assert!(in_trash[0].trashed && in_trash[0].parent == *folder);
+    assert_eq!(
+        (in_trash[0].size, in_trash[0].md5),
+        (stat_size(&small_data), Some(md5_of(&small_data)))
+    );
+    assert!(b.list_trashed(sub).await.unwrap().is_empty());
+    assert!(b.list_trashed(&top).await.unwrap().is_empty());
     let found = b.find_by_name("small.bin").await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].handle, *twin);
@@ -281,6 +292,7 @@ pub async fn run<B: Backend>(b: B) {
     b.untrash(small).await.unwrap();
     b.untrash(small).await.unwrap();
     assert!(!b.stat(small).await.unwrap().unwrap().trashed);
+    assert!(b.list_trashed(folder).await.unwrap().is_empty());
     assert_eq!(
         names(&b.list(folder).await.unwrap()),
         ["big.bin", "small.bin", "sub"]
@@ -288,6 +300,7 @@ pub async fn run<B: Backend>(b: B) {
     assert_eq!(b.find_by_name("small.bin").await.unwrap().len(), 2);
     b.trash(top_file).await.unwrap();
     assert_eq!(names(&b.list(&top).await.unwrap()), ["folder"]);
+    assert_eq!(names(&b.list_trashed(&top).await.unwrap()), ["top.bin"]);
     b.untrash(top_file).await.unwrap();
     assert_eq!(names(&b.list(&top).await.unwrap()), ["folder", "top.bin"]);
 
@@ -308,8 +321,10 @@ pub async fn run<B: Backend>(b: B) {
         ["big.bin", "small.bin", "sub"]
     );
     b.trash(twin).await.unwrap();
+    assert_eq!(names(&b.list_trashed(sub).await.unwrap()), ["small.bin"]);
     b.delete(twin).await.unwrap();
     assert!(b.stat(twin).await.unwrap().is_none());
+    assert!(b.list_trashed(sub).await.unwrap().is_empty());
 
     // --- NotFound
     for gone in [doomed, twin, absent] {

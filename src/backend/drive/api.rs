@@ -706,25 +706,34 @@ impl Inner {
     }
 
     pub(super) async fn list(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
-        self.list_children(parent, false).await
+        self.list_children(parent, false, false).await
     }
 
     /// `Backend::list_strict`: a `404` is `NotFound`.
     pub(super) async fn list_strict(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
-        self.list_children(parent, true).await
+        self.list_children(parent, true, false).await
+    }
+
+    /// `Backend::list_trashed`: the children of `parent` that are in the trash. `files.list`
+    /// answers `trashed = true` under `drive.file` for the files the app can see at all — the
+    /// ones it created. (A child of a live folder is in the trash only if it was trashed
+    /// itself.)
+    pub(super) async fn list_trashed(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        self.list_children(parent, false, true).await
     }
 
     async fn list_children(
         &self,
         parent: &Handle,
         strict: bool,
+        trashed: bool,
     ) -> Result<Vec<ObjMeta>, BackendError> {
         let id = if parent.is_top() {
             "root"
         } else {
             parent.0.as_str()
         };
-        let q = format!("'{}' in parents and trashed = false", q_escape(id));
+        let q = format!("'{}' in parents and trashed = {trashed}", q_escape(id));
         let files = self.list_query(&q, strict).await?;
         if parent.is_top()
             && let Some(root) = files.first().and_then(File::parent_id)

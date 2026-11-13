@@ -337,6 +337,10 @@ impl Backend for DriveBackend {
         self.inner.list_strict(parent).await
     }
 
+    async fn list_trashed(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        self.inner.list_trashed(parent).await
+    }
+
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {
         self.inner.find_by_name(name).await
     }
@@ -363,5 +367,9 @@ impl Backend for DriveBackend {
     fn now_ms(&self) -> u64 {
         let offset = self.inner.clock_offset_ms.load(Ordering::Relaxed);
         util::now_ms().saturating_add_signed(offset)
+    }
+
+    fn clock_offset_ms(&self) -> i64 {
+        self.inner.clock_offset_ms.load(Ordering::Relaxed)
     }
 }

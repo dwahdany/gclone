@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,8 +13,8 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { inspectDist, sha256 } from "./check-dist.mjs";
 import { readHeaders } from "./headers-file.mjs";
-import { compareFiles, readTarball, releaseBundle, tarballName, verifyArgs } from "./release-bundle.mjs";
-import { FAKE_BUILD, bundleTarball, fakeBundleFiles, fakeGh, inTempDir, readTree, tar, writeTree } from "./selftest-bundle.mjs";
+import { checkout, compareFiles, immutableArgs, readTarball, releaseBundle, tarballName, verifyArgs } from "./release-bundle.mjs";
+import { FAKE_BUILD, FAKE_COMMIT, bundleTarball, fakeBundleFiles, fakeGh, inTempDir, readTree, tar, writeTree } from "./selftest-bundle.mjs";
 import { ensureDist } from "./stub-dist.mjs";
 import { headerSet, hostOrigin } from "./verify-deployed.mjs";
 
@@ -24,11 +24,34 @@ const NAME = tarballName("9.8.7");
 const B = FAKE_BUILD;
 const scripts = fileURLToPath(new URL(".", import.meta.url));
 
-/** Runs one of the scripts as a command with `gh` resolved from `bin` (and from nowhere else). */
-function run(script, args, { bin, repo = REPO } = {}) {
+/**
+ * The commit this checkout is at: what fetch-viewer and check-release, run as commands, hold a release to. The
+ * made-up release of the command tests is "built from" it (the fake commit where the tests run outside a checkout).
+ */
+const HERE = checkout();
+const HEAD = HERE?.commit ?? FAKE_COMMIT;
+
+/** A directory that holds `git` and nothing else, for the PATH of the commands: they ask it for the checkout's commit. */
+const GIT_ONLY = (() => {
+  if (HERE === null) return null;
+  const real = (process.env.PATH ?? "")
+    .split(":")
+    .map((part) => join(part, "git"))
+    .find((candidate) => existsSync(candidate));
+  if (real === undefined) return null;
+  const dir = mkdtempSync(join(tmpdir(), "gclone-selftest-git-"));
+  symlinkSync(real, join(dir, "git"));
+  process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+})();
+
+/** Runs one of the scripts as a command with `gh` resolved from `bin` (and from nowhere else) — and `git` as it is. */
+function run(script, args, { bin, repo = REPO, env: extra = {} } = {}) {
   return new Promise((resolve) => {
-    const env = { ...process.env, PATH: bin ?? join(tmpdir(), "gclone-no-such-directory"), GCLONE_REPO: repo };
+    const path = [bin ?? join(tmpdir(), "gclone-no-such-directory"), ...(GIT_ONLY === null ? [] : [GIT_ONLY])];
+    const env = { ...process.env, PATH: path.join(":"), GCLONE_REPO: repo, ...extra };
     delete env.GCLONE_GH;
+    if (!("GCLONE_MUTABLE_RELEASE" in extra)) delete env.GCLONE_MUTABLE_RELEASE;
     const child = spawn(process.execPath, [join(scripts, script), ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -38,11 +61,11 @@ function run(script, args, { bin, repo = REPO } = {}) {
   });
 }
 
-/** A fake `gh` with the made-up bundle published and attested as release v9.8.7. */
-function published(dir, { files = fakeBundleFiles(), attest = true } = {}) {
+/** A fake `gh` with the made-up bundle published as the immutable release v9.8.7, attested as built from this checkout's commit. */
+function published(dir, { files = fakeBundleFiles(), attest = true, immutable = true } = {}) {
   const gh = fakeGh(dir);
   const tarball = bundleTarball(files);
-  gh.publish(TAG, NAME, tarball, { attest, repo: REPO });
+  gh.publish(TAG, NAME, tarball, { attest, immutable, repo: REPO, commit: HEAD });
   return { gh, files, tarball };
 }
 
@@ -83,12 +106,18 @@ test("releaseBundle: downloads the tag's tarball, verifies its attestation with 
       for (const [path, content] of Object.entries(files)) assert.equal(bundle.files[path], sha256(content));
       assert.deepEqual(Object.keys(readTree(bundle.path)).sort(), Object.keys(files).sort());
 
+      assert.equal(bundle.immutable, true);
+      assert.equal(bundle.commit, null, "no commit was asked for");
       const calls = gh.calls();
-      assert.equal(calls.length, 2);
+      assert.equal(calls.length, 3);
       assert.deepEqual(calls[0].slice(0, 7), ["release", "download", TAG, "--repo", REPO, "--pattern", NAME]);
       const downloaded = calls[1][2];
       assert.deepEqual(calls[1], ["attestation", "verify", downloaded, "--repo", REPO, "--signer-workflow", `${REPO}/.github/workflows/release.yml`, "--source-ref", `refs/tags/${TAG}`, "--deny-self-hosted-runners"]);
+      // … and the release itself: this file, of this tag, of an immutable release
+      assert.deepEqual(calls[2], ["release", "verify-asset", TAG, downloaded, "--repo", REPO]);
       assert.deepEqual(verifyArgs("x.tar.gz", "o/r", "v1.2.3"), ["attestation", "verify", "x.tar.gz", "--repo", "o/r", "--signer-workflow", "o/r/.github/workflows/release.yml", "--source-ref", "refs/tags/v1.2.3", "--deny-self-hosted-runners"]);
+      assert.deepEqual(verifyArgs("x.tar.gz", "o/r", "v1.2.3", "c".repeat(40)).slice(-2), ["--source-digest", "c".repeat(40)]);
+      assert.deepEqual(immutableArgs("x.tar.gz", "o/r", "v1.2.3"), ["release", "verify-asset", "v1.2.3", "x.tar.gz", "--repo", "o/r"]);
     } finally {
       bundle.remove();
     }
@@ -130,6 +159,69 @@ test("releaseBundle fails closed: no gh, no attestation, another repository, ano
     mislabeled.publish(TAG, NAME, bundleTarball(fakeBundleFiles({ tag: "v9.8.6", version: "9.8.6" })), { repo: REPO });
     assert.throws(() => releaseBundle(TAG, { repo: REPO, gh: mislabeled.command }), /says tag "v9\.8\.6", expected "v9\.8\.7"/);
     assert.deepEqual(leftovers(), before, "nothing is left behind by a failure");
+  }));
+
+test("releaseBundle holds the release to a commit: the one the deploying checkout is at", () =>
+  inTempDir((dir) => {
+    const gh = fakeGh(dir);
+    const built = "a".repeat(40);
+    gh.publish(TAG, NAME, bundleTarball(fakeBundleFiles()), { repo: REPO, commit: built });
+    const before = leftovers();
+    const bundle = releaseBundle(TAG, { repo: REPO, gh: gh.command, commit: built });
+    try {
+      assert.equal(bundle.commit, built);
+      assert.deepEqual(gh.calls()[1].slice(-2), ["--source-digest", built]);
+    } finally {
+      bundle.remove();
+    }
+    // A checkout at another commit — main, an older tag — or a tag that was moved since the release was built:
+    // the bytes are attested, but not as built from what is about to be deployed with them.
+    const other = "b".repeat(40);
+    assert.throws(
+      () => releaseBundle(TAG, { repo: REPO, gh: gh.command, commit: other }),
+      new RegExp(`is attested, but it was not built from commit ${other}, which this checkout is at.*git checkout v9\\.8\\.7.*the tag was moved`, "s"),
+    );
+    // An attestation that fails for another reason is reported as that, commit or not.
+    const unsigned = fakeGh(join(dir, "unsigned"));
+    unsigned.publish(TAG, NAME, bundleTarball(fakeBundleFiles()), { attest: false, repo: REPO });
+    assert.throws(() => releaseBundle(TAG, { repo: REPO, gh: unsigned.command, commit: built }), /verifying the attestation .*from commit a{40}\) failed.*no attestation matches/s);
+    assert.throws(() => releaseBundle(TAG, { repo: REPO, gh: gh.command, commit: "v9.8.7" }), /is not a commit/);
+    assert.deepEqual(leftovers(), before, "nothing is left behind");
+  }));
+
+test("releaseBundle wants an immutable release: a release whose tag can still be moved is used only when it is named", () =>
+  inTempDir((dir) => {
+    const gh = fakeGh(dir);
+    const tarball = bundleTarball(fakeBundleFiles());
+    gh.publish(TAG, NAME, tarball, { repo: REPO, immutable: false });
+    const before = leftovers();
+    assert.throws(
+      () => releaseBundle(TAG, { repo: REPO, gh: gh.command, mutable: "" }),
+      /verifying that gclone-viewer-9\.8\.7\.tar\.gz is an asset of the immutable release v9\.8\.7 of owner\/project failed.*no attestations for tag v9\.8\.7.*is not an immutable release.*whoever|is not an immutable release.*GCLONE_MUTABLE_RELEASE=v9\.8\.7/s,
+    );
+    // naming another tag does not help
+    assert.throws(() => releaseBundle(TAG, { repo: REPO, gh: gh.command, mutable: "v9.8.6" }), /GCLONE_MUTABLE_RELEASE=v9\.8\.7/);
+    // named: used, with a warning, and the result says what it is
+    const warnings = [];
+    const bundle = releaseBundle(TAG, { repo: REPO, gh: gh.command, mutable: TAG, warn: (line) => warnings.push(line) });
+    try {
+      assert.equal(bundle.immutable, false);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /^warning: release v9\.8\.7 of owner\/project is NOT immutable .*can still be changed by anyone who can push/);
+    } finally {
+      bundle.remove();
+    }
+    // The attestation is still required: an unattested file of a named release is refused before the release is asked.
+    const unsigned = fakeGh(join(dir, "unsigned"));
+    unsigned.publish(TAG, NAME, tarball, { attest: false, immutable: false, repo: REPO });
+    assert.throws(() => releaseBundle(TAG, { repo: REPO, gh: unsigned.command, mutable: TAG }), /verifying the attestation/);
+    assert.deepEqual(unsigned.calls().map((call) => call.slice(0, 2).join(" ")), ["release download", "attestation verify"]);
+    // An immutable release with ANOTHER file under the asset's name (replaced after publication, were that possible).
+    const replaced = fakeGh(join(dir, "replaced"));
+    replaced.publish(TAG, NAME, tarball, { repo: REPO });
+    replaced.publish(TAG, NAME, bundleTarball(fakeBundleFiles({ extra: { "app.js": "'use strict';\n// other\n" } })), { repo: REPO, immutable: false });
+    assert.throws(() => releaseBundle(TAG, { repo: REPO, gh: replaced.command, mutable: "" }), /is not an immutable release, or gclone-viewer-9\.8\.7\.tar\.gz is not the file it was published with/);
+    assert.deepEqual(leftovers(), before, "nothing is left behind");
   }));
 
 test("the tarball reader takes plain files under a bundle's names and refuses everything else", () => {
@@ -198,7 +290,28 @@ test("fetch-viewer: replaces dist/ with the verified bundle; a failed verificati
     assert.equal(ok.status, 0, ok.stderr);
     assert.match(ok.stdout, /^fetch-viewer: .*via-path is the viewer of owner\/project v9\.8\.7\n {2}version {3}9\.8\.7\n {2}build {5}0123456789abcdef\n/);
     assert.match(ok.stdout, / {2}tarball {3}gclone-viewer-9\.8\.7\.tar\.gz {2}sha256 [0-9a-f]{64}\n/);
+    assert.match(ok.stdout, / {2}release {3}immutable \(gh release verify-asset\)/);
     assert.deepEqual(Object.keys(readTree(viaPath)).sort(), Object.keys(files).sort());
+    // As a command in a git checkout it holds the release to the commit the checkout is at.
+    const verify = gh.calls().filter((call) => call[1] === "verify").at(-1);
+    if (HERE === null) {
+      assert.ok(!verify.includes("--source-digest"));
+      assert.match(ok.stdout, /this is not a git checkout/);
+    } else {
+      assert.deepEqual(verify.slice(-2), ["--source-digest", HERE.commit]);
+      assert.match(ok.stdout, new RegExp(`built from this checkout's commit ${HERE.commit}`));
+    }
+    // A release that is not immutable: refused, and nothing is written; named, it is fetched with the warning.
+    const mutable = fakeGh(join(dir, "mutable"));
+    mutable.publish(TAG, NAME, bundleTarball(files), { repo: REPO, immutable: false, commit: HEAD });
+    const refused = await run("fetch-viewer.mjs", [TAG, "--dist", join(dir, "never")], { bin: mutable.bin });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /^fetch-viewer: verifying that gclone-viewer-9\.8\.7\.tar\.gz is an asset of the immutable release/);
+    assert.ok(!existsSync(join(dir, "never")));
+    const named = await run("fetch-viewer.mjs", [TAG, "--dist", join(dir, "named")], { bin: mutable.bin, env: { GCLONE_MUTABLE_RELEASE: TAG } });
+    assert.equal(named.status, 0, named.stderr);
+    assert.match(named.stderr, /^warning: release v9\.8\.7 of owner\/project is NOT immutable/);
+    assert.match(named.stdout, / {2}release {3}NOT immutable/);
   });
 });
 
@@ -250,9 +363,13 @@ test("check-release, the gate of `npm run deploy`: only the release's bytes pass
     const dist = writeTree(join(dir, "dist"), files);
     const good = await run("check-release.mjs", [dist], { bin: gh.bin });
     assert.equal(good.status, 0, good.stderr);
-    assert.match(good.stdout, /^check-release: dist\/ is the attested viewer of owner\/project v9\.8\.7 — version 9\.8\.7, build 0123456789abcdef, 9 files, tarball sha256 [0-9a-f]{64}\n$/);
-    // the gate verified again: a download and a verification of its own
-    assert.deepEqual(gh.calls().map((call) => call.slice(0, 2).join(" ")), ["release download", "attestation verify"]);
+    assert.match(good.stdout, /^check-release: dist\/ is the attested viewer of owner\/project v9\.8\.7 — version 9\.8\.7, build 0123456789abcdef, 9 files, tarball sha256 [0-9a-f]{64}\n/);
+    // the gate verified again: a download and the verifications of its own
+    assert.deepEqual(gh.calls().map((call) => call.slice(0, 2).join(" ")), ["release download", "attestation verify", "release verify-asset"]);
+    if (HERE !== null) {
+      assert.deepEqual(gh.calls()[1].slice(-2), ["--source-digest", HERE.commit], "held to the commit of the checkout that is deployed");
+      assert.match(good.stdout, new RegExp(`check-release: the release was built from commit ${HERE.commit}, which this checkout is at; the release is immutable`));
+    }
 
     // one byte changed in one file (as an npm dependency's install script could): the manifest no longer matches
     // it, and it is not the release's file
@@ -261,6 +378,8 @@ test("check-release, the gate of `npm run deploy`: only the release's bytes pass
     assert.equal(result.status, 1);
     assert.match(result.stderr, /is NOT the viewer of release v9\.8\.7; nothing is deployed/);
     assert.match(result.stderr, new RegExp(`a/${B}/app\\.js: differs from release v9\\.8\\.7`));
+    // the same build and commit on both sides: it is ./dist that was changed, and fetching again is the cure
+    assert.match(result.stderr, /something changed \.\/dist after it was fetched.*Fetch it again: node scripts\/fetch-viewer\.mjs v9\.8\.7/s);
 
     // … also when the change is made consistently (the manifest updated to match): still not the release's bytes
     const consistent = fakeBundleFiles({ extra: { "app.js": "'use strict';\n// the pagE\n" } });
@@ -308,6 +427,41 @@ test("check-release, the gate of `npm run deploy`: only the release's bytes pass
     result = await run("check-release.mjs", [writeTree(join(dir, "claims"), fakeBundleFiles({ tag: "v9.8.6", version: "9.8.6" }))], { bin: gh.bin });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /downloading gclone-viewer-9\.8\.6\.tar\.gz of release v9\.8\.6/);
+  });
+});
+
+test("a tag that was moved after the fetch: the gate says that the RELEASE changed, and does not advise fetching again", async () => {
+  await inTempDir(async (dir) => {
+    // What was fetched and reviewed: the release as it was built from the checkout's commit.
+    const fetched = fakeBundleFiles({ commit: HEAD });
+    const dist = writeTree(join(dir, "dist"), fetched);
+    // Since then the tag was moved and the release workflow built — and attested — another viewer under the same
+    // name. (An immutable release cannot be changed like this; this is the repository that never turned that on,
+    // with the release named so that the scripts look at it at all.)
+    const moved = fakeBundleFiles({ build: "fedcba9876543210", commit: "e".repeat(40), extra: { "app.js": "'use strict';\n// someone else's page\n" } });
+    const gh = fakeGh(join(dir, "moved"));
+    gh.publish(TAG, NAME, bundleTarball(moved), { repo: REPO, immutable: false, commit: HEAD });
+    const result = await run("check-release.mjs", [dist], { bin: gh.bin, env: { GCLONE_MUTABLE_RELEASE: TAG } });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /is NOT the viewer of release v9\.8\.7; nothing is deployed/);
+    assert.match(result.stderr, new RegExp(`dist/ holds build ${B} of commit ${HEAD}; release v9\\.8\\.7 now holds build fedcba9876543210 of commit e{40} \\(tarball sha256 [0-9a-f]{64}\\)`));
+    assert.match(result.stderr, /THE RELEASE WAS CHANGED after it was fetched: a tag that was moved and built again\. Do not simply fetch again/);
+    assert.doesNotMatch(result.stderr, /Fetch it again/);
+    // Without the name it does not even get that far: the release is not immutable.
+    const plain = await run("check-release.mjs", [dist], { bin: gh.bin });
+    assert.equal(plain.status, 1);
+    assert.match(plain.stderr, /is not an immutable release/);
+
+    // The same for a host: what it serves is no longer "the release", and the message says which of the two may have moved.
+    const host = await serve(fetched);
+    try {
+      const verify = await run("verify-deployed.mjs", [host.origin, TAG], { bin: gh.bin, env: { GCLONE_MUTABLE_RELEASE: TAG } });
+      assert.equal(verify.status, 1);
+      assert.match(verify.stderr, /does NOT serve release v9\.8\.7 of owner\/project \(version 9\.8\.7, build fedcba9876543210, commit e{40}, tarball sha256 [0-9a-f]{64}, attestation verified, release NOT immutable\)/);
+      assert.match(verify.stderr, /either the deployment changed, or the release did\..*if THEY differ, the tag was moved; do not redeploy from it/s);
+    } finally {
+      await host.close();
+    }
   });
 });
 
@@ -377,7 +531,9 @@ test("verify-deployed: a host that serves the release passes; one different byte
         const result = await run("verify-deployed.mjs", [host.origin, TAG], { bin: gh.bin });
         if (ok) {
           assert.equal(result.status, 0, `${name}: ${result.stderr}`);
-          assert.match(result.stdout, /^verify-deployed: http:\/\/127\.0\.0\.1:\d+ serves release v9\.8\.7 of owner\/project \(version 9\.8\.7, build 0123456789abcdef, tarball sha256 [0-9a-f]{64}, attestation verified\)\n/);
+          assert.match(result.stdout, /^verify-deployed: http:\/\/127\.0\.0\.1:\d+ serves release v9\.8\.7 of owner\/project \(version 9\.8\.7, build 0123456789abcdef, commit [0-9a-f]{40}, tarball sha256 [0-9a-f]{64}, attestation verified, immutable release\)\n/);
+          // It deploys nothing, so it holds the release to no checkout: it runs from any machine, at any commit.
+          assert.ok(gh.calls().every((call) => !call.includes("--source-digest")));
           assert.match(result.stdout, /the page says: Status: ready\n/);
           // `/`, `/callback`, `/sw.js` and the six files of the build directory
           assert.equal(host.hits(), 9);

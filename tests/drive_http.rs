@@ -16,7 +16,7 @@ use gclone::backend::drive::{
 };
 use gclone::backend::{Backend, Handle, ObjMeta, PutBody, conformance, get_all, stream_body};
 use gclone::consts::{MULTIPART_MAX, PART_SIZE, UPLOAD_GRANULE};
-use gclone::error::{AuthError, BackendError, QuotaKind};
+use gclone::error::{AuthError, BackendError, QuotaKind, SyncError};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -1405,6 +1405,30 @@ async fn ranged_downloads() {
     ));
 }
 
+/// A Google-native file (a Google Doc) under a name of the vault: Drive reports a size and no
+/// md5 for it, and its content cannot be downloaded. The backend passes exactly that on —
+/// `md5: None` — and the index layer never takes "the right size, no md5" for the object it
+/// accepted (`tests/index_adversary.rs`): the read it falls back to fails here.
+#[tokio::test]
+async fn a_google_native_file_has_a_size_no_md5_and_no_content() {
+    let (fake, b, dir) = setup().await;
+    let data = pattern(56, 777);
+    let meta = put(&b, &dir, "s-looks-like-a-segment", &data).await;
+    assert!(meta.md5.is_some());
+    fake.make_native(&meta.handle.0);
+
+    let listed = b.list(&dir).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].size, listed[0].md5), (777, None));
+    assert!(!listed[0].is_folder);
+    let stat = b.stat(&meta.handle).await.unwrap().unwrap();
+    assert_eq!((stat.size, stat.md5), (777, None));
+    assert!(matches!(
+        get_all(&b, &meta.handle, None).await,
+        Err(BackendError::Fatal { status: 403, .. })
+    ));
+}
+
 #[tokio::test]
 async fn an_abuse_flag_is_acknowledged_on_the_second_request() {
     let (fake, b, dir) = setup().await;
@@ -1771,6 +1795,46 @@ async fn now_ms_follows_the_servers_date_header() {
         server.abs_diff(local) < 3_000,
         "server {server} vs local {local}"
     );
+}
+
+/// The offset the `Date` header gives is the store's word, and it has no bound of its own:
+/// `Backend::clock_offset_ms` reports it, and `gc` — whose every age is measured on that
+/// clock — refuses beyond a day (§5.9, §17.26).
+#[tokio::test]
+async fn the_clock_offset_of_the_date_header_is_reported_and_bounded_for_gc() {
+    use gclone::consts::GC_CLOCK_SKEW_MAX_MS;
+    use gclone::sync::check_gc_clock;
+    const DAY: i64 = 86_400_000;
+    const HOUR: i64 = 3_600_000;
+    let (fake, b, dir) = setup().await;
+    assert!(b.clock_offset_ms().abs() < 3_000);
+    check_gc_clock(b.clock_offset_ms()).unwrap();
+
+    // (`Date` has one-second resolution: an hour more than whole days.)
+    for (skew, text) in [
+        (40 * DAY + HOUR, "40 d ahead of"),
+        (-2 * DAY - HOUR, "2 d behind"),
+    ] {
+        fake.set_date_skew_ms(skew);
+        b.list(&dir).await.unwrap();
+        let offset = b.clock_offset_ms();
+        assert!((offset - skew).abs() < 3_000, "{offset} vs {skew}");
+        assert!(b.now_ms().abs_diff(gclone::util::now_ms()) > 86_000_000);
+        let err = check_gc_clock(offset).unwrap_err();
+        assert!(
+            matches!(err, SyncError::ClockSkew { limit_ms, .. } if limit_ms == GC_CLOCK_SKEW_MAX_MS),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(text), "{err}");
+        assert_eq!(gclone::error::exit_code(&anyhow::Error::new(err)), 5);
+    }
+    // Within the bound the store's clock is followed, as before.
+    fake.set_date_skew_ms(DAY / 2);
+    b.list(&dir).await.unwrap();
+    check_gc_clock(b.clock_offset_ms()).unwrap();
+    fake.set_date_skew_ms(0);
+    b.list(&dir).await.unwrap();
+    assert!(b.clock_offset_ms().abs() < 3_000);
 }
 
 // ---------------------------------------------------------------------------------------------

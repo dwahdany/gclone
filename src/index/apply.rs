@@ -346,6 +346,17 @@ pub struct ApplyStats {
     pub new_conflicts: u64,
 }
 
+/// The time the removals of `seg` count from (§5.2.2): the store's creation time of the
+/// segment object, but never earlier than the `created_ms` the writer sealed into it. The
+/// store's time is whatever the party that created the object asked for — anyone who can
+/// write to the vault folder can re-create a segment under its name with a creation time of
+/// his choosing — while `created_ms` is authenticated. With the later of the two, the store can
+/// only make a removal look more recent, which lengthens the restore window and the gc grace
+/// and never cuts them short (§17.26).
+pub fn removal_time(seg: &SegmentV1, listed_created_ms: u64) -> u64 {
+    listed_created_ms.max(seg.created_ms)
+}
+
 /// Applies every op of `seg` per §5.2.2; op `i` has the stamp `(seg.lamport, seg.device, i)`.
 /// Storage errors propagate with `?`. A `VaultInit` of a newer format rejects the segment
 /// before anything is written.

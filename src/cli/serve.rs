@@ -1,7 +1,8 @@
 //! `gclone serve restic` (SPEC §7.6, §10): the command line, the start-up and the two front
 //! ends of `crate::restic`.
 //!
-//! Only the sign-in is used: `secrets.json` for the login and the shared `token.json`. No
+//! Only the sign-in is used: the device's secrets (`secrets.json` or `secrets.sealed`, §8.2)
+//! for the login and the shared `token.json`. No
 //! vault, no passphrase, no `config.json`, no state lock, no `state.db` — a running server
 //! holds up no other gclone command, and none holds it up.
 
@@ -235,24 +236,26 @@ async fn listen(
     }
     let token = util::hex(&util::random::<16>());
     let app = App::listener(backend, token.clone(), hosts, opts);
+    // Ctrl-C ends it (exit 0), and so do SIGTERM and SIGHUP — what a service manager, `kill`
+    // and a closing terminal send; so does `gclone logout` on this device (exit 4).
+    super::SERVING.store(true, Ordering::SeqCst);
+    let serving = cancel_token().child_token();
+    stop_on_signals(&serving)?;
+
     ui.out(&format!(
         "Serving restic repositories on http://127.0.0.1:{port}/NAME/ — Ctrl-C stops.\n\
          export RESTIC_REST_USERNAME=gclone\n\
          export RESTIC_REST_PASSWORD={token}\n\
          restic -r rest:http://127.0.0.1:{port}/NAME/ snapshots"
     ));
-
-    // Ctrl-C ends it (exit 0), and so do SIGTERM and SIGHUP — what a service manager, `kill`
-    // and a closing terminal send; so does `gclone logout` on this device (exit 4).
-    super::SERVING.store(true, Ordering::SeqCst);
-    let serving = cancel_token().child_token();
-    stop_on_signals(&serving)?;
     let signed_out = Arc::new(AtomicBool::new(false));
     tokio::spawn({
         let (serving, signed_out) = (serving.clone(), signed_out.clone());
-        let secrets = paths.secrets_file();
+        let paths = paths.clone();
         async move {
-            while secrets.exists() {
+            // `secrets.json` or `secrets.sealed`: a move between the two is no sign-out, and
+            // neither is a moment in which another gclone holds the secrets lock (§8.3).
+            while paths.secrets_present() {
                 tokio::select! {
                     () = serving.cancelled() => return,
                     () = tokio::time::sleep(GUARD_INTERVAL) => {}

@@ -244,6 +244,13 @@ instead.
   (`gclone login`) are not affected.
 - **After a suspected leak** of the Worker's secrets: rotate the client secret, run
   `gclone logout --revoke` on one device (this ends the login of every device), then `gclone login` on each device.
+- **After a change of hands** — someone else may have deployed to the Worker, or pointed the domain elsewhere,
+  while the hosted viewer was in use: deploying the release again is not the end of it. A browser that opened the
+  viewer in that time can keep the other party's page (a Service Worker of theirs answers the address from inside
+  the browser), and `verify-deployed` cannot see a browser. **Clear the site's data in every browser that had the
+  viewer open, before the passphrase is typed there again**: the steps are in the repository's `README.md`, "After a
+  change of hands (the hosted viewer)", and `docs/AUTH.md`. What the Worker does about it by itself, and where that
+  stops, is under [What the Worker guarantees](#what-the-worker-guarantees).
 - **Cost and limits.** A login is one start plus one poll every 5 seconds while you enter the code (a minute at
   Google is about 13 requests); a refresh is 1 per device and hour of use — far inside the free plan's
   100,000 requests per day for your own use. The built-in limit of 30 requests per 60 s and client address (answer
@@ -396,9 +403,28 @@ a **build-provenance attestation** — a statement by GitHub that these bytes we
 
 1. The machine you deploy from needs the GitHub CLI: `gh` (`nix-shell -p gh`, or <https://cli.github.com>), signed
    in once (`gh auth login`).
-2. If you release from **your own fork**: turn on the repository setting **immutable releases** (a published
-   file can then not be replaced), make sure artifact attestations are available to the repository (they are for
-   public repositories), and set `GCLONE_REPO=<owner>/<name>` when you run the scripts below.
+2. The repository's releases have to be **immutable** (a repository setting: a published file can then not be
+   replaced and the tag of a release can not be moved). The deploy scripts check that themselves — `gh release
+   verify-asset` passes only for a file of an immutable release — and stop if it is not so: the build's
+   attestation follows the *tag*, and whoever can push a tag could otherwise move it and have the release
+   workflow attest another viewer under the same name. The setting holds for releases published **after** it was
+   turned on. For one that was published before (v0.4.0 of this repository is one), name it:
+   `GCLONE_MUTABLE_RELEASE=v0.4.0 node scripts/…` — the scripts then go on with a warning, and what protects you
+   is comparing the tarball's SHA-256 and the commit they print with what they printed the first time.
+3. If you release from **your own fork**: turn that setting on before the first release, make sure artifact
+   attestations are available to the repository (they are for public repositories), and set
+   `GCLONE_REPO=<owner>/<name>` when you run the scripts below.
+
+**Release-day order.** Since 0.5.0 the release workflow stops at a *draft* release: pushing the tag
+builds, tests and attests the files, and nothing is public yet. The order is: push the tag **alone**
+(`git push origin v0.5.0` — not `main` yet) → wait for the workflow → on the owner's Mac
+`scripts/release-sign-macos.sh <tag>` (it verifies the draft, adds the signed macOS build and
+publishes; main README, "Publishing a release") → deploy the viewer as below → `git push origin
+main`. `fetch-viewer` finds nothing to fetch while the release is still a draft, and `main` waits
+because the install one-liner pipes `install.sh` from it: the new script refuses a latest release
+without attested binaries, which is what the previous release is until this one is published.
+Deploy the 0.5.0 viewer before anybody relies on typing a generated passphrase in another case or
+spacing in the browser: the viewer of 0.4.0 wants it exactly as displayed.
 
 Then [deploy](#deploying-the-viewer), and go through the [checklist](#first-deployment-what-to-check).
 
@@ -416,36 +442,65 @@ node scripts/verify-deployed.mjs https://<host> v0.5.0     # 4
 ```
 
 1. **`fetch-viewer`** downloads `gclone-viewer-0.5.0.tar.gz` from the tag's release into a temporary directory,
-   verifies its attestation —
+   verifies its attestation and that the release is immutable —
 
    ```sh
    gh attestation verify gclone-viewer-0.5.0.tar.gz --repo <owner>/<repo> \
      --signer-workflow <owner>/<repo>/.github/workflows/release.yml \
-     --source-ref refs/tags/v0.5.0 --deny-self-hosted-runners
+     --source-ref refs/tags/v0.5.0 --deny-self-hosted-runners \
+     --source-digest <the commit this checkout is at>
+   gh release verify-asset v0.5.0 gclone-viewer-0.5.0.tar.gz --repo <owner>/<repo>
    ```
 
-   — and only then unpacks it, checks it (`scripts/check-dist.mjs`) and replaces `./dist` with it. It prints the
-   version, the build id and the tarball's SHA-256. It uses Node's built-in modules and `gh` only, which is why it
-   runs **before** `npm ci`: nothing of npm has run when the bundle is verified.
+   — and only then unpacks it, checks it (`scripts/check-dist.mjs`) and replaces `./dist` with it. The first
+   command says: built by this repository's release workflow, on this tag, **from the commit you have checked
+   out** — the Worker's code is deployed from the checkout and the viewer from the release, and the two belong
+   to one commit (if the checkout is somewhere else, the script says `git checkout v0.5.0`). The second says:
+   this file belongs to a release whose tag and files GitHub has fixed. It prints the version, the build id, the
+   commit and the tarball's SHA-256 — **keep those four lines**. It uses Node's built-in modules, `gh` and `git`
+   only, which is why it runs **before** `npm ci`: nothing of npm has run when the bundle is verified.
 2. **`npm ci`** installs wrangler (the locked versions of `package-lock.json`).
 3. **`npm run deploy`** runs `scripts/check-config.mjs`, then `scripts/check-release.mjs` — which reads the tag
-   from `dist`'s manifest, fetches and verifies the release **again**, and compares every file of `./dist` with it:
-   nothing missing, nothing extra, every hash equal — and only then `wrangler deploy`. A `./dist` that anything
-   changed since the fetch does not deploy.
+   from `dist`'s manifest, fetches and verifies the release **again** (both commands above), and compares every
+   file of `./dist` with it: nothing missing, nothing extra, every hash equal — and only then `wrangler deploy`.
+   A `./dist` that anything changed since the fetch does not deploy. It also lists what in the working tree
+   below `worker/` differs from the commit (your `routes` entry in `wrangler.jsonc` is expected there; anything
+   else is code that is not the release's).
 4. **`verify-deployed`** fetches and verifies the release a third time and compares it with what the host serves:
    the page at `/` and `/callback` (around the status line), `/sw.js`, and every file of `/a/<build>/`, each with
    the release's headers. It never reads `./dist`. Run it after every deploy, and whenever you want to — from any
-   machine with `gh` and Node; it needs no Cloudflare access.
+   machine with `gh` and Node; it needs no Cloudflare access and no checkout of the tag (it deploys nothing, so
+   it holds the release to no commit of yours; it prints the release's commit).
+
+**When a check that passed before fails.** `check-release` and `verify-deployed` compare with the release *as it
+is now*. If they stop matching, either your copy or deployment changed — or the release did: a tag that was
+moved and built again. The messages say which it looks like (they name the build and the commit on both sides).
+If the release is what changed, **do not fetch it again** — that deploys exactly the bytes that were swapped in.
+Compare with the four lines `fetch-viewer` printed when you deployed, and find out why they differ first. With
+immutable releases this cannot happen to a published release at all, which is why the scripts insist on it.
 
 What `verify-deployed` proves: the static files and the page **served to these requests** are the release's. It
 finds a stale deployment, a mix-up and a changed file. It cannot prove that the Worker does not answer someone
-else differently — whoever controls the Worker can do that, and no check from outside rules it out.
+else differently — whoever controls the Worker can do that, and no check from outside rules it out. (It asks with
+its own `User-Agent` and without a browser's headers, and it checks that the release's headers are present, not
+that there are no others.) And it says nothing about any **browser**: what a page served by someone else left in
+a browser's profile is not on the host ("After a change of hands", under [Operating it](#operating-it)).
+
+**The Worker's script is not part of the signed release.** The attestation, `check-release` and `verify-deployed`
+are about the viewer's static files. The code in `src/` — which answers `/` and `/callback` by putting the status
+line into the bundle's `index.html`, sets that answer's headers, and runs the sign-in — is bundled by `wrangler`
+and its `esbuild` on your machine, after `npm ci` (186 packages, three of them with install scripts), from your
+working tree. `fetch-viewer` and `check-release` refuse a checkout that is not at the release's commit and list
+local changes below `worker/` (a `routes` entry in `wrangler.jsonc` is expected); they do not refuse those
+changes, nothing signs the bundled script, and nothing compares what Cloudflare runs with the tag. So: deploy from
+a clean checkout of the tag, on a machine you trust, and treat the Cloudflare account like the vault's passphrase.
 
 The viewer shows what it is in its info panel ("Build"), to compare with the release notes: a convenience, not
 evidence — the page reports it about itself.
 
-Every step fails closed: no `gh`, no attestation, an attestation from another workflow or another ref, a tarball
-that holds anything but a bundle → nothing is unpacked, deployed or compared. `SHA256SUMS` of the release is not
+Every step fails closed: no `gh`, no attestation, an attestation from another workflow, another ref or another
+commit, a release that is not immutable, a tarball that holds anything but a bundle → nothing is unpacked,
+deployed or compared. `SHA256SUMS` of the release is not
 used for any of this: it is made by the same workflow run as the files it lists.
 
 **Other ways to deploy.**
@@ -512,7 +567,8 @@ note what you saw.
       refreshes; press Refresh after the hour to see it. `gclone ls` on a device works as before. (Sign in again.)
 - [ ] **9. The release**: the tag's workflow run shows the attestation; `fetch-viewer` accepted the tarball. A
       re-packed copy is refused: `gh attestation verify` (the command above) on a tarball you unpacked and packed
-      again fails. With immutable releases on, replacing a release file is refused by GitHub.
+      again fails. With immutable releases on, replacing a release file is refused by GitHub, and
+      `gh release verify-asset <tag> <tarball>` passes (the scripts run it).
 - [ ] **10. Plain http is not served:** `curl -sI http://<host>/` is a redirect to `https://`;
       `curl -s -X POST http://<host>/web/refresh` is a redirect or `https_required`, never a session answer.
 - [ ] **11. Old logins are closed:** `curl -s -X POST -H 'content-type: application/json' -d '{"refresh_token":"1//0aaaaaaaaaaaaaaaaaaaaaaaaaaa"}' https://<host>/refresh`
@@ -520,7 +576,12 @@ note what you saw.
 - [ ] **12. Local development** (only if you work on the Worker): `npm run dev` serves the page instead of
       redirecting in a loop.
 - [ ] **13. The Service Worker on the phone:** an image and a video open in the viewer on iOS Safari (item 5
-      covers it; a failure here shows as previews that never load).
+      covers it; a failure here shows as previews that never load). Since 0.5.0 this also shows that the worker
+      holding the vault's keys reaches the Service Worker with a request of its own, which the per-file keys are
+      sealed through — tested in desktop Chrome and in Playwright's WebKit and Firefox, **not in Safari itself and
+      not on a phone**. If it does not, the viewer stops before the passphrase screen with "The viewer's Service
+      Worker does not answer the worker that holds the vault's keys…": then that browser cannot use the viewer
+      (nothing is exposed; report it). Check Safari on a Mac the same way, and Firefox.
 - [ ] **14. The session cookie among other cookies.** Sign in, then give the host a second cookie — in the
       browser's developer tools, on the viewer's page: `document.cookie = "probe=1; Path=/; Secure"` — and
       reload: the passphrase screen comes, not "Sign in with Google". (Over HTTP/2 and HTTP/3 a browser sends one
@@ -532,6 +593,17 @@ note what you saw.
       other shows "Sign in with Google".
 - [ ] **16. A PDF.** It is offered as a card with "Open" and opens in a tab of its own, in desktop browsers
       too. In the browser's history that tab's entry carries no file name (an id instead).
+- [ ] **17. The answer to a foreign Service Worker** (0.5.0):
+
+      ```sh
+      curl -s -o /dev/null -D - -H 'Service-Worker: script' -H 'Sec-Fetch-Dest: serviceworker' https://<host>/not-the-viewers.js | grep -i -e '^HTTP' -e clear-site-data
+      curl -s -o /dev/null -D - -H 'Service-Worker: script' -H 'Sec-Fetch-Dest: serviceworker' https://<host>/a/nope.js | grep -i -e '^HTTP' -e clear-site-data
+      curl -s -o /dev/null -D - -H 'Service-Worker: script' -H 'Sec-Fetch-Dest: serviceworker' https://<host>/sw.js | grep -i -e '^HTTP' -e clear-site-data
+      ```
+
+      `404` with `clear-site-data: "cache", "storage"`; `404` without it (the asset layer answers under `/a/`; if
+      the header *is* there, a miss under `/a/` runs the Worker in production — better than expected, tell the
+      project); `200` without it.
 
 If something fails:
 
@@ -806,6 +878,26 @@ and only when Google granted exactly gclone's scopes — `openid`, `email`, `dri
 `/refresh` checks the allowlist (when Google sends an ID token) and the scopes again; `/web/refresh` checks the
 allowlist on every call. The only redirect the Worker ever answers is the one from `http` to `https`.
 
+**A Service Worker that is not the viewer's.** The viewer registers one Service Worker, `/sw.js`, which the asset
+layer serves. When a browser asks the Worker for the *script of a Service Worker* at any other path (the request
+header `Service-Worker: script`, with `Sec-Fetch-Dest: serviceworker` where the browser sends it), that
+registration was made by someone else — while they served this address, or by whatever used the domain before. The
+Worker answers as it would anyway (`404` for an unknown path) and adds `Clear-Site-Data: "cache", "storage"`, which
+asks the browser to drop this site's storage, Service Workers included, and its cache. What that is worth, as
+measured on this code (Chrome 157, Playwright's WebKit 27.2 and Firefox 159, on `http://127.0.0.1` — not on a
+deployment):
+
+| Browser | On that answer |
+|---|---|
+| Chrome (browsers built on it should do the same; not tested) | drops the registration, storage and cache — at the registration's next update check, which is after a visit that still showed the other page |
+| Firefox | nothing: it does not act on `Clear-Site-Data` in the answer to a Service Worker's script |
+| WebKit (Safari's engine) | cleared the storage and **kept the registration** |
+
+And it only reaches paths that run the Worker: a script someone placed under `/a/` (with a `Service-Worker-Allowed`
+header to give it the whole address) is answered by the asset layer, without the header. It is an aid, not the
+remedy. The viewer's own page also unregisters every Service Worker of this address that is not `/sw.js` for `/`,
+each time it loads.
+
 Source: `src/entry.ts` (the module the runtime loads), `src/index.ts` (routing, the https rule, the device routes),
 `src/web.ts` (the four routes of the viewer's sign-in), `src/seal.ts` (the sealed session), `src/google.ts`
 (everything said to Google), `src/pages.ts` and `src/headers.json` (the pages and their headers), `src/reply.ts`
@@ -999,7 +1091,7 @@ npx wrangler deploy --dry-run   # builds the Worker's script, uploads nothing
 
 npm run viewer:build       # the viewer's bundle into ./dist: ../web-core/build.sh, viewer/build.mjs, scripts/check-dist.mjs
 npm run viewer:check       # scripts/check-dist.mjs on ./dist
-npm run test:viewer        # the viewer's data layer in Node (needs ../web-core/pkg and the native gclone binary)
+npm run test:viewer        # the viewer's data layer and the ticket seal in Node (needs ../web-core/pkg and the native gclone binary)
 npm run test:browser       # the viewer in Chrome, WebKit and Firefox (viewer/README.md: what it needs)
 ```
 

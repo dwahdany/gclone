@@ -1,7 +1,8 @@
 //! A stateless, read-only replica: the newest accepted snapshot ⊕ every listed segment it does
 //! not cover, applied in causal order (SPEC §5.2.2, §5.3) into the in-memory `MemIndex` — and
 //! the viewer's queries over it. No rollback marks, no cache, no clock: `removed_ms` is the
-//! store's creation time of each segment object, handed in by the caller.
+//! store's creation time of each segment object, handed in by the caller — or the writer's
+//! own `created_ms` where that is later (`removal_time`).
 //!
 //! What the answers look like — the JSON shapes, the order of a listing, how a search matches —
 //! is `rules` (the main crate's `src/web/rules.rs`), so this viewer and `gclone web` agree by
@@ -16,7 +17,7 @@ use crate::error::{CryptoError, IndexError};
 use crate::format::{
     IndexName, Op, SegmentV1, blob_name, open_segment, open_snapshot, parse_index_name,
 };
-use crate::index::{MemIndex, apply_segment, causal_order, check_snapshot_format};
+use crate::index::{MemIndex, apply_segment, causal_order, check_snapshot_format, removal_time};
 use crate::types::{BlobId, BlobRec, CoveredSeg, DeviceId, EntryKind, Head, SegRef};
 use crate::web::rules::{
     self, EntryJson, InfoJson, LIST_PAGE, LIST_PAGE_MAX, ListJson, RefreshState, RowView,
@@ -61,8 +62,9 @@ pub struct Report {
 
 /// What opens one file and nothing else (design §5): where its ciphertext is, and the key of
 /// that one stream. `key` and `header` are base64url; a zero-length file has neither, and no
-/// location — there is nothing to fetch.
-#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+/// location — there is nothing to fetch. It carries a key: like every key type of the tree it
+/// has no `Debug`, so that no log line or panic message can print one.
+#[derive(Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct Ticket {
     pub v: u32,
     /// The file's name (the last component of its path): what it is served as.
@@ -377,7 +379,8 @@ impl Reader {
         for &i in &order {
             let (seg, origin) = (&self.pending[i].0, &self.origins[i]);
             let created_ms = origin.created_ms;
-            match apply_segment(&mut self.mem, seg, created_ms) {
+            // As the CLI's replica does (`index::commit::apply_and_record`).
+            match apply_segment(&mut self.mem, seg, removal_time(seg, created_ms)) {
                 Ok(_) => {}
                 Err(IndexError::NeedsNewerGclone) => {
                     failed = Some(newer(format!(

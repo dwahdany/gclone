@@ -119,6 +119,8 @@ impl Device {
             .env("GCLONE_CONFIG_DIR", &self.config)
             .env("GCLONE_STATE_DIR", &self.state)
             .env("GCLONE_TEST_FAST_KDF", "1")
+            // No Secure Enclave trial in a spawned gclone (§8.2); see tests/keystore.rs.
+            .env("GCLONE_KEYSTORE_TRIAL", "0")
             .env("HOME", &self.home)
             .env("TZ", "UTC")
             .env_remove("GCLONE_AUTH_URL")
@@ -2167,6 +2169,71 @@ fn logout_ends_a_running_viewer() {
     assert!(!a.state.join("token.json").exists());
 }
 
+/// `gclone keystore use` moves the secrets between `secrets.json` and `secrets.sealed` under
+/// a running viewer (§8.3): the file it watched goes away and the same login is still there.
+/// That is no sign-out — `gclone logout` is, from either store.
+#[test]
+fn the_viewer_survives_the_key_store_moves_and_ends_on_logout() {
+    let (lab, mut a) = vault_with(small_tree);
+    a.env
+        .push(("GCLONE_TEST_KEYSTORE_SEALER".into(), "fake".into()));
+    let v = Viewer::start(&a, &lab);
+    assert_eq!(v.get(&file("docs/a.txt")).body, b"alpha\n");
+    let pass = lab.pass();
+    for round in 0..2 {
+        a.ok(&[
+            "keystore",
+            "use",
+            "enclave",
+            "--yes",
+            "--passphrase-file",
+            &pass,
+        ]);
+        assert!(!a.state.join("secrets.json").exists());
+        assert!(a.state.join("secrets.sealed").exists());
+        // Longer than the guard's interval: it has looked, and found the same login.
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(v.get(&file("docs/a.txt")).body, b"alpha\n", "round {round}");
+        assert_eq!(v.refresh()["ok"], true);
+        a.ok(&["keystore", "use", "file"]);
+        assert!(a.state.join("secrets.json").exists());
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(v.get(&file("docs/a.txt")).body, b"alpha\n", "round {round}");
+    }
+    // A sealed store that cannot be read at the moment the guard looks (here: the file is
+    // damaged) is not a sign-out; the viewer looks again and goes on once it reads again.
+    a.ok(&[
+        "keystore",
+        "use",
+        "enclave",
+        "--yes",
+        "--passphrase-file",
+        &pass,
+    ]);
+    std::thread::sleep(Duration::from_millis(1500));
+    let sealed = a.state.join("secrets.sealed");
+    let good = std::fs::read(&sealed).expect("sealed");
+    std::fs::write(&sealed, b"{ not what it was").expect("damage");
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(v.get(&file("docs/a.txt")).body, b"alpha\n");
+    std::fs::write(&sealed, &good).expect("repair");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(v.get(&file("docs/a.txt")).body, b"alpha\n");
+
+    // Signed out of the sealed store: the viewer ends, as it does for the plain file.
+    let out = a.ok(&["logout"]);
+    assert!(out.contains("Signed out on this device."), "{out}");
+    let log = v.log.clone();
+    assert_eq!(v.ended(), Some(4));
+    let log = std::fs::read_to_string(log).expect("log");
+    assert!(
+        log.contains("The viewer has stopped: this device was signed out"),
+        "{log}"
+    );
+    assert!(!a.state.join("secrets.json").exists());
+    assert!(!a.state.join("secrets.sealed").exists());
+}
+
 /// `logout --forget` under a running viewer: the viewer ends, and what a refresh in its last
 /// moment does is nothing — the state directory with its plaintext index is not written back.
 #[test]
@@ -2208,9 +2275,12 @@ fn logout_forget_ends_the_viewer_and_nothing_is_written_back() {
     assert!(log.contains("The viewer has stopped"), "{log}");
     // Nothing was written back: no state directory, no replica, no index cache, no login.
     assert!(!state.exists(), "the state directory is back");
+    // (What stays in the state root holds nothing of the vault or the login: the backup tag
+    // and the lock file of the key store, §8.1 and §8.3.)
     let left: Vec<_> = std::fs::read_dir(&a.state)
         .expect("state root")
         .map(|e| e.expect("entry").file_name())
+        .filter(|name| name != "CACHEDIR.TAG" && name != "secrets.lock")
         .collect();
     assert!(left.is_empty(), "{left:?}");
     assert!(!a.config.join("config.json").exists());

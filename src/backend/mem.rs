@@ -242,6 +242,17 @@ impl MemBackend {
         obj.claimed_size = Some(size);
     }
 
+    /// A store that reports no md5 for `h` (on Drive: a Google-native file, which any token
+    /// holder can create under any name): listings and `stat` carry `md5: None`, `get` keeps
+    /// serving the bytes. Panics if `h` is not a stored file.
+    pub fn strip_md5(&self, h: &Handle) {
+        let mut s = self.store();
+        let Some(obj) = s.objects.get_mut(&h.0).filter(|o| !o.is_folder) else {
+            panic!("MemBackend::strip_md5: no file with id {:?}", h.0);
+        };
+        obj.md5 = None;
+    }
+
     /// Removes the object (a folder with its content) without a trace.
     pub fn hard_delete(&self, h: &Handle) -> bool {
         self.store().remove(h)
@@ -427,6 +438,21 @@ impl Backend for MemBackend {
         let mut s = self.store();
         s.counters.list += 1;
         Ok(s.visible(|o| o.parent == *parent))
+    }
+
+    async fn list_trashed(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        let mut s = self.store();
+        s.counters.list += 1;
+        // Nothing below a trashed folder: its content is not listed anywhere.
+        let live_parent = parent.is_top() || s.meta_of(parent).is_some_and(|m| !m.trashed);
+        let mut out: Vec<ObjMeta> = s
+            .objects
+            .iter()
+            .filter(|(_, o)| live_parent && o.parent == *parent && o.trashed)
+            .map(|(id, o)| s.meta(id, o))
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {

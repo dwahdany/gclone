@@ -2,9 +2,16 @@
 // and `window.gcloneProvider`, the object the shared page script (app.js) gets its answers and
 // its file addresses from.
 //
-// The page holds ids and paths. It never holds a key or a ticket: the key bundle travels
-// KDF worker → vault worker, tickets travel vault worker → Service Worker, both over ports the
-// page creates and gives away.
+// The page holds ids and paths. It creates the two channels that keys travel on and gives
+// their ports away — the key bundle KDF worker → vault worker, tickets vault worker → Service
+// Worker — and that is a convention of this script, not a boundary: any script in the page
+// could keep a port, or put its own in place. What makes the ticket channel safe to hand out
+// is that tickets cross it sealed to the Service Worker (seal.js), so a port in the wrong
+// hands carries ciphertext. Nothing protects the key bundle's channel in that way, and nothing
+// needs to: a script that is in the page while the passphrase is typed has the passphrase.
+//
+// What the page gets by design, and any script in it with it: every name, and the bytes of
+// every file through `/v/<id>`, for as long as the vault is unlocked.
 'use strict';
 (() => {
   const gclone = (window.gclone = window.gclone || {});
@@ -23,6 +30,8 @@
     const policy = window.trustedTypes.createPolicy('gclone', { createScriptURL: check });
     return (url) => policy.createScriptURL(url);
   })();
+
+  const terminateWorker = Worker.prototype.terminate;
 
   class VaultError extends Error {
     constructor(code, message) {
@@ -81,7 +90,7 @@
         listeners.get(name).push(fn);
       },
       terminate() {
-        worker.terminate();
+        terminateWorker.call(worker);
         if (!gone) fail(new VaultError('locked', 'The vault is locked.'));
       },
     };
@@ -103,7 +112,7 @@
     const paths = new Map();
     const controller = () => navigator.serviceWorker.controller;
 
-    /** A new ticket channel: one end to the vault worker, one to the Service Worker. */
+    /** A new ticket channel: one end to the vault worker, one to the Service Worker. What crosses it is sealed (seal.js). */
     function openChannel() {
       const channel = new MessageChannel();
       vault.send('tickets', {}, [channel.port1]);

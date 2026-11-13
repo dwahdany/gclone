@@ -107,6 +107,10 @@ impl Device {
             .env("GCLONE_CONFIG_DIR", &self.config)
             .env("GCLONE_STATE_DIR", &self.state)
             .env("GCLONE_TEST_FAST_KDF", "1")
+            // No Secure Enclave trial in a spawned gclone (§8.2): what a test finds in the
+            // state root is the same in every profile and on every machine. tests/keystore.rs
+            // is where the key store is tested.
+            .env("GCLONE_KEYSTORE_TRIAL", "0")
             .env("HOME", &self.home)
             .env("TZ", "UTC")
             .env_remove("GCLONE_AUTH_URL")
@@ -704,6 +708,75 @@ fn passphrase_rules() {
         ])
         .ok()
         .stdout_has("Connected to vault");
+
+    // A TYPED passphrase that happens to have the shape of a generated one (26 letters, no
+    // `u`) is set exactly as typed — what gclone 0.4.0 and a 0.4.0 hosted viewer make of it —
+    // and the command says so. It then opens as typed, not in any other spelling.
+    let words = lab.file("words", "the new victim passphrase long\n");
+    let words_vault = s(&lab.path("words-vault"));
+    let out = lab
+        .device("f")
+        .run(&[
+            "login",
+            "--vault-dir",
+            &words_vault,
+            "--passphrase-file",
+            &words,
+        ])
+        .ok()
+        .stderr_has("it is kept exactly as entered");
+    assert!(!out.stderr.contains("the new victim"), "{}", out.stderr);
+    lab.device("g")
+        .run(&[
+            "login",
+            "--vault-dir",
+            &words_vault,
+            "--passphrase-file",
+            &words,
+        ])
+        .ok()
+        .stdout_has("Connected to vault");
+    for other in [
+        "The New Victim Passphrase Long\n",
+        "THENE-WV1CT-1MPAS-SPHRA-SE10NG\n",
+    ] {
+        let file = lab.file("other-spelling", other);
+        lab.device("h")
+            .run(&[
+                "login",
+                "--vault-dir",
+                &words_vault,
+                "--passphrase-file",
+                &file,
+            ])
+            .code(4)
+            .stderr_has("Wrong passphrase");
+    }
+    // A generated passphrase in the form gclone displays: no note, any spelling opens.
+    let long = lab.file("long", "7K2M9-QXA41-TBZR8-D0HNW-ABCDEF\n");
+    let long_vault = s(&lab.path("long-vault"));
+    let out = lab
+        .device("i")
+        .run(&[
+            "login",
+            "--vault-dir",
+            &long_vault,
+            "--passphrase-file",
+            &long,
+        ])
+        .ok();
+    assert!(!out.stderr.contains("kept exactly"), "{}", out.stderr);
+    let sloppy = lab.file("sloppy-long", "7k2m9 qxa41 tbzr8 dohnw abcdef\n");
+    lab.device("j")
+        .run(&[
+            "login",
+            "--vault-dir",
+            &long_vault,
+            "--passphrase-file",
+            &sloppy,
+        ])
+        .ok()
+        .stdout_has("Connected to vault");
 }
 
 #[test]
@@ -976,7 +1049,15 @@ fn a_lost_creation_race_switches_to_the_winner() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     state.sort();
-    assert_eq!(state, [vault_id(&a), "secrets.json".to_string()]);
+    // The vault's state, the secrets, and what every login leaves beside them (§8.1, §8.3).
+    let mut expected = [
+        "CACHEDIR.TAG".to_string(),
+        vault_id(&a),
+        "secrets.json".to_string(),
+        "secrets.lock".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(state, expected);
     b.run(&["ls"]).ok();
     assert_eq!(a.head(), b.head());
     let devices = status_line(&a.run(&["status"]).ok().stdout, "Devices");
@@ -1043,7 +1124,19 @@ fn passwd_writes_a_new_keyfile() {
 
     // A planted name with the highest possible generation: a plain error, no wrap, no panic.
     let planted = w.vault_root().join("gclone-key-ffffffff-00000000");
+    let out = b.run(&["check"]).ok();
+    assert!(
+        !out.stderr.contains("under a keyfile's name"),
+        "{}",
+        out.stderr
+    );
     std::fs::write(&planted, b"junk").unwrap();
+    // Two objects under keyfile names — what a `passwd` that was killed between its put and
+    // its retirement leaves too — are what `check` warns about.
+    b.run(&["check"])
+        .ok()
+        .stderr_has("warning: 2 objects under a keyfile's name are in the vault folder: gclone-key-ffffffff-00000000, gclone-key-00000002-")
+        .stderr_has("Run `gclone passwd` again");
     let out = b
         .run(&["passwd", "--passphrase-file", &w.pass])
         .code(1)
@@ -1071,78 +1164,524 @@ fn passwd_writes_a_new_keyfile() {
         .ok();
 }
 
+/// §2.7, §17.26 (audit I5, L8): `passwd` moves the old keyfile to the trash, where it opens
+/// with the old passphrase for 30 more days; `--purge-old` (or a yes at the terminal) deletes
+/// the retired keyfiles for good, the ones in the trash included. Either way the command says
+/// what is left and that the key did not change — as a warning, which `-q` does not hide.
 #[test]
-fn keyfile_work_is_bounded() {
+fn passwd_can_delete_the_old_keyfiles_for_good() {
     let w = world();
     let root = w.vault_root();
-    let real = keyfiles(&root);
-    assert!(real[0].starts_with("gclone-key-00000001-"));
+    let lab = &w.lab;
+    let trash = Path::new(&w.vault).join(".trash");
+    let trashed_keyfiles = || -> Vec<String> {
+        if !trash.exists() {
+            return Vec::new();
+        }
+        files_under(&trash)
+            .into_iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+            .filter(|n| n.starts_with("gclone-key-"))
+            .collect()
+    };
+    let second = lab.file("second-pass", "the second passphrase of this vault\n");
+    let third = lab.file("third-pass", "the third passphrase of this vault\n");
 
-    // Six junk keyfiles of higher generations: the real one is seventh and is never looked at.
-    let junk: Vec<PathBuf> = (2..8)
-        .map(|g| root.join(format!("gclone-key-{g:08x}-0badf00d")))
-        .collect();
-    for (i, path) in junk.iter().enumerate() {
-        std::fs::write(path, pattern(i as u8, 300)).unwrap();
-    }
-    let b = w.lab.device("b");
-    let out = b
-        .run(&[
-            "-vv",
-            "login",
-            "--vault-dir",
-            &w.vault,
-            "--passphrase-file",
-            &w.pass,
-        ])
-        .code(3)
-        .stderr_has("The vault's keyfile is missing or damaged")
-        .stderr_has("gclone passwd");
-    let read: Vec<&str> = out
-        .stderr
-        .lines()
-        .filter(|l| l.contains("reading keyfile candidate"))
-        .collect();
-    assert_eq!(
-        read.len(),
-        4,
-        "at most KEYFILE_TRY_MAX keyfiles are read: {read:?}"
-    );
-    for generation in ["00000007", "00000006", "00000005", "00000004"] {
-        assert!(read.iter().any(|l| l.contains(generation)), "{read:?}");
-    }
-    assert!(!b.secrets_file().exists() && !b.config_file().exists());
+    // The default: the old keyfile is in the trash, and the output says so — also with -q.
+    let out =
+        w.a.run(&["-q", "passwd", "--passphrase-file", &second])
+            .ok()
+            .stdout_has("Passphrase changed.")
+            .stderr_has("warning: The old keyfile stays in the Drive trash for 30 days")
+            .stderr_has("gclone passwd --purge-old")
+            .stderr_has("The vault's key is unchanged")
+            .stderr_has("There is no re-keying yet");
+    assert!(!out.stdout.contains("Deleted for good"), "{}", out.stdout);
+    assert_eq!(keyfiles(&root).len(), 1);
+    let in_trash = trashed_keyfiles();
+    assert_eq!(in_trash.len(), 1, "{in_trash:?}");
+    assert!(in_trash[0].starts_with("gclone-key-00000001-"));
 
-    // Three planted ones and the real one fourth: it attaches.
-    for path in &junk[..3] {
-        std::fs::remove_file(path).unwrap();
+    // `--purge-old`: generation 2 is deleted from the folder and generation 1 from the trash.
+    w.a.run(&["passwd", "--passphrase-file", &third, "--purge-old"])
+        .ok()
+        .stdout_has("Passphrase changed.")
+        .stdout_has("Deleted for good: 1 old keyfile(s) in the vault folder, 1 in the Drive trash.")
+        .stderr_has("warning: The old keyfiles are gone from this Google account, trash included")
+        .stderr_has("Copies outside its reach stay what they were")
+        .stderr_has("The vault's key is unchanged");
+    let left = keyfiles(&root);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].starts_with("gclone-key-00000003-"), "{left:?}");
+    assert_eq!(trashed_keyfiles(), Vec::<String>::new());
+    // Only the newest passphrase attaches a device; the vault itself is untouched.
+    for old in [&w.pass, &second] {
+        lab.device("x")
+            .run(&["login", "--vault-dir", &w.vault, "--passphrase-file", old])
+            .code(4)
+            .stderr_has("Wrong passphrase");
     }
+    let b = lab.device("b");
     b.run(&[
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &third,
+    ])
+    .ok();
+    b.run(&["cat", ":docs/a.txt"]).ok().stdout_has("alpha");
+    w.a.run(&["check"]).ok();
+
+    // At a terminal, to a person who typed the passphrase, the question is asked — BEFORE
+    // anything is written; the answer decides.
+    let fourth = "the fourth passphrase of this vault";
+    let typed = |pass: &'static str, answer: &'static str| {
+        run_on_login_tty(
+            &w.a,
+            &["passwd"],
+            &[
+                ("New passphrase", pass),
+                ("Repeat:", pass),
+                ("no keeps a way back if the new one is lost. [y/N]", answer),
+            ],
+        )
+    };
+    let out = typed(fourth, "n")
+        .ok()
+        .stdout_has("Passphrase changed.")
+        .stderr_has("The old keyfile stays in the Drive trash");
+    let (question, changed) = (
+        out.stderr.find("[y/N]").expect("the question"),
+        out.stderr
+            .find("The old keyfile stays")
+            .expect("the caveat"),
+    );
+    assert!(question < changed, "{}", out.stderr);
+    assert_eq!(trashed_keyfiles().len(), 1);
+    let out = typed("the fifth passphrase of this vault", "y")
+        .ok()
+        .stdout_has(
+            "Deleted for good: 1 old keyfile(s) in the vault folder, 1 in the Drive trash.",
+        );
+    assert!(
+        out.stderr.contains("The old keyfiles are gone"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(trashed_keyfiles(), Vec::<String>::new());
+    assert_eq!(keyfiles(&root).len(), 1);
+
+    // With `--passphrase-file` nothing is asked, terminal or not (as in `login`): the
+    // invocation that never waited for anybody still does not.
+    let sixth = lab.file("sixth-pass", "the sixth passphrase of this vault\n");
+    let out = run_on_login_tty(&w.a, &["passwd", "--passphrase-file", &sixth], &[])
+        .ok()
+        .stdout_has("Passphrase changed.")
+        .stderr_has("The old keyfile stays in the Drive trash");
+    assert!(!out.stderr.contains("[y/N]"), "{}", out.stderr);
+    assert_eq!(trashed_keyfiles().len(), 1);
+    assert_eq!(keyfiles(&root).len(), 1);
+}
+
+/// The purge question of `passwd` is asked before the new keyfile is written. It used to be
+/// asked after the put and after "Passphrase changed." was printed, with the retirement of
+/// the old keyfile waiting for the answer: Ctrl-C there (or the end of the ssh session) left
+/// the old keyfile in the vault folder — not even in the trash — and the OLD passphrase went
+/// on attaching new devices for good, under the words "Passphrase changed".
+#[test]
+fn an_interrupt_at_the_purge_question_of_passwd_changes_nothing() {
+    let w = world();
+    let root = w.vault_root();
+    let before = keyfiles(&root);
+    assert_eq!(before.len(), 1);
+    let new = "a passphrase that never came to be";
+
+    // Ctrl-C (the terminal's interrupt character) typed at the question.
+    let out = run_on_login_tty(
+        &w.a,
+        &["passwd"],
+        &[
+            ("New passphrase", new),
+            ("Repeat:", new),
+            ("no keeps a way back if the new one is lost. [y/N]", "\u{3}"),
+        ],
+    );
+    assert_ne!(out.code, 0, "interrupted: {}", out.stderr);
+    assert!(
+        !out.stdout.contains("Passphrase changed") && !out.stderr.contains("Passphrase changed"),
+        "nothing was changed, and nothing says so:\n{}\n{}",
+        out.stdout,
+        out.stderr
+    );
+    // Exactly one keyfile is live, and it is the old one; nothing was trashed.
+    assert_eq!(keyfiles(&root), before);
+    assert!(!Path::new(&w.vault).join(".trash").exists());
+    // The old passphrase is the passphrase; the one that was typed opens nothing.
+    let pass_new = w.lab.file("never", &format!("{new}\n"));
+    let c = w.lab.device("c");
+    c.run(&[
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &pass_new,
+    ])
+    .code(4)
+    .stderr_has("Wrong passphrase");
+    c.run(&[
         "login",
         "--vault-dir",
         &w.vault,
         "--passphrase-file",
         &w.pass,
     ])
-    .ok()
-    .stdout_has("Connected to vault");
+    .ok();
 
-    // A vault without any keyfile.
-    for path in &junk[3..] {
-        std::fs::remove_file(path).unwrap();
+    // Declined (the default answer): the change runs through without another pause, and
+    // exactly one keyfile is live — the new one — with the old one in the trash.
+    run_on_login_tty(
+        &w.a,
+        &["passwd"],
+        &[
+            ("New passphrase", new),
+            ("Repeat:", new),
+            ("no keeps a way back if the new one is lost. [y/N]", ""),
+        ],
+    )
+    .ok()
+    .stdout_has("Passphrase changed.");
+    let after = keyfiles(&root);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(after[0].starts_with("gclone-key-00000002-"), "{after:?}");
+    let d = w.lab.device("d");
+    d.run(&[
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &w.pass,
+    ])
+    .code(4)
+    .stderr_has("Wrong passphrase");
+    d.run(&[
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &pass_new,
+    ])
+    .ok();
+}
+
+/// `passwd --purge-old` after the current keyfile was moved to the trash by hand — the
+/// obvious reaction to a leak, in drive.google.com. The purge used to delete from the trash
+/// only generations below the new keyfile's, and the new generation was counted from the
+/// keyfiles that were not in the trash: the new keyfile got generation 1 again, every trashed
+/// keyfile — each opening with an old passphrase — survived, and the command still said "The
+/// old keyfiles are gone from this Google account, trash included".
+#[test]
+fn passwd_purge_old_empties_the_trash_of_keyfiles_whatever_their_generation() {
+    use gclone::backend::{Backend as _, DirBackend};
+    let w = world();
+    let root = w.vault_root();
+    let trash = Path::new(&w.vault).join(".trash");
+    let trashed_keyfiles = || -> Vec<String> {
+        if !trash.exists() {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = files_under(&trash)
+            .into_iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+            .filter(|n| n.starts_with("gclone-key-"))
+            .collect();
+        names.sort();
+        names
+    };
+    let second = w
+        .lab
+        .file("second-pass", "the second passphrase of this vault\n");
+    let third = w
+        .lab
+        .file("third-pass", "the third passphrase of this vault\n");
+    w.a.run(&["passwd", "--passphrase-file", &second]).ok();
+    let live = keyfiles(&root);
+    assert!(live[0].starts_with("gclone-key-00000002-"), "{live:?}");
+
+    // The current keyfile goes to the trash by hand.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let backend = DirBackend::open(Path::new(&w.vault)).unwrap();
+        let found = backend.find_by_name(&live[0]).await.unwrap();
+        assert_eq!(found.len(), 1);
+        backend.trash(&found[0].handle).await.unwrap();
+    });
+    assert_eq!(keyfiles(&root), Vec::<String>::new());
+    let in_trash = trashed_keyfiles();
+    assert_eq!(in_trash.len(), 2, "{in_trash:?}");
+
+    w.a.run(&["passwd", "--passphrase-file", &third, "--purge-old"])
+        .ok()
+        .stdout_has("Passphrase changed.")
+        .stdout_has("Deleted for good: 0 old keyfile(s) in the vault folder, 2 in the Drive trash.")
+        .stderr_has("warning: The old keyfiles are gone from this Google account, trash included");
+    // A generation is never used twice: the trash counted.
+    let left = keyfiles(&root);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].starts_with("gclone-key-00000003-"), "{left:?}");
+    assert_eq!(trashed_keyfiles(), Vec::<String>::new());
+    for old in [&w.pass, &second] {
+        w.lab
+            .device("x")
+            .run(&["login", "--vault-dir", &w.vault, "--passphrase-file", old])
+            .code(4)
+            .stderr_has("Wrong passphrase");
     }
-    std::fs::remove_file(root.join(&real[0])).unwrap();
     w.lab
-        .device("c")
+        .device("y")
         .run(&[
             "login",
             "--vault-dir",
             &w.vault,
             "--passphrase-file",
-            &w.pass,
+            &third,
         ])
+        .ok();
+
+    // Without `--purge-old` a hand-trashed keyfile stays where it is, and nothing is called
+    // gone; the next generation still does not reuse a number.
+    runtime.block_on(async {
+        let backend = DirBackend::open(Path::new(&w.vault)).unwrap();
+        let found = backend.find_by_name(&left[0]).await.unwrap();
+        backend.trash(&found[0].handle).await.unwrap();
+    });
+    let out = w.a.run(&["passwd", "--passphrase-file", &second]).ok();
+    assert!(!out.stderr.contains("are gone"), "{}", out.stderr);
+    let left = keyfiles(&root);
+    assert!(left[0].starts_with("gclone-key-00000004-"), "{left:?}");
+    assert_eq!(trashed_keyfiles().len(), 1);
+}
+
+#[test]
+fn keyfile_work_is_bounded() {
+    let w = world();
+    let root = w.vault_root();
+    let real = keyfiles(&root);
+    assert!(real[0].starts_with("gclone-key-00000001-"));
+    let login = |d: &Device, extra: &[&str]| {
+        let mut args = vec![
+            "-vv",
+            "login",
+            "--vault-dir",
+            &w.vault,
+            "--passphrase-file",
+            &w.pass,
+        ];
+        args.extend_from_slice(extra);
+        d.run(&args)
+    };
+    let read = |out: &Out| {
+        out.stderr
+            .lines()
+            .filter(|l| l.contains("reading keyfile candidate"))
+            .count()
+    };
+
+    // Six junk objects under keyfile names of higher generations. They are looked at — 300
+    // bytes each — and refused before any key derivation; they take no place among the
+    // keyfiles that are tried, so the real one, seventh by its name, opens.
+    let junk = |g: u32| root.join(format!("gclone-key-{g:08x}-0badf00d"));
+    for g in 2..8 {
+        std::fs::write(junk(g), pattern(g as u8, 300)).unwrap();
+    }
+    let b = w.lab.device("b");
+    let out = login(&b, &[]).ok().stdout_has("Connected to vault");
+    assert_eq!(read(&out), 7, "{}", out.stderr);
+    assert!(out.stderr.contains("is not usable"), "{}", out.stderr);
+
+    // An object that is larger than a keyfile can be is not even fetched.
+    std::fs::write(junk(8), pattern(8, 70_000)).unwrap();
+    let out = login(&w.lab.device("b2"), &[]).ok();
+    assert_eq!(read(&out), 7, "{}", out.stderr);
+    std::fs::remove_file(junk(8)).unwrap();
+
+    // What is fetched is bounded: 32 objects. With 40 junk names in front of it the real
+    // keyfile is not reached — and the message says that, not that the keyfile is missing.
+    for g in 8..42 {
+        std::fs::write(junk(g), pattern(g as u8, 300)).unwrap();
+    }
+    let c = w.lab.device("c");
+    let out = login(&c, &[])
+        .code(3)
+        .stderr_has(
+            "None of the 32 object(s) with keyfile names that this login looked at is a keyfile",
+        )
+        .stderr_has("9 more object(s) with keyfile names were not looked at")
+        .stderr_has("gclone login --all-keyfiles")
+        .stderr_has("gclone passwd");
+    assert_eq!(read(&out), 32, "at most KEYFILE_LOOK_MAX objects are read");
+    assert!(!out.stderr.contains("missing or damaged"), "{}", out.stderr);
+    assert!(!c.secrets_file().exists() && !c.config_file().exists());
+    // On request every one of them is looked at.
+    let out = login(&c, &["--all-keyfiles"])
+        .ok()
+        .stdout_has("Connected to vault");
+    assert_eq!(read(&out), 41, "{}", out.stderr);
+
+    // A vault without any keyfile.
+    for g in 2..42 {
+        std::fs::remove_file(junk(g)).unwrap();
+    }
+    std::fs::remove_file(root.join(&real[0])).unwrap();
+    login(&w.lab.device("d"), &[])
         .code(3)
         .stderr_has("keyfile is missing or damaged");
+}
+
+/// Regression (§2.6, §17.26, audit L10): four **well-formed** keyfiles planted under higher
+/// generations — no secret is needed for that, the keyfile of any other vault will do — took
+/// the four places a new device looks at. The real keyfile was never tried and the answer to
+/// the right passphrase was "Wrong passphrase." (exit 4), with no hint that more keyfiles
+/// exist: with no connected device left, the owner would conclude that the passphrase is lost.
+#[test]
+fn planted_keyfiles_do_not_make_the_right_passphrase_wrong() {
+    let w = world();
+    let root = w.vault_root();
+    let real = keyfiles(&root);
+
+    // The attacker's own vault, with his own passphrase; its keyfile, five times, under the
+    // highest generations there are. (The name's hash is of the bytes: nothing to forge.)
+    let his = w.lab.device("attacker");
+    let his_vault = s(&w.lab.path("his-vault"));
+    let his_pass = w.lab.file("his-pass", "the attacker's own passphrase\n");
+    his.run(&[
+        "login",
+        "--vault-dir",
+        &his_vault,
+        "--passphrase-file",
+        &his_pass,
+    ])
+    .ok();
+    let his_root = Path::new(&his_vault).join("gclone");
+    let his_keyfile = keyfiles(&his_root).remove(0);
+    let h8 = his_keyfile.rsplit('-').next().unwrap().to_owned();
+    let bytes = std::fs::read(his_root.join(&his_keyfile)).unwrap();
+    let planted: Vec<PathBuf> = (0..5)
+        .map(|i| root.join(format!("gclone-key-fffffff{i}-{h8}")))
+        .collect();
+    for path in &planted {
+        std::fs::write(path, &bytes).unwrap();
+    }
+    let args = [
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &w.pass,
+    ];
+
+    // The right passphrase, read from a file: four keyfiles are asked (the work of one
+    // attempt), and the answer is that keyfiles were left out — never "Wrong passphrase".
+    let b = w.lab.device("b");
+    let out = b
+        .run(&args)
+        .code(4)
+        .stderr_has("The passphrase does not open the 4 newest keyfiles of this vault, and 2 older keyfiles were not tried")
+        .stderr_has("gclone login --all-keyfiles");
+    assert!(!out.stderr.contains("Wrong passphrase"), "{}", out.stderr);
+    assert!(!b.secrets_file().exists() && !b.config_file().exists());
+    // Asked for, every keyfile is tried: the real one opens.
+    let mut all = args.to_vec();
+    all.push("--all-keyfiles");
+    b.run(&all).ok().stdout_has("Connected to vault");
+    b.run(&["cat", ":docs/a.txt"]).ok().stdout_has("alpha");
+
+    // A passphrase that is wrong for every keyfile is still called wrong — once all were asked.
+    let wrong = w.lab.file("wrong-pass", "certainly not the passphrase\n");
+    let c = w.lab.device("c");
+    let out = c
+        .run(&[
+            "login",
+            "--vault-dir",
+            &w.vault,
+            "--passphrase-file",
+            &wrong,
+        ])
+        .code(4)
+        .stderr_has("2 older keyfiles were not tried");
+    assert!(!out.stderr.contains("Wrong passphrase"), "{}", out.stderr);
+    c.run(&[
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &wrong,
+        "--all-keyfiles",
+    ])
+    .code(4)
+    .stderr_has("Wrong passphrase.");
+
+    // At a terminal the question is asked, and a yes tries the rest with the same passphrase.
+    let d = w.lab.device("d");
+    let out = run_on_login_tty(
+        &d,
+        &["login", "--vault-dir", &w.vault],
+        &[
+            ("Passphrase:", PASS),
+            (
+                "Try it on the 2 older one(s) too (a key derivation each)? [y/N]",
+                "y",
+            ),
+        ],
+    )
+    .ok()
+    .stdout_has("Connected to vault");
+    assert!(!out.stderr.contains("Wrong passphrase"), "{}", out.stderr);
+    // Declined, the passphrase is asked again and nothing is called wrong; the third answer
+    // says what was not tried.
+    let e = w.lab.device("e");
+    let out = run_on_login_tty(
+        &e,
+        &["login", "--vault-dir", &w.vault],
+        &[
+            ("Passphrase:", PASS),
+            ("too (a key derivation each)? [y/N]", "n"),
+            ("Passphrase:", "another guess entirely"),
+            ("too (a key derivation each)? [y/N]", "n"),
+            ("Passphrase:", "and a third one, also wrong"),
+            ("too (a key derivation each)? [y/N]", "n"),
+        ],
+    )
+    .code(4)
+    .stderr_has("older keyfiles were not tried");
+    assert!(!out.stderr.contains("Wrong passphrase"), "{}", out.stderr);
+
+    // With three planted keyfiles the real one is the fourth: no question, no flag.
+    for path in &planted[..2] {
+        std::fs::remove_file(path).unwrap();
+    }
+    w.lab
+        .device("f")
+        .run(&args)
+        .ok()
+        .stdout_has("Connected to vault");
+    // `passwd` on a connected device writes a keyfile ahead of them and retires the rest,
+    // the planted ones included.
+    for path in &planted[..2] {
+        std::fs::write(path, &bytes).unwrap();
+    }
+    w.a.run(&["passwd", "--passphrase-file", &w.pass]).ok();
+    let left = keyfiles(&root);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].starts_with("gclone-key-fffffff5-"), "{left:?}");
+    assert!(!left.contains(&real[0]));
+    w.lab
+        .device("g")
+        .run(&args)
+        .ok()
+        .stdout_has("Connected to vault");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1538,6 +2077,184 @@ fn open_policies_with_an_index_gap() {
     b.run(&["gc"]).ok().stdout_has("Trashed 0 dead blobs");
     w.a.run(&["ls"]).ok();
     assert_eq!(w.a.head(), b.head());
+}
+
+/// Every file under `dir`, sorted.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).expect("read dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The newest index segment in the vault's `index` folder that device `id` wrote.
+fn newest_segment_of(index: &Path, id: &str) -> PathBuf {
+    let mut segments: Vec<PathBuf> = files_under(index)
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            name.starts_with(&format!("s-{id}-"))
+        })
+        .collect();
+    // `s-<device>-<seq: 16 hex digits>-<h8>`: the names of one device sort by sequence number.
+    segments.sort();
+    segments.pop().expect("the device has written a segment")
+}
+
+/// Overwrites `file` in place with as many bytes of junk: what anyone who can write to the
+/// vault folder can do to an object without holding the vault's key.
+fn overwrite_with_junk(file: &Path) -> String {
+    let len = std::fs::metadata(file).unwrap().len() as usize;
+    std::fs::write(file, vec![0x41u8; len]).expect("overwrite");
+    file.file_name().unwrap().to_str().unwrap().to_owned()
+}
+
+/// Regression (§17.26, audit L4): an index object overwritten under its own name silenced the
+/// rollback alarm. The devices that had applied the object looked at the listed *name*, found
+/// it, and said nothing — `status` clean, mutating commands exit 0 — while a device that had
+/// not applied it was held on the older state. Plain deletion of the same object was loud.
+#[test]
+fn an_index_object_overwritten_under_its_name_is_noticed_and_repaired() {
+    let w = world();
+    let a = &w.a;
+    let b = w.join("b");
+    a.run(&["mkdir", ":secret-new-dir"]).ok();
+    b.run(&["ls", ":"]).ok().stdout_has("secret-new-dir/");
+    let index = w.vault_root().join("index");
+    let (_, a_id) = a.identity();
+    let tip = overwrite_with_junk(&newest_segment_of(&index, &a_id));
+
+    // The two devices that had applied it: a warning on read-only commands, exit 3 on the rest.
+    for d in [a, &b] {
+        d.run(&["status"])
+            .ok()
+            .stderr_has("warning:")
+            .stderr_has("rolled back")
+            .stderr_has("gclone repair");
+        d.run(&["ls", ":"]).ok().stdout_has("secret-new-dir/");
+        d.run(&["mkdir", ":x"])
+            .code(3)
+            .stderr_has("rolled back")
+            .stderr_has("gclone repair");
+        d.run(&["gc"])
+            .code(3)
+            .stderr_has("gc needs a complete index");
+    }
+
+    // A device that attaches now is served the older state — and is told that an index object
+    // failed verification, on every command; its gc refuses and names the object.
+    let c = w.lab.device("c");
+    c.run(&[
+        "login",
+        "--vault-dir",
+        &w.vault,
+        "--passphrase-file",
+        &w.pass,
+        "--device-name",
+        "c",
+    ])
+    .ok()
+    .stdout_has("Connected to vault \"gclone\"");
+    let out = c.run(&["ls", ":"]).ok().stderr_has("failed verification");
+    assert!(out.stderr.contains(&tip), "{}", out.stderr);
+    assert!(!out.stdout.contains("secret-new-dir"), "{}", out.stdout);
+    c.run(&["gc", "--orphans"])
+        .code(3)
+        .stderr_has("gc needs a complete index")
+        .stderr_has(&tip);
+
+    // One `repair` on a device that holds the object puts it back for everybody.
+    b.run(&["repair"])
+        .ok()
+        .stdout_has("Republished 1")
+        .stdout_has(&tip)
+        .stdout_has("Index repaired");
+    for d in [a, &b, &c] {
+        let out = d.run(&["ls", ":"]).ok().stdout_has("secret-new-dir/");
+        assert!(!out.stderr.contains("warning:"), "{}", out.stderr);
+        d.run(&["gc"]).ok().stdout_has("Trashed 0 dead blobs");
+    }
+    a.run(&["mkdir", ":after"]).ok();
+    b.run(&["ls", ":"]).ok().stdout_has("after/");
+    c.run(&["status"]).ok();
+    assert_eq!(a.head(), b.head());
+    assert_eq!(a.head(), c.head());
+}
+
+/// Regression (§5.9, §17.26, audit L3): `gc` ran on a replica whose refresh had just ignored an
+/// index object. The segment that records a new file fails verification for device c; fifteen
+/// days later c's `gc --orphans` exited 0 with "Trashed 0 dead blobs (0 B), 1 orphans (…)" —
+/// the blob of a file that is live on device a. It refuses now, in all three steps.
+#[test]
+fn gc_refuses_on_a_device_that_ignored_an_index_object() {
+    let w = world();
+    let a = &w.a;
+    let c = w.join("c"); // attached before the upload below
+    let data = w.vault_root().join("data");
+    let before = files_under(&data);
+
+    let more = w.lab.path("more");
+    let content = pattern(77, 300_000);
+    write(&more.join("precious.bin"), &content);
+    a.run(&["copy", &s(&more), ":more"]).ok();
+    let new_blobs: Vec<PathBuf> = files_under(&data)
+        .into_iter()
+        .filter(|p| !before.contains(p))
+        .collect();
+    assert_eq!(new_blobs.len(), 1, "one new blob for the one new file");
+    let blob = &new_blobs[0];
+
+    // Junk under the name of a's newest segment — the one that records the blob.
+    let index = w.vault_root().join("index");
+    let (_, a_id) = a.identity();
+    let tip = overwrite_with_junk(&newest_segment_of(&index, &a_id));
+
+    // Fifteen days pass (the directory backend's creation time is the file's mtime): for a
+    // device that knows nothing of the blob it is an orphan past the grace.
+    let then = std::time::SystemTime::now() - Duration::from_secs(15 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(blob)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+
+    for args in [
+        &["gc", "--orphans"][..],
+        &["gc"],
+        &["gc", "--purge"],
+        &["gc", "--orphans", "--purge"],
+        &["gc", "-n", "--orphans", "--purge"],
+    ] {
+        let out = c
+            .run(args)
+            .code(3)
+            .stderr_has("gc needs a complete index and did nothing")
+            .stderr_has("failed verification")
+            .stderr_has(&tip)
+            .stderr_has("gclone repair");
+        assert!(!out.stdout.contains("Trashed"), "{args:?}: {}", out.stdout);
+        assert!(blob.exists(), "{args:?}: the live blob is where it was");
+    }
+    assert_eq!(a.bytes(&["cat", ":more/precious.bin"]), content);
+
+    // After the repair, c knows the file; its sweep finds nothing to collect.
+    a.run(&["repair"]).ok().stdout_has("Republished 1");
+    c.run(&["gc", "--orphans", "--purge"])
+        .ok()
+        .stdout_has("Trashed 0 dead blobs (0 B), 0 orphans (0 B)");
+    assert!(blob.exists());
+    assert_eq!(c.bytes(&["cat", ":more/precious.bin"]), content);
 }
 
 /// Regression: a device that had run `gclone logout` could not log in again while its replica
@@ -1939,7 +2656,7 @@ fn restore_mv_and_missing_paths_at_the_command_line() {
         let out = a
             .run(args)
             .code(2)
-            .stderr_has("--json is supported by copy and sync only");
+            .stderr_has("--json is supported by copy, sync and `gclone keystore` only");
         assert_eq!(out.stdout, "");
     }
 
@@ -2308,6 +3025,7 @@ fn default_paths_are_xdg_under_home() {
             .args(args)
             .env("HOME", &home)
             .env("GCLONE_TEST_FAST_KDF", "1")
+            .env("GCLONE_KEYSTORE_TRIAL", "0")
             .env_remove("GCLONE_CONFIG_DIR")
             .env_remove("GCLONE_STATE_DIR")
             .env_remove("XDG_CONFIG_HOME")
@@ -3077,6 +3795,289 @@ async fn drive_mode_varied_tree_round_trip() {
 // Drive mode: an unreachable auth Worker, the wrong Google account, `logout --revoke --forget`
 // ---------------------------------------------------------------------------------------------
 
+/// The high-severity finding of the second key-store review (§8.2, §17.28). A sealed device;
+/// the Secure Enclave answers with an error and then works again — a transient failure, a few
+/// seconds of it are enough. Every command says "the stored key cannot be used any more …
+/// Run `gclone login`"; that login finds "no usable secrets", signs in at Google, and saves
+/// the grant WITHOUT a key before it asks for the passphrase. By then the sealed file opened
+/// again, and the keyless document was re-sealed over it: the only copy of the vault key on
+/// the device was gone before the passphrase was asked — a wrong, forgotten or abandoned
+/// passphrase left the device locked. (Drive vaults only: a directory vault has no keyless
+/// save.) Sealed keys are never replaced by a document without keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_mode_a_transient_enclave_failure_during_login_keeps_the_sealed_key() {
+    let fake = FakeDrive::start().await;
+    let lab = Lab::new();
+    let pass = lab.pass();
+    let auth_url = format!("{}/auth", fake.base());
+    let mut a = drive_device(&lab, &fake, "a");
+    a.env
+        .push(("GCLONE_TEST_KEYSTORE_SEALER".into(), "fake".into()));
+    let login = [
+        "login",
+        &auth_url,
+        "--no-browser",
+        "--passphrase-file",
+        &pass,
+    ];
+    drive_login(&fake, &a, &login).await.ok();
+    let src = lab.path("src");
+    make_tree(&src);
+    run_async(&a, &["copy", &s(&src), ":docs"]).await.ok();
+    let sealed = a.state.join("secrets.sealed");
+    let use_enclave = [
+        "keystore",
+        "use",
+        "enclave",
+        "--yes",
+        "--passphrase-file",
+        &pass,
+    ];
+    run_async(&a, &use_enclave).await.ok();
+    assert!(sealed.exists() && !a.secrets_file().exists());
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    let sealed_before = std::fs::read(&sealed).unwrap();
+    let flaky = |fail: &str| {
+        let mut d = a.clone();
+        d.env
+            .push(("GCLONE_TEST_KEYSTORE_FAIL".into(), fail.to_string()));
+        d
+    };
+
+    // One failed call is not a dead key: the stored key is tried a second time, and the
+    // command simply works. Nobody is sent to `gclone login`.
+    let out = run_async(&flaky("open-first"), &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    assert!(!out.stderr.contains("gclone login"), "{}", out.stderr);
+
+    // Two in a row: the command says what it has to say …
+    run_async(&flaky("open-first-2"), &["ls", ":docs"])
+        .await
+        .code(4)
+        .stderr_has("the stored key cannot be used any more")
+        .stderr_has("tried twice")
+        .stderr_has("The sealed file is kept until that login has the key again.");
+    assert_eq!(std::fs::read(&sealed).unwrap(), sealed_before);
+
+    // … and the login it sends the owner to — with the enclave failing twice and working
+    // from then on, and with a WRONG passphrase — keeps that promise.
+    let wrong = lab.file("wrong-pass", "not the passphrase at all\n");
+    let out = drive_login(
+        &fake,
+        &flaky("open-first-2"),
+        &[
+            "login",
+            &auth_url,
+            "--no-browser",
+            "--passphrase-file",
+            &wrong,
+        ],
+    )
+    .await
+    .code(4)
+    .stderr_has("the stored key cannot be used any more")
+    .stderr_has("Wrong passphrase.");
+    assert!(out.stdout.contains("Signed in"), "{}", out.stdout);
+    assert_eq!(
+        std::fs::read(&sealed).unwrap(),
+        sealed_before,
+        "secrets.sealed is byte for byte what it was"
+    );
+    // The login just made lies in secrets.json without a key; the key is where it was. The
+    // device works, and says where its two halves are.
+    assert_eq!(
+        a.json(&a.secrets_file())["keys"].as_array().unwrap().len(),
+        0
+    );
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    run_async(&a, &["cat", ":docs/a.txt"])
+        .await
+        .ok()
+        .stdout_has("alpha");
+    run_async(&a, &["keystore"]).await.ok().stdout_has(
+        "Secure Enclave of this Mac (secrets.sealed) for the key, secrets.json for the login",
+    );
+
+    // The same with a passphrase prompt that is abandoned (no terminal, no file).
+    let out = drive_login(
+        &fake,
+        &flaky("open-first-2"),
+        &["login", &auth_url, "--no-browser"],
+    )
+    .await;
+    assert_ne!(out.code, 0, "{}", out.stderr);
+    assert_eq!(std::fs::read(&sealed).unwrap(), sealed_before);
+    run_async(&a, &["ls", ":docs"]).await.ok();
+
+    // A login with the passphrase settles the two files into one.
+    drive_login(&fake, &a, &login).await.ok();
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    assert!(a.secrets_file().exists() != sealed.exists(), "one store");
+}
+
+/// F2 of the key-store review (§8.2, §17.28): the device's secrets are sealed, an older gclone
+/// says "not signed in", its `login` signs in and writes `secrets.json` with the login and no
+/// key — and its passphrase prompt is abandoned. The key stays where it is: every command
+/// keeps working with the login just made and the sealed keys, nothing is deleted, and a
+/// later `login` settles the two files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_mode_a_keyless_login_file_beside_the_sealed_store() {
+    let fake = FakeDrive::start().await;
+    let lab = Lab::new();
+    let pass = lab.pass();
+    let auth_url = format!("{}/auth", fake.base());
+    let mut a = drive_device(&lab, &fake, "a");
+    a.env
+        .push(("GCLONE_TEST_KEYSTORE_SEALER".into(), "fake".into()));
+    let login = [
+        "login",
+        &auth_url,
+        "--no-browser",
+        "--passphrase-file",
+        &pass,
+    ];
+    drive_login(&fake, &a, &login).await.ok();
+    let src = lab.path("src");
+    make_tree(&src);
+    run_async(&a, &["copy", &s(&src), ":docs"]).await.ok();
+    let original = a.json(&a.secrets_file());
+    assert_eq!(original["keys"].as_array().unwrap().len(), 1);
+
+    let sealed = a.state.join("secrets.sealed");
+    run_async(
+        &a,
+        &[
+            "keystore",
+            "use",
+            "enclave",
+            "--yes",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .ok();
+    assert!(sealed.exists() && !a.secrets_file().exists());
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    let sealed_before = std::fs::read(&sealed).unwrap();
+
+    // What gclone 0.4.0 writes after the sign-in and before it asks for the passphrase
+    // (its login.rs: `keys: []`): the login alone.
+    let mut keyless = original.clone();
+    keyless["keys"] = serde_json::json!([]);
+    keyless["min_epoch"] = serde_json::json!(0);
+    let write_keyless = |a: &Device| {
+        std::fs::write(
+            a.secrets_file(),
+            serde_json::to_vec_pretty(&keyless).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(a.secrets_file(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write_keyless(&a);
+
+    // Every command keeps working: the login of secrets.json, the keys of secrets.sealed.
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    let more = lab.path("more");
+    write(&more.join("later.txt"), b"later\n");
+    run_async(&a, &["copy", &s(&more), ":docs"]).await.ok();
+    assert_eq!(a.bytes(&["cat", ":docs/later.txt"]), b"later\n");
+    run_async(&a, &["status"])
+        .await
+        .ok()
+        .stdout_has("Key store    Secure Enclave of this Mac (secrets.sealed) for the key, secrets.json for the login")
+        .stderr_has("secrets.json holds a login without a key (an older gclone signed in here)");
+    // Nothing was merged on disk, and nothing was removed.
+    assert_eq!(std::fs::read(&sealed).unwrap(), sealed_before);
+    assert_eq!(a.json(&a.secrets_file())["keys"], serde_json::json!([]));
+    // The move refuses to guess; `login` is how the two files are settled.
+    run_async(
+        &a,
+        &[
+            "keystore",
+            "use",
+            "enclave",
+            "--yes",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .code(1)
+    .stderr_has("Run `gclone login` first");
+    assert_eq!(std::fs::read(&sealed).unwrap(), sealed_before);
+
+    // The sealed keys are for the vault they were sealed for: with another vault in
+    // config.json there is no merged view, and the command says what it says for a login
+    // without a key.
+    let config = a.json(&a.config_file());
+    let mut elsewhere = config.clone();
+    elsewhere["vault_id"] = "ffeeddccbbaa99887766554433221100".into();
+    std::fs::write(a.config_file(), serde_json::to_vec(&elsewhere).unwrap()).unwrap();
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .code(4)
+        .stderr_has("Run `gclone login` to finish connecting this device");
+    std::fs::write(a.config_file(), serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&sealed).unwrap(), sealed_before);
+
+    // `keystore use file` writes the merged view as one plain file …
+    run_async(&a, &["keystore", "use", "file"])
+        .await
+        .ok()
+        .stdout_has("are now one plain file");
+    assert!(!sealed.exists());
+    assert_eq!(a.json(&a.secrets_file())["keys"], original["keys"]);
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("later.txt");
+
+    // … and so does a later `login`, which has the passphrase: back in the sealed store,
+    // the keyless file beside it again, then the login that settles it.
+    run_async(
+        &a,
+        &[
+            "keystore",
+            "use",
+            "enclave",
+            "--yes",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .ok();
+    write_keyless(&a);
+    drive_login(&fake, &a, &login).await.ok();
+    assert!(
+        a.secrets_file().exists() && !sealed.exists(),
+        "exactly one store"
+    );
+    assert_eq!(a.json(&a.secrets_file())["keys"], original["keys"]);
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("later.txt");
+}
+
 /// A device for `FakeDrive`, as in `drive_mode`.
 fn drive_device(lab: &Lab, fake: &FakeDrive, name: &str) -> Device {
     let mut d = lab.device(name);
@@ -3098,8 +4099,24 @@ fn drive_device(lab: &Lab, fake: &FakeDrive, name: &str) -> Device {
 /// and types `answer` when `prompt` shows up, in the given order. `Out::stderr` is everything
 /// the terminal showed (the echo of the answers included).
 fn run_on_tty(d: &Device, args: &[&str], answers: &[(&str, &str)]) -> Out {
+    run_on_a_terminal(d, args, answers, false)
+}
+
+/// As [`run_on_tty`], with the pseudo-terminal as the **controlling** terminal of the binary:
+/// a passphrase is read from `/dev/tty` and from nowhere else, so a prompt for one needs it.
+fn run_on_login_tty(d: &Device, args: &[&str], answers: &[(&str, &str)]) -> Out {
+    run_on_a_terminal(d, args, answers, true)
+}
+
+fn run_on_a_terminal(
+    d: &Device,
+    args: &[&str],
+    answers: &[(&str, &str)],
+    controlling: bool,
+) -> Out {
     use std::io::Read as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::process::CommandExt as _;
 
     let (mut master, mut slave) = (0, 0);
     // SAFETY: openpty only writes the two descriptors, which are owned right below.
@@ -3119,13 +4136,25 @@ fn run_on_tty(d: &Device, args: &[&str], answers: &[(&str, &str)]) -> Out {
     let rc = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
     assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
 
-    let mut child = d
-        .command(args)
+    let mut command = d.command(args);
+    command
         .stdin(Stdio::from(slave.try_clone().expect("dup")))
         .stderr(Stdio::from(slave.try_clone().expect("dup")))
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn gclone");
+        .stdout(Stdio::piped());
+    if controlling {
+        // SAFETY: the closure runs in the forked child before exec and makes only the two
+        // async-signal-safe calls: a new session, with descriptor 0 (the slave side, by then)
+        // as its controlling terminal.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn().expect("spawn gclone");
     let stdout = child.stdout.take().expect("stdout");
     let stdout = std::thread::spawn(move || std::io::read_to_string(stdout).expect("stdout"));
 
@@ -3698,4 +4727,60 @@ async fn drive_mode_wrong_account_after_logout_and_revoke_forget_order() {
     .stdout_has("This device's vault configuration and local state were removed.");
     assert_eq!(fake.revoked(), [token]);
     assert!(!a.secrets_file().exists() && !a.config_file().exists() && !state.exists());
+}
+
+/// §5.9, §17.26 (audit L5): every age `gc` judges by is measured on the store's clock, which is
+/// this device's clock plus whatever the `Date` header of Drive's answers says. A store whose
+/// clock stands a grace period ahead would make everything removed today collectable — and
+/// with `--purge` deleted for good. Beyond a day of difference `gc` does nothing (exit 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_does_not_follow_a_store_clock_that_is_far_from_the_devices() {
+    let lab = Lab::new();
+    let pass = lab.pass();
+    let fake = FakeDrive::start().await;
+    let auth_url = format!("{}/auth", fake.base());
+    let mut a = drive_device(&lab, &fake, "a");
+    a.env.push(("GCLONE_TEST_FAST_PACER".into(), "1".into()));
+    drive_login(
+        &fake,
+        &a,
+        &[
+            "login",
+            &auth_url,
+            "--no-browser",
+            "--passphrase-file",
+            &pass,
+        ],
+    )
+    .await
+    .ok()
+    .stdout_has("Vault created.");
+    run_async(&a, &["gc", "--orphans", "--purge"])
+        .await
+        .ok()
+        .stdout_has("Trashed 0 dead blobs");
+
+    // (`Date` has one-second resolution: an hour more than whole days.)
+    for (skew_hours, text) in [
+        (40 * 24 + 1, "40 d ahead of"),
+        (-31 * 24 - 1, "31 d behind"),
+    ] {
+        fake.set_date_skew_ms(skew_hours * 3_600_000);
+        for args in [&["gc"][..], &["gc", "--orphans", "--purge"], &["gc", "-n"]] {
+            let out = run_async(&a, args)
+                .await
+                .code(5)
+                .stderr_has("safety guard: the store's clock is")
+                .stderr_has(text)
+                .stderr_has("gc did nothing");
+            assert!(!out.stdout.contains("Trashed"), "{}", out.stdout);
+        }
+        // Everything else works on as before.
+        run_async(&a, &["ls", ":"]).await.ok();
+    }
+    fake.set_date_skew_ms(0);
+    run_async(&a, &["gc"])
+        .await
+        .ok()
+        .stdout_has("Trashed 0 dead blobs");
 }

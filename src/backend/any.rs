@@ -65,6 +65,10 @@ impl Backend for AnyBackend {
         delegate!(self, b => b.list_strict(parent).await)
     }
 
+    async fn list_trashed(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        delegate!(self, b => b.list_trashed(parent).await)
+    }
+
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {
         delegate!(self, b => b.find_by_name(name).await)
     }
@@ -87,5 +91,9 @@ impl Backend for AnyBackend {
 
     fn now_ms(&self) -> u64 {
         delegate!(self, b => b.now_ms())
+    }
+
+    fn clock_offset_ms(&self) -> i64 {
+        delegate!(self, b => b.clock_offset_ms())
     }
 }

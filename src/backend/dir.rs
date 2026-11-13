@@ -936,6 +936,36 @@ impl Inner {
         Ok(out)
     }
 
+    /// The objects that were trashed out of `parent` (each sits in a slot of its own).
+    fn list_trashed(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        let items = {
+            let mut map = self.state();
+            self.sync(&mut map)?;
+            let dir = match self.resolve(&map, parent)? {
+                Some((dir, md)) if md.is_dir() && !in_trash(&dir) => dir,
+                _ => return Ok(Vec::new()),
+            };
+            let mut items = Vec::new();
+            for (n, orig) in &map.slots {
+                let (from, name) = split(orig);
+                if from != dir {
+                    continue;
+                }
+                let path = format!("{}/{name}", slot_dir(*n));
+                if let Some(md) = self.lstat(&path)? {
+                    items.push(self.describe(&map, &path, &md)?);
+                }
+            }
+            items
+        };
+        let mut out = self.finish(items)?;
+        for meta in &mut out {
+            meta.parent = parent.clone();
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
     fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {
         let items = {
             let mut map = self.state();
@@ -1204,6 +1234,11 @@ impl Backend for DirBackend {
     async fn list(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
         let parent = parent.clone();
         self.run(move |dir| dir.list(&parent)).await
+    }
+
+    async fn list_trashed(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        let parent = parent.clone();
+        self.run(move |dir| dir.list_trashed(&parent)).await
     }
 
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {

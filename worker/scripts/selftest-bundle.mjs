@@ -136,7 +136,9 @@ export function bundleTarball(files) {
 /**
  * A stand-in for `gh` in a directory to put on PATH. It serves `release download` from `<state>/releases/<tag>/` and
  * accepts `attestation verify` for a file only when `<state>/attested.json` lists its SHA-256 with the repository,
- * the signer workflow and the source ref that the command line names — which is what the real one binds together.
+ * the signer workflow, the source ref and — where `--source-digest` is given — the commit that the command line
+ * names: which is what the real one binds together. `release verify-asset` passes only for a file that
+ * `<state>/immutable.json` lists for that tag and repository, as the real one does for an immutable release.
  * Every call is appended to `<state>/calls.jsonl`.
  */
 export function fakeGh(dir) {
@@ -145,6 +147,7 @@ export function fakeGh(dir) {
   mkdirSync(bin, { recursive: true });
   mkdirSync(join(state, "releases"), { recursive: true });
   writeFileSync(join(state, "attested.json"), "[]");
+  writeFileSync(join(state, "immutable.json"), "[]");
   writeFileSync(join(state, "calls.jsonl"), "");
   const script = join(dir, "fake-gh.mjs");
   writeFileSync(
@@ -167,14 +170,25 @@ if (args[0] === "release" && args[1] === "download") {
 }
 if (args[0] === "attestation" && args[1] === "verify") {
   const digest = createHash("sha256").update(readFileSync(args[2])).digest("hex");
+  const commit = option("--source-digest");
   const ok = JSON.parse(readFileSync(join(state, "attested.json"), "utf8")).some(
-    (a) => a.sha256 === digest && a.repo === option("--repo") && a.repo + "/" + a.workflow === option("--signer-workflow") && a.ref === option("--source-ref"),
+    (a) => a.sha256 === digest && a.repo === option("--repo") && a.repo + "/" + a.workflow === option("--signer-workflow") && a.ref === option("--source-ref") && (commit === undefined || a.commit === commit),
   );
   if (!ok || !args.includes("--deny-self-hosted-runners")) {
     console.error("x verification failed: no attestation matches the policy for sha256:" + digest);
     process.exit(1);
   }
   console.log("ok: verification succeeded");
+  process.exit(0);
+}
+if (args[0] === "release" && args[1] === "verify-asset") {
+  const digest = createHash("sha256").update(readFileSync(args[3])).digest("hex");
+  const ok = JSON.parse(readFileSync(join(state, "immutable.json"), "utf8")).some((r) => r.tag === args[2] && r.repo === option("--repo") && r.sha256 === digest);
+  if (!ok) {
+    console.error("no attestations for tag " + args[2]);
+    process.exit(1);
+  }
+  console.log("ok: the asset is part of the immutable release " + args[2]);
   process.exit(0);
 }
 console.error("fake gh: unexpected command " + args.join(" "));
@@ -186,15 +200,20 @@ process.exit(2);
   return {
     bin,
     command: join(bin, "gh"),
-    /** Publishes `bytes` as an asset of `tag`; with `attest`, also records the attestation the release workflow makes. */
-    publish(tag, name, bytes, { attest = true, repo = "owner/project", workflow = ".github/workflows/release.yml", ref = `refs/tags/${tag}` } = {}) {
+    /**
+     * Publishes `bytes` as an asset of `tag`; with `attest`, also records the attestation the release workflow makes
+     * (for a build from `commit`); with `immutable`, GitHub's attestation of an immutable release with that asset.
+     */
+    publish(tag, name, bytes, { attest = true, immutable = true, repo = "owner/project", workflow = ".github/workflows/release.yml", ref = `refs/tags/${tag}`, commit = FAKE_COMMIT } = {}) {
       mkdirSync(join(state, "releases", tag), { recursive: true });
       writeFileSync(join(state, "releases", tag, name), bytes);
-      if (attest) {
-        const list = JSON.parse(readFileSync(join(state, "attested.json"), "utf8"));
-        list.push({ sha256: sha256(bytes), repo, workflow, ref });
-        writeFileSync(join(state, "attested.json"), JSON.stringify(list));
-      }
+      const add = (file, entry) => {
+        const list = JSON.parse(readFileSync(join(state, file), "utf8"));
+        list.push(entry);
+        writeFileSync(join(state, file), JSON.stringify(list));
+      };
+      if (attest) add("attested.json", { sha256: sha256(bytes), repo, workflow, ref, commit });
+      if (immutable) add("immutable.json", { sha256: sha256(bytes), repo, tag });
     },
     calls: () => readFileSync(join(state, "calls.jsonl"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)),
   };

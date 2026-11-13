@@ -104,6 +104,9 @@ pub async fn run(g: &GlobalOpts, _args: StatusArgs) -> anyhow::Result<i32> {
             (n, Some(cause)) => format!("{n} change(s) not published yet — {cause}"),
         },
     );
+    // §8.2: where this device's login and key are kept, and what the trial has seen.
+    let (key_store, key_store_warnings) = super::keystore::status_lines(&ctx.paths);
+    line("Key store", key_store);
     if stats.conflicts > 0 {
         line(
             "Conflicts",
@@ -115,6 +118,9 @@ pub async fn run(g: &GlobalOpts, _args: StatusArgs) -> anyhow::Result<i32> {
     }
 
     idle_warning(&ctx);
+    for warning in &key_store_warnings {
+        ctx.ui.warn(warning);
+    }
     // §17.18, §17.22: a login from before 0.2.0 is refreshed only by an auth Worker older than
     // 0.4.0; the 0.4.0 Worker answers it `invalid_grant`.
     if matches!(ctx.config.backend, BackendCfg::Drive)

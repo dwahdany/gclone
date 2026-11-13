@@ -3,7 +3,10 @@
 // loads the index, starts the shared page script (app.js) and locks.
 //
 // The page is the UI and nothing else. It sees the passphrase while it is typed and hands it
-// to the KDF worker; it never loads the core, and no key and no ticket ever reaches it.
+// to the KDF worker; it never loads the core. After the unlock nothing that reaches it — or a
+// port it creates — holds a key it could read: tickets cross its channel sealed to the Service
+// Worker (seal.js). Before that, a script in this page has the passphrase, and the port the
+// key bundle travels on.
 // Nothing is kept beyond the tab but the sign-in cookie (HttpOnly, the Worker's) and the sort
 // order. Names of the vault never get into the address, the title or the session history.
 //
@@ -18,6 +21,32 @@
   const token = gclone.token;
   const $ = (id) => document.getElementById(id);
   const shell = $('shell');
+  // What a lock must do, with functions taken now — before any script that arrives later
+  // could put its own in their place — and each step on its own: a step that throws (a
+  // script that redefined `document.body.hidden` to throw kept the whole lock from happening,
+  // for this tab and for every later Lock, clock and Sign out) does not keep the next from
+  // running. This narrows what a script in the page can do after the fact; it does not make
+  // the page safe from one (it can still keep a lock from being asked for, design §7.1).
+  const postToServiceWorker = window.ServiceWorker ? ServiceWorker.prototype.postMessage : null;
+  const terminateWorker = window.Worker ? Worker.prototype.terminate : null;
+  const attempt = (fn) => { try { fn(); } catch (_) { /* the next step still happens */ } };
+  /** Tells the Service Worker to forget, with the function taken at load. */
+  function forgetInServiceWorker() {
+    attempt(() => {
+      const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
+      if (controller && postToServiceWorker) postToServiceWorker.call(controller, { type: 'forget' });
+    });
+  }
+  /**
+   * The irreversible half of a lock, before anything of the DOM or the history is touched:
+   * the Service Worker forgets, the vault worker (which holds the master keys) and the KDF
+   * worker end. After this the page holds nothing of the vault.
+   */
+  function dropVault() {
+    forgetInServiceWorker();
+    attempt(() => { if (vault) vault.terminate(); });
+    attempt(() => endKdf());
+  }
 
   const MINUTE = 60 * 1000;
   const IDLE_LOCK = 15 * MINUTE; // without input
@@ -35,6 +64,8 @@
   const LOCKED_ELSEWHERE = 'The vault was locked in another tab.';
   const OUT_ELSEWHERE = 'You signed out in another tab.';
   const NO_SERVICE_WORKER = 'The viewer\'s Service Worker is gone (this site\'s data was cleared). Unlock the vault again.';
+  const NO_SEAL = 'The viewer\'s Service Worker does not answer the worker that holds the vault\'s keys, so no file could be opened. Reload the page; if that does not help, close the other tabs of the viewer and try again.';
+  const VAULT_STARTS = 3; // vault workers started before the viewer gives up on reaching its Service Worker
 
   // ---- small things ---------------------------------------------------------------------------
 
@@ -217,6 +248,19 @@
   async function startServiceWorker() {
     const sw = navigator.serviceWorker;
     sw.startMessages();
+    // The viewer has one Service Worker: `/sw.js`, for the whole origin. A registration of
+    // another script, or for another scope, is not this build's — it is what someone who
+    // served this origin before left in the browser (a worker for `/callback` alone would
+    // take the way back from Google). It is removed whenever this page gets to run. (A foreign
+    // worker for the whole origin answers `/` itself, and this page never runs: that takes
+    // clearing the site's data by hand — README, "After a change of hands".)
+    try {
+      for (const other of await sw.getRegistrations()) {
+        const worker = other.active || other.waiting || other.installing;
+        const own = other.scope === `${location.origin}/` && worker && new URL(worker.scriptURL).pathname === '/sw.js';
+        if (!own) await other.unregister();
+      }
+    } catch (_) { /* a browser that does not list them: the registration below still takes the origin */ }
     let registration;
     try {
       registration = await sw.register(scriptUrl('/sw.js'), { scope: '/' });
@@ -343,9 +387,10 @@
 
   function endKdf() {
     if (!kdf) return;
-    clearTimeout(kdf.timer);
-    kdf.worker.terminate();
+    const ending = kdf;
     kdf = null;
+    attempt(() => clearTimeout(ending.timer));
+    attempt(() => terminateWorker.call(ending.worker));
   }
 
   /** The KDF worker of this unlock screen: made for the first attempt, reused for the next. */
@@ -385,19 +430,33 @@
   async function findVault() {
     work('Looking for your vault…');
     try {
-      vault = gclone.createVault();
-      vault.on('gone', (error) => {
-        if (error.code === 'gone') stop(UPDATED);
-      });
-      vault.on('progress', (state) => {
-        $('work-detail').textContent = `${mib(state.done)} of ${mib(state.total)}`;
-        meter(state.done, state.total);
-      });
-      vault.on('load-begin', (state) => flags.set('gclone.load', String(state.total)));
-      vault.on('load-end', () => flags.remove('gclone.load'));
-      vault.on('confirm', confirmIndex);
       const current = await token.get(false).then(() => token.peek());
-      await vault.call('init', { token: current ? current.token : null, exp: current ? current.exp : 0 });
+      // The vault worker seals tickets to the Service Worker, whose key it asks for itself
+      // (seal.js). A worker whose requests the engine did not put under the Service Worker
+      // (WebKit, when two tabs load the worker's script at the same moment) cannot: it is
+      // replaced here, where it holds nothing yet.
+      for (let start = 1; ; start += 1) {
+        vault = gclone.createVault();
+        vault.on('gone', (error) => {
+          if (error.code === 'gone') stop(UPDATED);
+        });
+        vault.on('progress', (state) => {
+          $('work-detail').textContent = `${mib(state.done)} of ${mib(state.total)}`;
+          meter(state.done, state.total);
+        });
+        vault.on('load-begin', (state) => flags.set('gclone.load', String(state.total)));
+        vault.on('load-end', () => flags.remove('gclone.load'));
+        vault.on('confirm', confirmIndex);
+        const started = await vault.call('init', { token: current ? current.token : null, exp: current ? current.exp : 0 });
+        if (started.sealed) break;
+        vault.terminate();
+        vault = null;
+        if (start >= VAULT_STARTS) {
+          stop(NO_SEAL);
+          return;
+        }
+        await sleep(200 * start);
+      }
       const found = await vault.call('discover');
       if (found.vaults.length === 0) {
         stop(found.unreadable ? NEWER
@@ -598,14 +657,11 @@
     if (leaving) return;
     leaving = true;
     unlocked = false;
+    dropVault();
     // Nothing of the list is painted after this task.
-    document.body.hidden = true;
-    const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
-    if (controller) controller.postMessage({ type: 'forget' });
-    if (vault) vault.terminate();
-    endKdf();
-    history.replaceState(null, '', '/');
-    if (typeof note === 'string' && note) flags.set('gclone.note', note);
+    attempt(() => { document.body.hidden = true; });
+    attempt(() => history.replaceState(null, '', '/'));
+    attempt(() => { if (typeof note === 'string' && note) flags.set('gclone.note', note); });
     location.reload();
   }
 
@@ -634,9 +690,8 @@
         else if (screen !== 'signin' && screen !== 'out') {
           // On its way to the list, or at the passphrase: the session it relies on is gone.
           leaving = true;
-          endKdf();
-          if (vault) vault.terminate();
-          flags.set('gclone.note', OUT_ELSEWHERE);
+          dropVault();
+          attempt(() => flags.set('gclone.note', OUT_ELSEWHERE));
           location.reload();
         }
       }
@@ -653,22 +708,25 @@
     if (leaving) return;
     leaving = true;
     unlocked = false;
-    document.body.hidden = true;
-    const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
-    if (controller) controller.postMessage({ type: 'forget' });
-    if (vault) vault.terminate();
-    endKdf();
-    history.replaceState(null, '', '/');
+    dropVault();
+    attempt(() => { document.body.hidden = true; });
+    attempt(() => history.replaceState(null, '', '/'));
     tellTabs('outgoing');
+    let failure = null;
     try {
       await token.post('/web/logout', {});
+    } catch (error) {
+      failure = error;
+    }
+    // Whatever the steps below do, the page loads again: each on its own.
+    if (!failure) {
       // The answer cleared this site's storage; what a browser left is removed here.
-      try { localStorage.clear(); sessionStorage.clear(); } catch (_) { /* no storage */ }
-      flags.set('gclone.out', '1');
+      attempt(() => { localStorage.clear(); sessionStorage.clear(); });
+      attempt(() => flags.set('gclone.out', '1'));
       // The cookie is gone: the other tabs forget the vault and go to the sign-in screen.
       tellTabs('out');
-    } catch (error) {
-      flags.set('gclone.note', `The sign-out did not reach the server, so this browser is still signed in: ${error.message}`);
+    } else {
+      attempt(() => flags.set('gclone.note', `The sign-out did not reach the server, so this browser is still signed in: ${failure.message}`));
       // Still signed in — but no tab keeps the vault open after "Sign out".
       tellTabs('lock');
     }
@@ -727,8 +785,7 @@
     endKdf();
     // A tab that goes — closed, reloaded, or taken to another address — leaves neither a
     // ticket nor the token behind in the Service Worker. (Streams that are open finish.)
-    const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
-    if (unlocked && controller) controller.postMessage({ type: 'forget' });
+    if (unlocked) forgetInServiceWorker();
     // A page that leaves in the ordinary way was not killed in the middle of anything.
     flags.remove('gclone.kdf');
     flags.remove('gclone.load');

@@ -204,6 +204,13 @@ jobs:
             web-core -> target
       # The native binary writes the fixture vault.
       - run: cargo build --release --locked
+      # macOS only, and they want the release binary that was just built: install.sh with a signed build in the
+      # release (codesign), and scripts/release-sign-macos.sh from step 1 to step 16 against a fake release
+      # directory and a fake gh, with an ad hoc signature (no identity, no keychain, no network).
+      - name: install.sh with a signed macOS build
+        run: sh tests/install/test.sh
+      - name: The release-signing script against a fake release
+        run: bash tests/release/selftest.sh
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -302,6 +309,8 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck -s sh install.sh tests/install/test.sh
+      # The release-signing script of the owner's Mac, its self-test and the fake gh of that test (bash).
+      - run: shellcheck scripts/release-sign-macos.sh tests/release/selftest.sh tests/release/fake-gh.sh
       # The shell scripts of the hosted viewer: the wasm build and its test runner, the fixture makers, CI's own.
       - run: shellcheck -s sh web-core/build.sh web-core/test/run.sh .github/scripts/*.sh worker/test/e2e/fixtures/*.sh
       # Against a fake release and a fake GitHub on loopback; with dash (Ubuntu's sh) and bash.

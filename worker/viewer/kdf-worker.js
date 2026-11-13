@@ -1,8 +1,13 @@
 // gclone viewer — the KDF worker: one per visit of the unlock screen. It runs Argon2id and
 // opens a keyfile, gives the key bundle to the vault worker over the port it was handed —
-// never to the page — and is terminated by the page. Its wasm memory grows by what the
-// keyfile asks for (256 MiB as the CLI writes them) and never shrinks: that is why this is a
-// worker of its own, and why every attempt of one unlock screen reuses it.
+// never in a message to the page — and is terminated by the page. Its wasm memory grows by
+// what the keyfile asks for (256 MiB as the CLI writes them) and never shrinks: that is why
+// this is a worker of its own, and why every attempt of one unlock screen reuses it.
+//
+// The port is the page's to hand out, and this worker cannot tell whose it is. That is not
+// what keeps the bundle from a script in the page: nothing does, at this moment — such a
+// script has the passphrase that this worker is about to be sent. (Tickets, which are issued
+// for as long as the vault stays unlocked, are another matter: seal.js.)
 //
 // The candidate loop is the CLI's (`cli::login::unlock`): the passphrase is tried on each
 // candidate, highest generation first. `wrong-passphrase` keeps the candidate; `damaged`,

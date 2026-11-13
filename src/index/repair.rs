@@ -9,8 +9,8 @@ use bytes::Bytes;
 use super::commit::{apply_and_record, tips};
 use super::refresh::{Pulled, is_superset};
 use super::{RepairReport, Vault, blocking, fresh_ids, put_retrying};
-use crate::backend::{Backend, Handle};
-use crate::error::{IndexError, StateError};
+use crate::backend::{Backend, Handle, ObjMeta, md5_of};
+use crate::error::{BackendError, IndexError, StateError};
 use crate::format::{
     IndexName, SnapshotV1, open_segment, open_snapshot, parse_index_name, segment_name,
 };
@@ -104,6 +104,11 @@ impl<B: Backend> Vault<B> {
 
     /// Step 2: every object in the local index cache that is neither listed nor covered by an
     /// accepted listed snapshot is un-trashed, or put again under a new id.
+    ///
+    /// "Listed" means the cached bytes, not the name (§5.3 presence, §17.26): an object that
+    /// stands under the name of a cached one with another size or md5 was overwritten or
+    /// planted. It can pass acceptance for nobody — the name carries the hash of the content
+    /// it belongs to — so it is moved to the trash and the cached object is put in its place.
     async fn republish(
         &self,
         pulled: &Pulled,
@@ -163,6 +168,16 @@ impl<B: Backend> Vault<B> {
             let Some(bytes) = self.cache_read(&name) else {
                 continue;
             };
+            let (size, md5) = (bytes.len() as u64, md5_of(&bytes));
+            let listed: &[ObjMeta] = match kind {
+                IndexName::Segment { .. } => pulled.listed.segs.get(&name),
+                IndexName::Snapshot { .. } => pulled.listed.snaps.get(&name),
+            }
+            .map_or(&[], Vec::as_slice);
+            // The store holds this very object: by size and md5, and where it reports no md5,
+            // by its content — never by the size alone (a plant of the right size under the
+            // name would otherwise keep the lost object from being published again).
+            let held = self.find_object(&name, listed, size, &md5).await?.is_some();
             // Nothing is published that would not be accepted.
             let keys = self.keys.clone();
             let object = name.clone();
@@ -173,7 +188,7 @@ impl<B: Backend> Vault<B> {
                         seq,
                         h4: h8,
                     };
-                    if pulled.listed.segs.contains_key(&name)
+                    if held
                         || listed_snapshots
                             .iter()
                             .any(|s| s.covered.binary_search(&identity).is_ok())
@@ -187,7 +202,7 @@ impl<B: Backend> Vault<B> {
                     .await?
                 }
                 IndexName::Snapshot { .. } => {
-                    if pulled.listed.snaps.contains_key(&name) {
+                    if held {
                         continue;
                     }
                     let others = listed_snapshots.clone();
@@ -209,17 +224,41 @@ impl<B: Backend> Vault<B> {
             };
 
             let place = places.remove(&name).filter(|id| !id.is_empty());
-            if let Some(id) = &place {
-                match self.backend.stat(&Handle(id.clone())).await? {
-                    Some(m) if m.trashed && m.name == name => {
-                        self.backend.untrash(&m.handle).await?;
-                        report.untrashed.push(name);
-                        continue;
+            // The object this replica knew, if it still holds the cached bytes under its name.
+            let known = match &place {
+                Some(id) => match self.backend.stat(&Handle(id.clone())).await? {
+                    Some(m)
+                        if !m.is_folder
+                            && m.name == name
+                            && self.is_object(&name, &m, size, &md5).await? =>
+                    {
+                        Some(m)
                     }
-                    // Present under its name: only the listing lags.
-                    Some(m) if m.name == name => continue,
-                    _ => {}
+                    _ => None,
+                },
+                None => None,
+            };
+            // Present under its name: only the listing lags.
+            if known.as_ref().is_some_and(|m| !m.trashed) {
+                continue;
+            }
+            // What stands under the name with other bytes makes room first: a directory
+            // vault holds one object per name, and no device can use this one.
+            for impostor in listed {
+                tracing::warn!(
+                    "index object {name} in the store is not the object this device holds \
+                     ({} bytes there, {size} here): moved to the trash and put again",
+                    impostor.size
+                );
+                match self.backend.trash(&impostor.handle).await {
+                    Ok(()) | Err(BackendError::NotFound) => {}
+                    Err(e) => return Err(e.into()),
                 }
+            }
+            if let Some(m) = known {
+                self.backend.untrash(&m.handle).await?;
+                report.untrashed.push(name);
+                continue;
             }
             let [id] = fresh_ids(&*self.backend).await?;
             let index = &self.handles.index;

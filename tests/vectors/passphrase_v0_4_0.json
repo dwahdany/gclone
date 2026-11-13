@@ -1,0 +1,33 @@
+{
+  "about": "gclone format v1 — frozen keyfiles sealed by gclone 0.4.0 (tag v0.4.0), the last release whose passphrase normalisation knew only the 20-symbol generated shape (SPEC §2.6, §17.26). Written once by a throw-away test against the v0.4.0 source: KeyfilePayload::from_keyring(Keyring{vault_id, epoch 1: mk}, gen 1, by \"gclone 0.4.0\", 1794500000000), Passphrase::set_checked(entered), seal_keyfile with m_kib 8192, t 1, p 1. Every later gclone must open each keyfile with the passphrase as it was entered then; never edit by hand.",
+  "kdf": {
+    "m_kib": 8192,
+    "t": 1,
+    "p": 1
+  },
+  "vault_id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+  "mk": "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3da",
+  "keyfiles": [
+    {
+      "what": "generated-20",
+      "entered": "7K2M9-QXA41-TBZR8-D0HNW",
+      "normalised_by_0_4_0": "7K2M9-QXA41-TBZR8-D0HNW",
+      "name": "gclone-key-00000001-70f68ab9",
+      "keyfile": "47434b3101130000000020000000000100000001bfb492515ef99e8ad95436808267dd5a4743533101100500000000005bcfcfe712973f861ffc877f2cfaa293ce0abb768cd95888a40c3d6d1b4cf615f5eadac0b3abf9935225f4094be958806828732c908e8653a2545ded1d98c38203b2b090176fde0629ca92c0fc40030705192a21f85912dcc8e90cff60da6e2e1be8271de4efd296621a7b9b04c4621dad35e1c9b14d1345bc3e9f536a8eaeccc1064233a5cf02c10cd831fd5724ff0806c28e37fbbe234dbf051c0956b934ce59e8a9a50c40e502b0afc35de6d6c65a7f3c6b384cc4fc939f612b438b09c1bea5e9fe2191bb49a7b67fd7a7b8b81edda7e6e33c08438eb8d9ee7f1331fc681e19a27238acec413717256db00194db2b23d0c9449081f149eacba836dac28d84f3408f"
+    },
+    {
+      "what": "typed-26-shape",
+      "entered": "maple tiger candle stone wharf",
+      "normalised_by_0_4_0": "maple tiger candle stone wharf",
+      "name": "gclone-key-00000001-41f67d5e",
+      "keyfile": "47434b3101130000000020000000000100000001cc12e32fefa5ea72dcf0cd5f0626ca3047435331011005000000000023a7c406622963eee15967513b35bb32cfe6c3d5545464439c83c001f9529d997b896d5bb4fd1527307e36fa5454cf6bedf2dc3e2b34d9d2f18f71420a83f7032e0d814170b476ddcea688131694c9797b3fba9aa35aa48200deb3589900d853eed628fa661df628e3d2aeceeb548eec8b36bea317c57b1a888e9672d5c5586757a83686e879fb478671d0a4219dd80eacaa9639b86e638c2f7d43ed471bd516a856b58600e242bec70012c525e5fe1483f28912b05779fa0d6bb491d667ab0ab3b1df1058525fbbd129a4bb95634563835922a0122dd7182fd9f701db37fae84407ba581766e2ea2e91d752a8a41dd1b04b073c3060b75d962e9be7db0e41e47f30b0"
+    },
+    {
+      "what": "typed-other",
+      "entered": "correct horse battery staple",
+      "normalised_by_0_4_0": "correct horse battery staple",
+      "name": "gclone-key-00000001-b9ecaa23",
+      "keyfile": "47434b3101130000000020000000000100000001587574720aa2b14447c22f116b706077474353310110050000000000350b9fed3301e4d0ef91801fd3991ad4c92538cb6144d5263f7bbaba0338966120c2282fe057f5e52f835e8a9dee1eea8f211b87a530a838d5fe9f8e80b797a365a22f3aeca952c0759a2968208f16c38c9b6abf9a19f6cc977ca7f16503fefbfb490ef3d6bbd962d053d1d6379222b098e087da68ec2a6c45e9a0bbf780765b3f3b8f2d3d7493e1eeeace251a34042f8ae4a48581e67705439fe0f1730eaebd7c1e8368ea3e9e2d5a5a2546fe536ac86f3fd4f8f7d7855110e7ca4a9ab75ad37d53372a787a9cb02490aa2a05f470a4c78f4256386e6ef7ebca55e7a8c75b0df3c91dfebf4e191f4a1fa44d4ec9727c7206637ee45f472542bdc21dca951233f54e22"
+    }
+  ]
+}

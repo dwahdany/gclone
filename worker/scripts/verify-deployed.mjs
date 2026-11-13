@@ -4,7 +4,7 @@
 //   node scripts/verify-deployed.mjs https://<host> --dist <dir>     (a local build; no attestation is involved)
 //
 // The expected bytes come from releaseBundle(tag) (release-bundle.mjs) — a fresh download whose attestation is
-// verified — and never from `worker/dist/`. Compared: `/` and `/callback` (the page, with the Worker's status line
+// verified, of a release that is verified to be immutable — and never from `worker/dist/`. Compared: `/` and `/callback` (the page, with the Worker's status line
 // taken out again), `/sw.js`, and every file of the build directory, the manifest included; and on each the header
 // set of the bundle's `_headers`.
 //
@@ -120,12 +120,17 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     } else {
       if (args.length !== 2) throw new Error(usage);
       bundle = releaseBundle(args[1]);
-      what = `release ${bundle.tag} of ${bundle.repo} (version ${bundle.version}, build ${bundle.build}, tarball sha256 ${bundle.tarball.sha256}, attestation verified)`;
+      what = `release ${bundle.tag} of ${bundle.repo} (version ${bundle.version}, build ${bundle.build}, commit ${bundle.manifest.commit}, tarball sha256 ${bundle.tarball.sha256}, attestation verified, ${bundle.immutable ? "immutable release" : "release NOT immutable"})`;
     }
     try {
       const { differences, status, checked } = await verifyDeployed(origin, bundle);
       if (differences.length > 0) {
-        throw new Error(`${origin} does NOT serve ${what}:\n${differences.map((d) => `  - ${d}`).join("\n")}`);
+        // A host that matched before and no longer does: the deployment changed — or the release did (a moved tag).
+        const hint =
+          args[1] === "--dist"
+            ? ""
+            : `\nIf this host served this release before: either the deployment changed, or the release did. Compare the build, the commit and the tarball's SHA-256 above with what fetch-viewer printed when the release was deployed — if THEY differ, the tag was moved; do not redeploy from it before you know why.`;
+        throw new Error(`${origin} does NOT serve ${what}:\n${differences.map((d) => `  - ${d}`).join("\n")}${hint}`);
       }
       console.log(`verify-deployed: ${origin} serves ${what}`);
       console.log(`  ${checked} answers compared: the page (/ and /callback), /sw.js and every file of /a/${bundle.build}/, each with the release's headers`);

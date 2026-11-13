@@ -1276,12 +1276,44 @@ fn passphrase_from_input_table() {
     assert_eq!(shown("0123456789abcdefghjk"), "01234-56789-ABCDE-FGHJK");
     assert_eq!(shown("mnpqrstvwxyz01234567"), "MNPQR-STVWX-YZ012-34567");
 
+    // … and so is the 26-symbol shape that gclone generates since 0.5.0 (5-5-5-5-6)
+    let canonical = "ABCDE-FGHJK-MNPQR-STVWX-YZ0123";
+    for typed in [
+        "abcde-fghjk-mnpqr-stvwx-yz0123",
+        "ABCDE FGHJK MNPQR STVWX YZ0123",
+        "ABCDE-FGHJK-MNPQR-STVWX-YZ0123",
+        "abcdefghjkmnpqrstvwxyz0123",
+        "abcde-fghjk-mnpqr-stvwx-yz012-3",
+        " AbCdE\tfghjk - mnpqr--stvwx yzo123 \n",
+        "abcdefghjkmnp qrstvwxyz0123\r\n",
+    ] {
+        assert_eq!(shown(typed), canonical, "{typed:?}");
+    }
+    assert_eq!(
+        shown("ilo23-45678-9abcd-efghj-kmnpqr"),
+        "11023-45678-9ABCD-EFGHJ-KMNPQR"
+    );
+    assert_eq!(
+        shown("oooooiiiiilllll00000111111"),
+        "00000-11111-11111-00000-111111"
+    );
+    // The two shapes are told apart by their length alone: neither is a prefix rule.
+    assert_eq!(shown("7K2M9-QXA41-TBZR8-D0HNW"), "7K2M9-QXA41-TBZR8-D0HNW");
+    assert_eq!(
+        shown("7k2m9qxa41tbzr8d0hnw7k2m9q"),
+        "7K2M9-QXA41-TBZR8-D0HNW-7K2M9Q"
+    );
+
     // anything else is left untouched
     for typed in [
-        "abcde-fghjk-mnpqr-stvw",   // 19 symbols
-        "abcde-fghjk-mnpqr-stvwxy", // 21 symbols
-        "abcde-fghjk-mnpqr-stvwu",  // U is not a Crockford symbol
-        "abcde_fghjk-mnpqr-stvwx",  // another separator
+        "abcde-fghjk-mnpqr-stvw",                                 // 19 symbols
+        "abcde-fghjk-mnpqr-stvwxy",                               // 21 symbols
+        "abcde-fghjk-mnpqr-stvwx-yz012",                          // 25 symbols
+        "abcde-fghjk-mnpqr-stvwx-yz01234",                        // 27 symbols
+        "abcde-fghjk-mnpqr-stvwx-yzu123",                         // U again, in the longer shape
+        "abcde-fghjk-mnpqr-stvwx-yz0123-abcde-fghjk-mnpqr-stvwx", // 46 symbols
+        "abcde-fghjk-mnpqr-stvwu",                                // U is not a Crockford symbol
+        "abcde_fghjk-mnpqr-stvwx",                                // another separator
         "abcde-fghjk-mnpqr-stvw\u{e9}",
         "abcde.fghjk.mnpqr.stvwx",
         "abcde\u{a0}fghjk mnpqr stvwx", // a no-break space is not ASCII whitespace
@@ -1297,17 +1329,27 @@ fn passphrase_generate() {
     for _ in 0..200 {
         let pass = Passphrase::generate();
         let text = pass.display().to_string();
-        assert_eq!(text.len(), 23);
-        assert_eq!(pass.char_count(), 23);
+        // 26 symbols — 130 bits — shown as XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX
+        assert_eq!(text.len(), 30);
+        assert_eq!(pass.char_count(), 30);
         let groups: Vec<&str> = text.split('-').collect();
-        assert_eq!(groups.len(), 4);
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            [5, 5, 5, 5, 6],
+            "{text}"
+        );
         for group in &groups {
-            assert_eq!(group.len(), 5);
             assert!(
                 group.bytes().all(|b| util::CROCKFORD.contains(&b)),
                 "{text}"
             );
         }
+        assert_eq!(
+            text.bytes().filter(|b| *b != b'-').count(),
+            gclone::consts::PASSPHRASE_GENERATED_SYMBOLS
+        );
+        // nothing of an older gclone is needed to enter it: it has no other form there
+        assert!(pass.legacy().is_none());
         // the canonical form is a fixed point of the normalisation
         assert_eq!(shown(&text), text);
         assert_eq!(shown(&text.to_lowercase().replace('-', " ")), text);
@@ -1320,6 +1362,297 @@ fn passphrase_generate() {
     for symbol in util::CROCKFORD {
         assert!(all.contains(*symbol as char));
     }
+}
+
+/// The frozen keyfiles of `tests/vectors/passphrase_v0_4_0.json` were sealed by gclone 0.4.0.
+/// Since 0.5.0 a generated passphrase has 26 symbols and the normalisation recognises both
+/// shapes; a passphrase that was set before — generated then, or typed — must open the same
+/// keyfile, byte for byte, however it is typed now.
+#[test]
+fn keyfiles_sealed_by_gclone_0_4_0_open_with_their_passphrases() {
+    let frozen: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/vectors/passphrase_v0_4_0.json"
+    )))
+    .expect("valid JSON");
+    let text = |v: &serde_json::Value| v.as_str().expect("a string").to_owned();
+    let vault_id = text(&frozen["vault_id"]);
+    let mk = util::unhex(&text(&frozen["mk"])).unwrap();
+    let keyfile = |what: &str| {
+        let case = frozen["keyfiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["what"] == what)
+            .unwrap_or_else(|| panic!("no vector {what}"));
+        (
+            text(&case["name"]),
+            util::unhex(&text(&case["keyfile"])).unwrap(),
+            text(&case["entered"]),
+            text(&case["normalised_by_0_4_0"]),
+        )
+    };
+    let opens =
+        |(name, bytes, ..): &(String, Vec<u8>, String, String), typed: &str| match open_keyfile(
+            name,
+            bytes,
+            &Passphrase::from_input(typed),
+        ) {
+            Ok(payload) => {
+                assert_eq!(payload.vault_id, vault_id);
+                assert_eq!(payload.generation, 1);
+                assert_eq!(payload.by, "gclone 0.4.0");
+                let keys = payload.keyring().unwrap();
+                assert_eq!(
+                    keys.export()[0].1.as_slice(),
+                    &mk[..],
+                    "the same master key"
+                );
+                true
+            }
+            Err(FormatError::Crypto(CryptoError::WrongKey)) => false,
+            Err(e) => panic!("{name} with {typed:?}: {e}"),
+        };
+
+    // A passphrase generated by 0.4.0 (20 symbols): the canonical form is what it always was,
+    // and every way of typing it that 0.4.0 accepted is still accepted.
+    let old = keyfile("generated-20");
+    assert_eq!(
+        (old.2.as_str(), old.3.as_str()),
+        ("7K2M9-QXA41-TBZR8-D0HNW", "7K2M9-QXA41-TBZR8-D0HNW")
+    );
+    assert_eq!(
+        shown(&old.2),
+        old.3,
+        "the normalisation of the old shape is unchanged"
+    );
+    for typed in [
+        "7K2M9-QXA41-TBZR8-D0HNW",
+        "7k2m9-qxa41-tbzr8-d0hnw",
+        "7K2M9 QXA41 TBZR8 D0HNW\n",
+        "7k2m9qxa41tbzr8d0hnw",
+        "7K2M9-QXA4l-TBZR8-DoHNW", // l for 1, o for 0
+        "7k2m-9qxa-41tb-zr8d-0hnw\r\n",
+    ] {
+        assert!(opens(&old, typed), "{typed:?}");
+    }
+    for wrong in [
+        "7K2M9-QXA41-TBZR8-D0HNX",
+        "7K2M9-QXA41-TBZR8-D0HNW-7K2M9Q", // six more symbols make another passphrase
+        "7K2M9-QXA41-TBZR8-D0HN",
+    ] {
+        assert!(!opens(&old, wrong), "{wrong:?}");
+    }
+
+    // A typed passphrase that happens to have the 26-symbol shape: 0.4.0 used it as typed, and
+    // so it opens as typed — not in the canonical form the new normalisation gives the input
+    // (that is another passphrase, which a keyfile sealed by 0.5.0 or later would open with).
+    let typed26 = keyfile("typed-26-shape");
+    assert_eq!(typed26.2, "maple tiger candle stone wharf");
+    assert_eq!(typed26.3, typed26.2, "0.4.0 left it as typed");
+    assert_eq!(shown(&typed26.2), "MAP1E-T1GER-CAND1-EST0N-EWHARF");
+    assert!(Passphrase::from_input(&typed26.2).legacy().is_some());
+    assert!(opens(&typed26, "maple tiger candle stone wharf"));
+    assert!(opens(&typed26, "maple tiger candle stone wharf\n"));
+    // What 0.4.0 refused for this keyfile is still refused: it was never case-insensitive.
+    for wrong in [
+        "Maple tiger candle stone wharf",
+        "maple-tiger-candle-stone-wharf",
+        "MAP1E-T1GER-CAND1-EST0N-EWHARF",
+        "maple tiger candle stone whart",
+    ] {
+        assert!(!opens(&typed26, wrong), "{wrong:?}");
+    }
+
+    // Any other typed passphrase: nothing changed at all.
+    let other = keyfile("typed-other");
+    assert_eq!(shown(&other.2), other.2);
+    assert!(Passphrase::from_input(&other.2).legacy().is_none());
+    assert!(opens(&other, "correct horse battery staple"));
+    assert!(!opens(&other, "correct horse battery stapl"));
+}
+
+/// A keyfile sealed now under a passphrase of the 26-symbol shape opens however that
+/// passphrase is typed — and with nothing else.
+#[test]
+fn a_26_symbol_passphrase_opens_however_it_is_typed() {
+    let generated = Passphrase::from_input("ABCDE-FGHJK-MNPQR-STVWX-YZ0123");
+    let sealed = seal_keyfile(&payload(1), &generated, SMALL).unwrap();
+    for typed in [
+        "ABCDE-FGHJK-MNPQR-STVWX-YZ0123",
+        "abcde fghjk mnpqr stvwx yz0123",
+        "abcdefghjkmnpqrstvwxyzo123\n",
+    ] {
+        let entered = Passphrase::from_input(typed);
+        assert!(open_keyfile(&sealed.name, &sealed.bytes, &entered).unwrap() == payload(1));
+    }
+    assert_err!(
+        open_keyfile(
+            &sealed.name,
+            &sealed.bytes,
+            &Passphrase::from_input("ABCDE-FGHJK-MNPQR-STVWX-YZ0124")
+        ),
+        FormatError::Crypto(CryptoError::WrongKey)
+    );
+    // Entered once, a text of that shape reaches both of its readings — and no third one.
+    let typed = Passphrase::from_input("abcde fghjk mnpqr stvwx yz0123");
+    let readings: Vec<String> = typed
+        .readings()
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect();
+    assert_eq!(
+        readings,
+        [
+            "ABCDE-FGHJK-MNPQR-STVWX-YZ0123",
+            "abcde fghjk mnpqr stvwx yz0123"
+        ]
+    );
+    assert_eq!(generated.readings().len(), 1);
+}
+
+/// gclone 0.4.0 as a reference: what it fed the KDF for an input (its `Passphrase::from_input`,
+/// which knew the 20-symbol generated shape only). Written independently of `crypto::kdf`.
+fn normalised_by_0_4_0(input: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let line = match input.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => input,
+    };
+    let text: String = line.nfc().collect();
+    let mut symbols = Vec::new();
+    for c in text
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != '-')
+    {
+        match c.to_ascii_uppercase() {
+            'I' | 'L' => symbols.push('1'),
+            'O' => symbols.push('0'),
+            u if u.is_ascii() && util::CROCKFORD.contains(&(u as u8)) => symbols.push(u),
+            _ => return text,
+        }
+    }
+    if symbols.len() != 20 {
+        return text;
+    }
+    symbols
+        .chunks(5)
+        .map(|group| group.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Old and new binaries interoperate in both directions: a passphrase is SET — `login`
+/// creating a vault, `passwd` — to exactly the text gclone 0.4.0 makes of the same input, so
+/// that the 0.4.0 device and a hosted viewer still on 0.4.0 open the keyfile with the
+/// passphrase as the user set it. 0.5.0 once sealed a typed passphrase of the 26-symbol shape
+/// ("the new victim passphrase long": five ordinary words) under its canonical form
+/// `THENE-WV1CT-…`, and 0.4.0 answered "Wrong passphrase" to the passphrase as typed.
+#[test]
+fn a_passphrase_is_set_to_what_gclone_0_4_0_makes_of_it() {
+    // The frozen vectors: `normalised_by_0_4_0` was written by the 0.4.0 source itself.
+    let frozen: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/vectors/passphrase_v0_4_0.json"
+    )))
+    .expect("valid JSON");
+    for case in frozen["keyfiles"].as_array().unwrap() {
+        let entered = case["entered"].as_str().unwrap();
+        let then = case["normalised_by_0_4_0"].as_str().unwrap();
+        assert_eq!(normalised_by_0_4_0(entered), then, "the reference is 0.4.0");
+        let set = Passphrase::set_checked(entered).unwrap();
+        assert_eq!(set.display().as_str(), then, "{entered:?}");
+        assert!(set.legacy().is_none(), "one text is sealed: {entered:?}");
+        // … and that text opens what 0.4.0 sealed, so 0.4.0 opens what is sealed under it.
+        let name = case["name"].as_str().unwrap();
+        let bytes = util::unhex(case["keyfile"].as_str().unwrap()).unwrap();
+        assert!(open_keyfile(name, &bytes, &set).is_ok(), "{entered:?}");
+    }
+
+    // A corpus around the two shapes: every way of writing an input.
+    let bases = [
+        "the new victim passphrase long",
+        "maple tiger candle stone wharf",
+        "Maple Tiger Candle Stone Wharf",
+        "7K2M9-QXA41-TBZR8-D0HNW-ABCDE-F",
+        "7K2M9-QXA41-TBZR8-D0HNW-ABCDEF",
+        "7k2m9qxa41tbzr8d0hnwabcdef",
+        "7K2M9-QXA41-TBZR8-D0HNW",
+        "7k2m9 qxa41 tbzr8 d0hnw",
+        "7K2M9-QXA4l-TBZR8-DoHNW",
+        "correct horse battery staple",
+        "abcde-fghjk-mnpqr-stvwx-yzu123",
+        "e\u{301}cole de la plage du nord",
+        "\u{212a}elvin sign and twenty more",
+    ];
+    let mut checked = 0;
+    for base in bases {
+        for variant in [
+            base.to_string(),
+            base.to_uppercase(),
+            base.to_lowercase(),
+            base.replace(' ', "-"),
+            base.replace(['-', ' '], ""),
+            base.replace('-', "  "),
+            format!("{base}\n"),
+            format!("{base}\r\n"),
+            format!(" {base}"),
+            format!("{base}\t"),
+        ] {
+            let set = Passphrase::for_setting(&variant);
+            assert_eq!(
+                set.display().as_str(),
+                normalised_by_0_4_0(&variant),
+                "{variant:?}"
+            );
+            assert!(set.legacy().is_none(), "{variant:?}");
+            // Whatever is set is opened again by entering the same input, on this version …
+            let sealed = seal_keyfile(&payload(3), &set, SMALL).unwrap();
+            let entered = Passphrase::from_input(&variant);
+            assert!(
+                open_keyfile(&sealed.name, &sealed.bytes, &entered).is_ok(),
+                "{variant:?}"
+            );
+            // … and the 0.4.0 reading of that input is one of the texts tried for it.
+            assert!(
+                entered
+                    .readings()
+                    .iter()
+                    .any(|r| r.display().as_str() == normalised_by_0_4_0(&variant)),
+                "{variant:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 130);
+
+    // The reviewer's passphrase, end to end: sealed as typed, opened as typed — exact in
+    // case and spacing, as every typed passphrase is — and not under the canonical form.
+    let typed = "the new victim passphrase long";
+    let set = Passphrase::set_checked(typed).unwrap();
+    assert_eq!(set.display().as_str(), typed);
+    assert!(set.looks_generated(), "said to the user when it is set");
+    let sealed = seal_keyfile(&payload(2), &set, SMALL).unwrap();
+    for entered in [typed, "the new victim passphrase long\n"] {
+        let entered = Passphrase::from_input(entered);
+        assert!(open_keyfile(&sealed.name, &sealed.bytes, &entered).unwrap() == payload(2));
+    }
+    for other in [
+        "The New Victim Passphrase Long",
+        "THENE-WV1CT-1MPAS-SPHRA-SE10NG",
+        "the-new-victim-passphrase-long",
+    ] {
+        assert_err!(
+            open_keyfile(&sealed.name, &sealed.bytes, &Passphrase::from_input(other)),
+            FormatError::Crypto(CryptoError::WrongKey)
+        );
+    }
+    // A generated passphrase is set in the form it is displayed in: one text for every
+    // version, entered in any case and grouping from 0.5.0 on.
+    let generated = Passphrase::generate();
+    let set = Passphrase::set_checked(&generated.display()).unwrap();
+    assert_eq!(set.display(), generated.display());
+    assert!(!set.looks_generated() && !generated.looks_generated());
 }
 
 #[test]

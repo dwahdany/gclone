@@ -222,6 +222,10 @@ pub enum IndexError {
     /// A sealed segment could not be published yet; the text names the cause.
     #[error("index changes could not be published yet: {0}")]
     OutboxStuck(String),
+    /// The replica may lack index state — its last refresh failed or ignored index objects —
+    /// and the operation judges what is dead (§5.9). The text names the objects.
+    #[error("the index of this device may be incomplete: {0}")]
+    Incomplete(String),
     #[error(transparent)]
     Format(#[from] FormatError),
     #[error(transparent)]
@@ -310,6 +314,20 @@ pub enum TransferError {
     Io(#[from] std::io::Error),
 }
 
+fn clock_skew_text(offset_ms: &i64, limit_ms: &u64) -> String {
+    format!(
+        "the store's clock is {} {} this device's clock, and gc judges every age by it (at \
+         most {} apart is accepted): gc did nothing. Check this device's date and time",
+        crate::util::human_age(offset_ms.unsigned_abs()),
+        if *offset_ms >= 0 {
+            "ahead of"
+        } else {
+            "behind"
+        },
+        crate::util::human_age(*limit_ms)
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error("safety guard: {0}")]
@@ -318,6 +336,10 @@ pub enum SyncError {
     Partial { failed: usize, skipped: usize },
     #[error("interrupted")]
     Interrupted,
+    /// `gc`: the store's clock (the `Date` header) is further from this device's than `gc`
+    /// accepts (§5.9). Exit 5, like the planner's guards.
+    #[error("safety guard: {}", clock_skew_text(.offset_ms, .limit_ms))]
+    ClockSkew { offset_ms: i64, limit_ms: u64 },
     #[error("{0}")]
     Usage(String),
     #[error(transparent)]
@@ -348,6 +370,14 @@ pub enum ConfigError {
     InsecurePermissions(String),
     #[error("wrong passphrase")]
     WrongPassphrase,
+    /// `secrets.sealed` is this device's only copy of the secrets and cannot be opened (§8.2).
+    /// Carries the whole user-facing text: what failed, and what to do — which is NOT always
+    /// `gclone login`.
+    #[error("{0}")]
+    KeyStoreUnavailable(String),
+    /// Another gclone holds the secrets lock (`login`, `logout`, `keystore use`; §8.3).
+    #[error("another gclone is changing this device's sign-in; nothing was changed")]
+    KeyStoreBusy,
     #[error("unsupported configuration version {0}")]
     Version(u32),
     #[error("invalid configuration file: {0}")]
@@ -500,7 +530,8 @@ fn own_code(e: &(dyn StdError + 'static)) -> Option<i32> {
             | IndexError::VaultTrashed
             | IndexError::VaultMissing
             | IndexError::NeedsNewerGclone
-            | IndexError::UnsupportedObject { .. } => Some(3),
+            | IndexError::UnsupportedObject { .. }
+            | IndexError::Incomplete(_) => Some(3),
             IndexError::VaultNotVisible => Some(4),
             IndexError::OutboxStuck(_) => Some(75),
             _ => None,
@@ -520,7 +551,7 @@ fn own_code(e: &(dyn StdError + 'static)) -> Option<i32> {
     }
     if let Some(x) = e.downcast_ref::<SyncError>() {
         return match x {
-            SyncError::Guard(_) => Some(5),
+            SyncError::Guard(_) | SyncError::ClockSkew { .. } => Some(5),
             SyncError::Partial { .. } => Some(6),
             SyncError::Interrupted => Some(130),
             SyncError::Usage(_) => Some(2),
@@ -533,8 +564,9 @@ fn own_code(e: &(dyn StdError + 'static)) -> Option<i32> {
             | ConfigError::NotLoggedIn
             | ConfigError::Locked
             | ConfigError::InsecurePermissions(_)
-            | ConfigError::WrongPassphrase => Some(4),
-            ConfigError::Version(_) | ConfigError::Json(_) => Some(1),
+            | ConfigError::WrongPassphrase
+            | ConfigError::KeyStoreUnavailable(_) => Some(4),
+            ConfigError::Version(_) | ConfigError::Json(_) | ConfigError::KeyStoreBusy => Some(1),
             _ => None,
         };
     }
@@ -563,9 +595,10 @@ fn rank(code: i32) -> u8 {
 ///   (a wrong passphrase never reaches this function as `CryptoError::WrongKey`: the login flow
 ///   turns the keyfile's `WrongKey` into `ConfigError::WrongPassphrase` first, §2.6)
 /// - 4 ← `AuthError`, `ConfigError::{NotConfigured, NotLoggedIn, Locked, InsecurePermissions,
-///   WrongPassphrase}`, `IndexError::VaultNotVisible`, `BackendError::AppNotAuthorized`
+///   WrongPassphrase, KeyStoreUnavailable}`, `IndexError::VaultNotVisible`,
+///   `BackendError::AppNotAuthorized`
 /// - 75 ← `QuotaExceeded(_)`, `RateLimited`, `IndexError::OutboxStuck`
-/// - 5 ← `SyncError::Guard`, 6 ← `SyncError::Partial`, 130 ← `Interrupted` / `Cancelled`,
+/// - 5 ← `SyncError::Guard` / `ClockSkew`, 6 ← `SyncError::Partial`, 130 ← `Interrupted` / `Cancelled`,
 ///   2 ← `SyncError::Usage` (a usage error detected after argument parsing; clap's own usage
 ///   errors exit 2 before any of this runs), 1 ← everything else
 pub fn exit_code(e: &anyhow::Error) -> i32 {
@@ -624,6 +657,7 @@ mod tests {
             }),
             3
         );
+        assert_eq!(code(IndexError::Incomplete("s-1 was ignored".into())), 3);
         assert_eq!(code(TransferError::Verify("x".into())), 3);
         assert_eq!(code(IndexError::Crypto(CryptoError::BadMagic)), 3);
         assert_eq!(code(ConfigError::Crypto(CryptoError::UnknownEpoch(2))), 3);
@@ -644,6 +678,8 @@ mod tests {
         assert_eq!(code(ConfigError::Locked), 4);
         assert_eq!(code(ConfigError::InsecurePermissions("/x".into())), 4);
         assert_eq!(code(ConfigError::WrongPassphrase), 4);
+        assert_eq!(code(ConfigError::KeyStoreUnavailable("text".into())), 4);
+        assert_eq!(code(ConfigError::KeyStoreBusy), 1);
         assert_eq!(
             code(ConfigError::Auth(AuthError::BadAuthUrl("u".into()))),
             4
@@ -666,6 +702,13 @@ mod tests {
 
         // 5, 6, 130
         assert_eq!(code(SyncError::Guard(GuardKind::RootChanged)), 5);
+        assert_eq!(
+            code(SyncError::ClockSkew {
+                offset_ms: -90_000_000,
+                limit_ms: 86_400_000
+            }),
+            5
+        );
         assert_eq!(code(SyncError::Guard(GuardKind::EmptySource)), 5);
         assert_eq!(
             code(SyncError::Guard(GuardKind::RevertedTree { suspicious: 12 })),

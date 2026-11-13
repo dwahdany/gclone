@@ -14,7 +14,7 @@ use super::hkdf_sha256;
 use super::keys::PurposeKey;
 use crate::consts::{
     KDF_M_KIB_MAX, KDF_M_KIB_MIN, KDF_T_MAX, KDF_T_MIN, PASSPHRASE_GENERATED_SYMBOLS,
-    PASSPHRASE_MIN_CHARS,
+    PASSPHRASE_GENERATED_SYMBOLS_OLD, PASSPHRASE_MIN_CHARS,
 };
 use crate::error::{CryptoError, FormatError};
 use crate::util::{self, CROCKFORD};
@@ -25,10 +25,17 @@ const PREAMBLE_MAGIC: [u8; 4] = *b"GCK1";
 const ALG_ARGON2ID: u8 = 0x01;
 const ARGON2_V13: u8 = 0x13;
 const PASS_KEY_INFO: &[u8] = b"gclone/v1/passphrase/keyfile";
-/// A generated passphrase is shown in groups of this many symbols.
+/// A generated passphrase is shown in groups of this many symbols; a last group that would be
+/// a single symbol joins the group before it (26 symbols: 5-5-5-5-6).
 const GROUP: usize = 5;
+/// Symbols and separators of the longer generated form.
 const GENERATED_TEXT_LEN: usize =
-    PASSPHRASE_GENERATED_SYMBOLS + PASSPHRASE_GENERATED_SYMBOLS / GROUP - 1;
+    PASSPHRASE_GENERATED_SYMBOLS + PASSPHRASE_GENERATED_SYMBOLS / GROUP;
+
+/// Whether a `-` stands before symbol `i` of a generated passphrase of `symbols` symbols.
+fn group_break(i: usize, symbols: usize) -> bool {
+    i > 0 && i.is_multiple_of(GROUP) && symbols - i >= 2
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct KdfParams {
@@ -124,13 +131,20 @@ impl KdfPreamble {
 }
 
 /// The normalised passphrase text. No `Debug`, no `Display`.
-pub struct Passphrase(Zeroizing<String>);
+pub struct Passphrase {
+    text: Zeroizing<String>,
+    /// The text as gclone before 0.5.0 normalised the same input, where that differs: see
+    /// [`Passphrase::legacy`].
+    legacy: Option<Zeroizing<String>>,
+}
 
 impl Passphrase {
-    /// Normalisation of §2.6; used when entering AND when setting: one trailing `\n` or `\r\n`
-    /// is dropped, the text is put into NFC, and a text of the generated shape (20 Crockford
-    /// symbols in any case, `I`/`L`/`O` tolerated, any grouping) becomes the canonical
-    /// `XXXXX-XXXXX-XXXXX-XXXXX`. Anything else is used as is.
+    /// Normalisation of §2.6 for ENTERING a passphrase (setting one: [`Passphrase::for_setting`]):
+    /// one trailing `\n` or `\r\n` is dropped, the text is put into NFC, and a text of a
+    /// generated shape — 26 Crockford symbols, or the 20 of gclone before 0.5.0, in any case,
+    /// `I`/`L`/`O` tolerated, any grouping — becomes the canonical
+    /// `XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX` or `XXXXX-XXXXX-XXXXX-XXXXX`, the 26-symbol one
+    /// keeping the text as typed as its second reading. Anything else is used as is.
     pub fn from_input(input: &str) -> Self {
         let line = match input.strip_suffix('\n') {
             Some(line) => line.strip_suffix('\r').unwrap_or(line),
@@ -140,69 +154,133 @@ impl Passphrase {
         // copy of the text is left behind un-zeroed.
         let mut text = Zeroizing::new(String::with_capacity(3 * line.len()));
         text.extend(line.nfc());
-        Passphrase(canonical_generated(&text).unwrap_or(text))
+        match canonical_generated(&text) {
+            // The 20-symbol shape was canonicalised by every gclone: one text, then and now.
+            Some((canonical, PASSPHRASE_GENERATED_SYMBOLS_OLD)) => Passphrase {
+                text: canonical,
+                legacy: None,
+            },
+            // The 26-symbol shape was plain text to gclone before 0.5.0.
+            Some((canonical, _)) => Passphrase {
+                legacy: (*canonical != *text).then_some(text),
+                text: canonical,
+            },
+            None => Passphrase { text, legacy: None },
+        }
     }
 
-    /// `from_input` + `PASSPHRASE_MIN_CHARS` → `WeakPassphrase`.
+    /// The passphrase gclone before 0.5.0 made of the same input, if it is another one.
+    ///
+    /// Those versions knew the 20-symbol generated shape only, so a typed passphrase that
+    /// happens to have the 26-symbol shape — five words without a `u`, 26 letters in all —
+    /// was used as typed, and a keyfile sealed then opens with the typed text and not with
+    /// its canonical form. It is also what a passphrase is SET to ([`Passphrase::for_setting`]).
+    /// Whoever opens a keyfile tries this second, after `self` answered "wrong key"
+    /// (`format::open_keyfile`): a passphrase that worked keeps working, byte for byte, and
+    /// nothing but an input of that one shape ever costs a second derivation.
+    pub fn legacy(&self) -> Option<Passphrase> {
+        self.legacy.as_ref().map(|text| Passphrase {
+            text: text.clone(),
+            legacy: None,
+        })
+    }
+
+    /// Every text this input can stand for, in the order they are tried: the canonical
+    /// reading, then the text as typed where that is another one ([`Passphrase::legacy`]).
+    /// Each is a passphrase of exactly one reading.
+    pub fn readings(&self) -> Vec<Passphrase> {
+        let first = Passphrase {
+            text: self.text.clone(),
+            legacy: None,
+        };
+        std::iter::once(first).chain(self.legacy()).collect()
+    }
+
+    /// The passphrase a keyfile is SEALED under for `input` (§2.6): exactly the text every
+    /// gclone, 0.4.0 included, makes of it. That is `from_input` — except that an input of
+    /// the 26-symbol shape that is not in its canonical form stays the text as typed, as
+    /// every typed passphrase does: gclone 0.4.0 and a hosted viewer still on 0.4.0 use such
+    /// an input as typed, and a keyfile sealed under its canonical form would answer "wrong
+    /// passphrase" to them. A generated passphrase is set in its canonical form, which is one
+    /// text for every version; `open_keyfile` reaches both forms from whatever is entered.
+    pub fn for_setting(input: &str) -> Self {
+        let entered = Passphrase::from_input(input);
+        entered.legacy().unwrap_or(entered)
+    }
+
+    /// Whether this passphrase has the shape of a generated one without being in the
+    /// canonical form: it is then a typed passphrase, exact in case, spaces and hyphens,
+    /// although it looks like one that may be typed in any case.
+    pub fn looks_generated(&self) -> bool {
+        canonical_generated(&self.text).is_some_and(|(canonical, _)| *canonical != *self.text)
+    }
+
+    /// `for_setting` + `PASSPHRASE_MIN_CHARS` → `WeakPassphrase`.
     pub fn set_checked(input: &str) -> Result<Self, FormatError> {
-        let pass = Passphrase::from_input(input);
+        let pass = Passphrase::for_setting(input);
         if pass.char_count() < PASSPHRASE_MIN_CHARS {
             return Err(FormatError::WeakPassphrase);
         }
         Ok(pass)
     }
 
-    /// 20 Crockford symbols drawn uniformly with the OS CSPRNG (100 bits), in the canonical form.
+    /// 26 Crockford symbols drawn uniformly with the OS CSPRNG (130 bits), in the canonical
+    /// form `XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX`.
     pub fn generate() -> Self {
         let raw = Zeroizing::new(util::random::<PASSPHRASE_GENERATED_SYMBOLS>());
         let mut text = Zeroizing::new(String::with_capacity(GENERATED_TEXT_LEN));
         for (i, byte) in raw.iter().enumerate() {
-            if i > 0 && i % GROUP == 0 {
+            if group_break(i, PASSPHRASE_GENERATED_SYMBOLS) {
                 text.push('-');
             }
             // 256 is a multiple of 32: the low five bits are uniform.
             text.push(CROCKFORD[usize::from(byte & 31)] as char);
         }
-        Passphrase(text)
+        Passphrase { text, legacy: None }
     }
 
     /// The text to show once after `generate()`.
     pub fn display(&self) -> Zeroizing<String> {
-        Zeroizing::new(self.0.as_str().to_owned())
+        Zeroizing::new(self.text.as_str().to_owned())
     }
 
-    /// Unicode scalar values (for the < 20 warning).
+    /// Unicode scalar values (for the warning below `PASSPHRASE_WARN_CHARS`).
     pub fn char_count(&self) -> usize {
-        self.0.chars().count()
+        self.text.chars().count()
     }
 }
 
-/// The canonical generated form of `text`, if it has the generated shape (§2.6): with ASCII
-/// whitespace and `-` removed, exactly 20 characters, each a Crockford symbol in either case or
-/// one of `I L O i l o`.
-fn canonical_generated(text: &str) -> Option<Zeroizing<String>> {
-    let mut out = Zeroizing::new(String::with_capacity(GENERATED_TEXT_LEN));
+/// The canonical generated form of `text` and its number of symbols, if it has a generated
+/// shape (§2.6): with ASCII whitespace and `-` removed, exactly 26 or exactly 20 characters,
+/// each a Crockford symbol in either case or one of `I L O i l o`.
+fn canonical_generated(text: &str) -> Option<(Zeroizing<String>, usize)> {
+    // The symbols alone, on the stack: never more than the longer shape.
+    let mut found = Zeroizing::new([0u8; PASSPHRASE_GENERATED_SYMBOLS]);
     let mut symbols = 0;
     for c in text
         .chars()
         .filter(|c| !c.is_ascii_whitespace() && *c != '-')
     {
         let symbol = match c.to_ascii_uppercase() {
-            'I' | 'L' => '1',
-            'O' => '0',
-            u if u.is_ascii() && CROCKFORD.contains(&(u as u8)) => u,
+            'I' | 'L' => b'1',
+            'O' => b'0',
+            u if u.is_ascii() && CROCKFORD.contains(&(u as u8)) => u as u8,
             _ => return None,
         };
-        if symbols == PASSPHRASE_GENERATED_SYMBOLS {
-            return None;
-        }
-        if symbols > 0 && symbols % GROUP == 0 {
-            out.push('-');
-        }
-        out.push(symbol);
+        *found.get_mut(symbols)? = symbol;
         symbols += 1;
     }
-    (symbols == PASSPHRASE_GENERATED_SYMBOLS).then_some(out)
+    if symbols != PASSPHRASE_GENERATED_SYMBOLS && symbols != PASSPHRASE_GENERATED_SYMBOLS_OLD {
+        return None;
+    }
+    let mut out = Zeroizing::new(String::with_capacity(GENERATED_TEXT_LEN));
+    for (i, symbol) in found[..symbols].iter().enumerate() {
+        if group_break(i, symbols) {
+            out.push('-');
+        }
+        out.push(*symbol as char);
+    }
+    Some((out, symbols))
 }
 
 /// `K_pass` (§2.6). Blocking (≈ 1 s, 256 MiB with the default parameters): call it from
@@ -213,7 +291,7 @@ pub fn derive_pass_key(pass: &Passphrase, pre: &KdfPreamble) -> Result<PurposeKe
         return Err(CryptoError::Kdf("parameters out of bounds".into()));
     }
     let mut ikm = Zeroizing::new([0u8; 32]);
-    argon2id(pass.0.as_bytes(), pre, &mut ikm)?;
+    argon2id(pass.text.as_bytes(), pre, &mut ikm)?;
     let mut key = Zeroizing::new([0u8; 32]);
     hkdf_sha256(&pre.encode(), ikm.as_ref(), PASS_KEY_INFO, key.as_mut());
     Ok(PurposeKey::from_zeroizing(key))

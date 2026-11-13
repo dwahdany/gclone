@@ -113,20 +113,6 @@ impl Listed {
         }
         *h.finalize().as_bytes()
     }
-
-    fn segment_identities(&self) -> HashSet<CoveredSeg> {
-        self.segs
-            .keys()
-            .filter_map(|name| match parse_index_name(name) {
-                Some(IndexName::Segment { device, seq, h8 }) => Some(CoveredSeg {
-                    device,
-                    seq,
-                    h4: h8,
-                }),
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 /// An accepted index object with where it came from.
@@ -340,6 +326,26 @@ struct Pull<'a, B: Backend> {
     remembered: HashMap<String, Place>,
     /// The sealed segment waiting in the outbox: `recover_outbox` applies it, nothing else.
     outbox: Option<SegKey>,
+    /// Size and md5 of the bytes this replica accepted under a segment name, from its cached
+    /// copy (`None`: no copy with the accepted hash) — looked up once per refresh.
+    accepted: HashMap<String, Option<(u64, [u8; 16])>>,
+}
+
+/// Whether `meta` — a listed or `stat`ed object — is SHOWN to hold bytes of this size and
+/// md5: both must be reported and equal. An object the store lists without an md5 is not
+/// shown to be anything — on Drive that is a Google-native file, which any token holder can
+/// create under an index object's name, and a size alone must never stand for the object a
+/// replica accepted (the presence rules and `repair` would then take the plant for the
+/// original: no `Rollback`, nothing republished). Such an object is judged by its content
+/// instead: [`Vault::is_object`], or the BLAKE3 comparison of `holds_segment`.
+pub(super) fn same_bytes(meta: &ObjMeta, size: u64, md5: &[u8]) -> bool {
+    meta.size == size && meta.md5.is_some_and(|have| have[..] == md5[..])
+}
+
+/// An object of the right size for which the store reports no md5: [`same_bytes`] cannot
+/// answer, the content has to be read.
+fn unhashed(meta: &ObjMeta, size: u64) -> bool {
+    meta.size == size && meta.md5.is_none()
 }
 
 impl<B: Backend> Vault<B> {
@@ -375,6 +381,46 @@ impl<B: Backend> Vault<B> {
             },
         })
         .await
+    }
+
+    /// Whether the object `meta` of the store holds exactly the bytes of this size and md5 —
+    /// by what the store reports ([`same_bytes`]), and where it reports no md5, by reading
+    /// the object once and hashing it here (an object that cannot be read — a Google-native
+    /// file is not downloadable — is not it).
+    pub(super) async fn is_object(
+        &self,
+        name: &str,
+        meta: &ObjMeta,
+        size: u64,
+        md5: &[u8],
+    ) -> Result<bool, IndexError> {
+        if !unhashed(meta, size) {
+            return Ok(same_bytes(meta, size, md5));
+        }
+        Ok(self
+            .download(name, &meta.handle, Some(size))
+            .await?
+            .is_some_and(|bytes| bytes.len() as u64 == size && md5_of(&bytes)[..] == md5[..]))
+    }
+
+    /// [`Vault::is_object`] for any of `metas`: the first that is shown to be the object.
+    pub(super) async fn find_object<'m>(
+        &self,
+        name: &str,
+        metas: &'m [ObjMeta],
+        size: u64,
+        md5: &[u8],
+    ) -> Result<Option<&'m ObjMeta>, IndexError> {
+        // What the store's own word settles costs nothing: asked first.
+        if let Some(meta) = metas.iter().find(|m| same_bytes(m, size, md5)) {
+            return Ok(Some(meta));
+        }
+        for meta in metas.iter().filter(|m| unhashed(m, size)) {
+            if self.is_object(name, meta, size, md5).await? {
+                return Ok(Some(meta));
+            }
+        }
+        Ok(None)
     }
 
     /// The bytes of one index object of the store, at most `object_max` of them (§4.6 rule 1):
@@ -414,9 +460,7 @@ impl<B: Backend> Vault<B> {
             let (size, md5) = (bytes.len() as u64, md5_of(&bytes));
             let cached = self.accept(name, bytes, open, Origin::Cache).await?;
             if let (Some((body, hash)), _) = cached {
-                let same = metas
-                    .iter()
-                    .find(|m| m.size == size && m.md5.is_none_or(|have| have == md5));
+                let same = self.find_object(name, metas, size, &md5).await?;
                 return Ok(Some(Fetched {
                     body,
                     hash,
@@ -466,14 +510,16 @@ impl<B: Backend> Vault<B> {
         self.fetch_object(name, metas, open).await
     }
 
-    /// Un-trashed and still carrying its name, by id (list lag; §5.3 presence (c)).
-    async fn stat_present(&self, file_id: &str, name: &str) -> Result<bool, IndexError> {
+    /// The object `file_id`, if the store shows it un-trashed and still under `name` (list
+    /// lag; §5.3 presence (c)). That alone does not make it present: the caller compares its
+    /// content with what this replica accepted — an object can be overwritten in place.
+    async fn stat_named(&self, file_id: &str, name: &str) -> Result<Option<ObjMeta>, IndexError> {
         if file_id.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         match self.backend.stat(&Handle(file_id.to_owned())).await {
-            Ok(meta) => Ok(meta.is_some_and(|m| !m.trashed && !m.is_folder && m.name == name)),
-            Err(e) if is_missing(&e) => Ok(false),
+            Ok(meta) => Ok(meta.filter(|m| !m.trashed && !m.is_folder && m.name == name)),
+            Err(e) if is_missing(&e) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -496,9 +542,16 @@ impl<B: Backend> Vault<B> {
     /// §5.3 (includes `recover_outbox`; a stuck outbox is not an error).
     pub async fn refresh(&self) -> Result<RefreshReport, IndexError> {
         let _journal = self.journal.lock().await;
-        let pulled = self.pull().await?;
-        pulled.verdict.into_result()?;
-        Ok(pulled.report)
+        let result = match self.pull().await {
+            Ok(pulled) => pulled.verdict.into_result().map(|()| pulled.report),
+            Err(e) => Err(e),
+        };
+        // `gc` asks whether this replica may lack index state (§5.9).
+        *self.incomplete.lock().unwrap_or_else(|e| e.into_inner()) = match &result {
+            Ok(report) => report.incomplete(),
+            Err(e) => Some(e.to_string()),
+        };
+        result
     }
 
     /// The whole of §5.3 with the verdicts collected instead of returned.
@@ -546,6 +599,7 @@ impl<B: Backend> Vault<B> {
             snaps: HashMap::new(),
             remembered: self.db.read(remembered_load)?,
             outbox,
+            accepted: HashMap::new(),
         };
         known = self.db.read(Known::load)?;
         p.gather(&known).await?;
@@ -607,6 +661,7 @@ impl<B: Backend> Vault<B> {
             tracing::warn!(
                 "snapshot {name} covers index segments this device lacks but cannot be used yet"
             );
+            p.report.unused_snapshot = Some(name);
         }
 
         // `blocked` runs on the local clock: server-supplied times never feed a grace period.
@@ -824,10 +879,11 @@ impl<B: Backend> Pull<'_, B> {
             };
             // The listed object must be the bytes this replica applied.
             let md5 = self.v.cache_read(&row.name).map(|bytes| md5_of(&bytes));
+            // An object without an md5 is not shown to be them: its id is not adopted.
             let same = metas.iter().find(|m| {
                 m.size == row.size
                     && m.md5
-                        .is_none_or(|have| md5.is_none_or(|cached| cached == have))
+                        .is_some_and(|have| md5.is_none_or(|cached| cached == have))
             });
             if let Some(m) = same {
                 found.push(((row.dev, row.seq, row.hash), m.handle.0.clone()));
@@ -1209,27 +1265,106 @@ impl<B: Backend> Pull<'_, B> {
         Ok(false)
     }
 
+    /// Whether one of `metas` — the objects listed under `name`, or the one object a `stat`
+    /// by id returned — holds the very segment this replica accepted with the hash `hash`.
+    ///
+    /// A name proves nothing (§5.3 presence): whoever can write to the vault folder can
+    /// overwrite an index object in place, or delete it and create something else under its
+    /// name, and the devices that had applied the object would go on calling it present —
+    /// the rollback alarm silenced by the party it is meant for. So the object must have the
+    /// size and md5 of the accepted bytes, which the index cache still holds for everything
+    /// the base does not cover. Without a cached copy an object of a plausible size is read
+    /// once and compared by its BLAKE3 with the hash this replica applied — and kept in the
+    /// cache, so that the next refresh is a comparison of two listings again.
+    async fn holds_segment(
+        &mut self,
+        name: &str,
+        hash: &[u8; 32],
+        size: Option<u64>,
+        metas: &[ObjMeta],
+    ) -> Result<bool, IndexError> {
+        if metas.is_empty() {
+            return Ok(false);
+        }
+        if !self.accepted.contains_key(name) {
+            let cached = match self.v.cache_read(name) {
+                Some(bytes) if blake3::hash(&bytes).as_bytes() == hash => {
+                    Some((bytes.len() as u64, md5_of(&bytes)))
+                }
+                // Not the bytes this replica applied (a damaged cache file): it makes room
+                // for the copy that the comparison below fetches.
+                Some(_) => {
+                    let _ = std::fs::remove_file(self.v.cache_path(name));
+                    None
+                }
+                None => None,
+            };
+            self.accepted.insert(name.to_owned(), cached);
+        }
+        let cached = self.accepted.get(name).copied().flatten();
+        if let Some((size, md5)) = cached
+            && metas.iter().any(|m| same_bytes(m, size, &md5))
+        {
+            return Ok(true);
+        }
+        // What is left to read: without a cached copy every object of a plausible size; with
+        // one, only the objects of the accepted size for which the store reports no md5 —
+        // the size alone is not the object (a Google-native file of that size is not even
+        // readable, and so is not it).
+        let size = cached.map(|(size, _)| size).or(size);
+        let unread = |m: &&ObjMeta| match cached {
+            Some((size, _)) => unhashed(m, size),
+            None => size.is_none_or(|s| s == m.size),
+        };
+        for meta in metas.iter().filter(unread) {
+            let Some(bytes) = self.v.download(name, &meta.handle, Some(meta.size)).await? else {
+                continue;
+            };
+            if blake3::hash(&bytes).as_bytes() == hash {
+                self.v.cache_write(name, &bytes);
+                self.accepted
+                    .insert(name.to_owned(), Some((bytes.len() as u64, md5_of(&bytes))));
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// presence_check(): what this replica has seen must still be held by the remote for the
-    /// other devices. Returns the first identity that is gone.
+    /// other devices. Returns the first identity that is gone — or whose object was replaced.
     async fn presence(&mut self, known: &Known) -> Result<Option<(DeviceId, u64)>, IndexError> {
-        let listed = self.listed.segment_identities();
-        let mut seen: BTreeMap<(DeviceId, u64, [u8; 4]), (String, String)> = BTreeMap::new();
+        /// A segment this replica has seen: where it lived, and what it was.
+        struct Seen {
+            file_id: String,
+            name: String,
+            hash: [u8; 32],
+            /// `applied.size`; a mark alone carries none.
+            size: Option<u64>,
+        }
+        let mut seen: BTreeMap<(DeviceId, u64, [u8; 4]), Seen> = BTreeMap::new();
         for row in known.applied.values() {
             let c = row.seg_ref().covered();
             seen.insert(
                 (c.device, c.seq, c.h4),
-                (row.file_id.clone(), row.name.clone()),
+                Seen {
+                    file_id: row.file_id.clone(),
+                    name: row.name.clone(),
+                    hash: row.hash,
+                    size: Some(row.size),
+                },
             );
         }
         for mark in &known.hw {
             let c = mark.covered();
-            let place = seen.entry((c.device, c.seq, c.h4)).or_insert_with(|| {
-                let name = segment_name(mark.device, mark.seq, &mark.hash);
-                (mark.file_id.clone(), name)
+            let place = seen.entry((c.device, c.seq, c.h4)).or_insert_with(|| Seen {
+                file_id: mark.file_id.clone(),
+                name: segment_name(mark.device, mark.seq, &mark.hash),
+                hash: mark.hash,
+                size: None,
             });
             // An `applied` row without an id must not hide the id the mark has.
-            if place.0.is_empty() {
-                place.0.clone_from(&mark.file_id);
+            if place.file_id.is_empty() {
+                place.file_id.clone_from(&mark.file_id);
             }
         }
         // Rule (b) without parsing anything: the base snapshot's coverage is in `base_covered`,
@@ -1239,27 +1374,53 @@ impl<B: Backend> Pull<'_, B> {
         // since — made every refresh load and decode a whole snapshot.
         let base_listed = match (&known.base_name, known.base_size, &known.base_md5) {
             (Some(name), Some(size), Some(md5)) => {
-                self.listed.snaps.get(name).is_some_and(|metas| {
-                    metas
-                        .iter()
-                        .any(|m| m.size == size && m.md5.is_none_or(|have| have[..] == md5[..]))
-                })
+                let metas = self.listed.snaps.get(name).cloned().unwrap_or_default();
+                self.v.find_object(name, &metas, size, md5).await?.is_some()
             }
             _ => false,
         };
-        for ((device, seq, h4), (file_id, name)) in seen {
+        for ((device, seq, h4), segment) in seen {
             let identity = CoveredSeg { device, seq, h4 };
-            if listed.contains(&identity)
-                || (base_listed && known.covered.binary_search(&identity).is_ok())
-                || self.covered_remotely(&identity).await?
-                || self.v.stat_present(&file_id, &name).await?
+            // (b) for the base first: it costs nothing, and it settles every mark whose
+            // segment the base covers — whatever became of that segment's own object.
+            if base_listed && known.covered.binary_search(&identity).is_ok() {
+                continue;
+            }
+            // (a) — the listed object must be the one this replica accepted, not just its name.
+            let listed = self
+                .listed
+                .segs
+                .get(&segment.name)
+                .cloned()
+                .unwrap_or_default();
+            if self
+                .holds_segment(&segment.name, &segment.hash, segment.size, &listed)
+                .await?
+            {
+                continue;
+            }
+            if !listed.is_empty() {
+                tracing::warn!(
+                    "index object {} in the store is not the object this device applied (its \
+                     size or content differ): it was overwritten or replaced",
+                    segment.name
+                );
+            }
+            if self.covered_remotely(&identity).await? {
+                continue;
+            }
+            // (c) — by id, with the same comparison: an object overwritten in place keeps its id.
+            if let Some(meta) = self.v.stat_named(&segment.file_id, &segment.name).await?
+                && self
+                    .holds_segment(&segment.name, &segment.hash, segment.size, &[meta])
+                    .await?
             {
                 continue;
             }
             return Ok(Some((device, seq)));
         }
 
-        // The base must still be on offer.
+        // The base must still be on offer — the object this replica accepted, not its name.
         let Some(base) = known
             .base_name
             .as_deref()
@@ -1267,9 +1428,11 @@ impl<B: Backend> Pull<'_, B> {
         else {
             return Ok(None);
         };
-        if self.listed.snaps.contains_key(base) {
+        if base_listed {
             return Ok(None);
         }
+        // Reads the listed snapshots (the base's name among them: its cached copy against
+        // the listed size and md5, else the listed object itself).
         for name in self.snapshot_names() {
             if let Some(snap) = self.snapshot(&name).await?
                 && snap.on_remote
@@ -1278,12 +1441,27 @@ impl<B: Backend> Pull<'_, B> {
                 return Ok(None);
             }
         }
-        if self
+        // List lag right after writing or adopting a snapshot: by id — and again by content,
+        // from what was recorded when the base was accepted, else from its cached copy.
+        let recorded = match (known.base_size, &known.base_md5) {
+            (Some(size), Some(md5)) => Some((size, md5.clone())),
+            _ => self
+                .v
+                .cache_read(base)
+                .map(|bytes| (bytes.len() as u64, md5_of(&bytes).to_vec())),
+        };
+        let by_id = self
             .v
-            .stat_present(known.base_id.as_deref().unwrap_or(""), base)
-            .await?
-        {
-            return Ok(None);
+            .stat_named(known.base_id.as_deref().unwrap_or(""), base)
+            .await?;
+        if let Some(meta) = by_id {
+            let same = match &recorded {
+                Some((size, md5)) => self.v.is_object(base, &meta, *size, md5).await?,
+                None => true,
+            };
+            if same {
+                return Ok(None);
+            }
         }
         let tip = known.base_covers.iter().max_by_key(|t| (t.seq, t.device));
         Ok(Some(

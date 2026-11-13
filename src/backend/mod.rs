@@ -130,6 +130,19 @@ pub trait Backend: Send + Sync + 'static {
         self.list(parent)
     }
 
+    /// The direct children of `parent` that are in the trash themselves (`trashed = true`;
+    /// what lies inside a trashed folder is not listed). For `gclone passwd --purge-old`
+    /// (§2.7), which is the only caller: the retired keyfiles that an earlier `passwd` left in
+    /// the trash. Drive answers this for the files the app's scope reaches — the same ones
+    /// `list` shows. The default — a wrapper that does not pass the call on — lists nothing.
+    fn list_trashed(
+        &self,
+        parent: &Handle,
+    ) -> impl Future<Output = Result<Vec<ObjMeta>, BackendError>> + Send {
+        let _ = parent;
+        async { Ok(Vec::new()) }
+    }
+
     /// Exact name, non-trashed, anywhere visible.
     fn find_by_name(
         &self,
@@ -141,13 +154,24 @@ pub trait Backend: Send + Sync + 'static {
 
     fn untrash(&self, h: &Handle) -> impl Future<Output = Result<(), BackendError>> + Send;
 
-    /// Permanent. Called only by `gc --purge` (§5.9). `NotFound` if absent.
+    /// Permanent. Called only by `gc --purge` (§5.9: blobs of the blob table that are in the
+    /// trash as they were uploaded) and by `passwd --purge-old` (§2.7: retired keyfiles).
+    /// `NotFound` if absent.
     fn delete(&self, h: &Handle) -> impl Future<Output = Result<(), BackendError>> + Send;
 
     fn about(&self) -> impl Future<Output = Result<Quota, BackendError>> + Send;
 
     /// Server clock estimate.
     fn now_ms(&self) -> u64;
+
+    /// How far [`Backend::now_ms`] stands from this device's own clock because the store said
+    /// so (Drive: the `Date` header of its last answer), in milliseconds. `0` for a store
+    /// whose clock is this device's, and for the fakes, whose clock is the test's. `gc` bounds
+    /// it (§5.9): the header is the store's unauthenticated word, and every age `gc` judges
+    /// by would follow it.
+    fn clock_offset_ms(&self) -> i64 {
+        0
+    }
 }
 
 /// Collects `get` into one buffer.

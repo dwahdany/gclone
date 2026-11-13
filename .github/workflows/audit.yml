@@ -1,0 +1,70 @@
+name: Advisories
+
+# Known vulnerabilities in what the two lockfiles pin, from the RustSec advisory database.
+#
+# Nobody else looks: the lockfiles change only when someone changes them, the released binaries are static, the CLI
+# has no update check, and the hosted viewer's wasm stays until it is redeployed. So this runs every week, on every
+# push to main and on every pull request that touches a manifest or a lockfile - and a red run is a reason to act:
+#   - an advisory for a TLS crate (rustls, rustls-webpki, aws-lc-*) or for the AEAD path (chacha20, poly1305,
+#     ctutils, cmov, aead, hkdf, argon2): update the lock, RELEASE, reinstall on each device, redeploy the viewer;
+#   - anything else: update the lock; release with the next version.
+# Dependabot (.github/dependabot.yml) opens the pull requests; it reads GitHub's advisory database, which also lists
+# what RustSec does not - both are wanted. "Dependabot alerts" and "Dependabot security updates" are repository
+# settings (Settings → Advanced Security): they must be switched ON for that half to work.
+#
+# The tool is built from source in a pinned version with its own lockfile; no third-party action.
+
+on:
+  schedule:
+    # Mondays, 05:17 UTC.
+    - cron: "17 5 * * 1"
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_AUDIT_VERSION: 0.22.2
+
+jobs:
+  cargo-audit:
+    name: cargo audit (Cargo.lock, web-core/Cargo.lock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          # The version comes from rust-toolchain.toml.
+          rustup toolchain install --no-self-update
+          cargo --version
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: tool
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_AUDIT_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+      - name: cargo-audit, the pinned version
+        if: steps.tool.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+      - run: cargo audit --version
+      # A vulnerability fails the run; so does an unsound or a yanked crate. "Unmaintained" is shown and does not.
+      - name: The CLI (Cargo.lock)
+        run: cargo audit --deny unsound --deny yanked --file Cargo.lock
+      # Both lockfiles are always looked at: the first one failing must not hide the second.
+      - name: The hosted viewer's core (web-core/Cargo.lock)
+        if: ${{ !cancelled() }}
+        run: cargo audit --deny unsound --deny yanked --file web-core/Cargo.lock

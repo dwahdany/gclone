@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import worker from "../src/entry";
-import { BODY_MAX, GOOGLE_AUTH_URL, GOOGLE_DEVICE_CODE_URL, GOOGLE_REVOKE_URL, GOOGLE_TOKEN_URL, RATE_LIMIT_RETRY_AFTER_S, defaultDeps, handle, rateLimitKey, type Env } from "../src/index";
+import { BODY_MAX, CLEAR_SITE_DATA, GOOGLE_AUTH_URL, GOOGLE_DEVICE_CODE_URL, GOOGLE_REVOKE_URL, GOOGLE_TOKEN_URL, RATE_LIMIT_RETRY_AFTER_S, SERVICE_WORKER_PATH, defaultDeps, handle, rateLimitKey, type Env } from "../src/index";
 import { REFRESH_TOKEN_RE, revokeToken } from "../src/google";
 import {
   CLIENT_ID,
@@ -466,6 +466,63 @@ describe("transport rules", () => {
     expect(await errorOf(await h.post("/token", { code: "x", verifier: "y" }))).toEqual({ status: 404, error: "not_found" });
     expect(await errorOf(await h.post("/revoke", { token: "x" }))).toEqual({ status: 404, error: "not_found" });
     expect(h.google.calls).toEqual([]);
+  });
+
+  it("a request for the script of a Service Worker that is not the viewer's → the path's answer, plus Clear-Site-Data", async () => {
+    h.env = withWeb();
+    const asScript = { "service-worker": "script", "sec-fetch-dest": "serviceworker", "sec-fetch-site": "same-origin" };
+    // What a browser sends when it installs, or checks for an update of, a Service Worker at each of these paths.
+    for (const path of ["/planted-sw.js", "/x", "/a/0123456789abcdef/planted.js", "/web/sw.js", "/callback/sw.js", "/Sw.js", "/sw.js/", "/sw.js.map", "//sw.js"]) {
+      const res = await h.get(path, asScript);
+      expect(await errorOf(res), path).toEqual({ status: 404, error: "not_found" });
+      expect(res.headers.get("clear-site-data"), path).toBe(CLEAR_SITE_DATA);
+    }
+    expect(CLEAR_SITE_DATA).toBe('"cache", "storage"');
+    // A path the Worker does answer is answered as ever — a page is no script, so the browser installs nothing — and cleared too.
+    for (const [path, status] of [["/", 200], ["/callback", 200], ["/privacy", 200], ["/web/refresh", 405], ["/refresh", 405]] as const) {
+      const res = await h.get(path, asScript);
+      expect(res.status, path).toBe(status);
+      expect(res.headers.get("clear-site-data"), path).toBe(CLEAR_SITE_DATA);
+    }
+    // A browser that sends no Sec-Fetch-Dest: the first header decides.
+    expect((await h.get("/planted-sw.js", { "service-worker": "script" })).headers.get("clear-site-data")).toBe(CLEAR_SITE_DATA);
+    // Over plain http the answer is the redirect, with the header (which a browser ignores there).
+    const plain = await h.call("http://auth.test/planted-sw.js", { headers: asScript });
+    expect([plain.status, plain.headers.get("clear-site-data")]).toEqual([308, CLEAR_SITE_DATA]);
+    expect(h.google.calls).toEqual([]);
+  });
+
+  it("nothing else is ever answered with Clear-Site-Data: the viewer's own Service Worker, what it imports, and every ordinary request", async () => {
+    h.env = withWeb();
+    const none = async (path: string, headers: Record<string, string>, what: string) => {
+      expect((await h.get(path, headers)).headers.get("clear-site-data"), what).toBeNull();
+    };
+    // /sw.js is the asset layer's and never gets here; if it did (a deployment without the file), it is the viewer's own.
+    expect(SERVICE_WORKER_PATH).toBe("/sw.js");
+    await none("/sw.js", { "service-worker": "script", "sec-fetch-dest": "serviceworker" }, "the viewer's Service Worker");
+    await none("/sw.js?x=1", { "service-worker": "script", "sec-fetch-dest": "serviceworker" }, "the viewer's Service Worker, with a query");
+    // Firefox sends `Service-Worker: script` for the scripts a Service Worker imports too: a file of the build that a
+    // deployment has not propagated yet must not clear the site.
+    await none("/a/0123456789abcdef/core.js", { "service-worker": "script", "sec-fetch-dest": "script" }, "an imported script (Firefox)");
+    await none("/a/0123456789abcdef/core.js", { "sec-fetch-dest": "script" }, "an imported script");
+    for (const dest of ["document", "empty", "worker", "script", "sharedworker", "iframe", ""]) {
+      await none("/planted-sw.js", { "service-worker": "script", "sec-fetch-dest": dest }, `Sec-Fetch-Dest: ${dest}`);
+    }
+    // The header's value is exact; a page cannot be made to send it cross-site (it is not a simple header, and no answer carries CORS).
+    for (const value of ["Script", "scripts", "true", "1", ""]) await none("/planted-sw.js", { "service-worker": value, "sec-fetch-dest": "serviceworker" }, `Service-Worker: ${value}`);
+    for (const path of ["/", "/callback", "/privacy", "/nowhere", "/seal-key", "/v/AAAAAAAAAAAAAAAAAAAAAA", "/favicon.ico"]) {
+      await none(path, {}, path);
+      await none(path, { "sec-fetch-dest": "document" }, path);
+      await none(path, { "sec-fetch-dest": "serviceworker" }, `${path}, Sec-Fetch-Dest alone`);
+    }
+    // The vault worker's question for the seal's key, when no Service Worker answers it: a plain 404 that says nothing.
+    expect(await errorOf(await h.get("/seal-key", { "sec-fetch-dest": "empty", "sec-fetch-site": "same-origin" }))).toEqual({ status: 404, error: "not_found" });
+    for (const [path, body] of [["/device/start", {}], ["/refresh", { refresh_token: "x" }]] as const) {
+      expect((await h.post(path, body)).headers.get("clear-site-data"), path).toBeNull();
+    }
+    for (const path of ["/web/start", "/web/token", "/web/refresh"]) expect((await h.web(path, {})).headers.get("clear-site-data"), path).toBeNull();
+    // Sign-out keeps its own, narrower value.
+    expect((await h.web("/web/logout")).headers.get("clear-site-data")).toBe('"storage"');
   });
 
   it("a body that is not application/json → 415", async () => {

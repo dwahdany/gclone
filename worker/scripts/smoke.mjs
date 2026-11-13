@@ -221,6 +221,24 @@ async function main() {
       equal(`GET ${path}: cache-control`, res.headers.get("cache-control"), "no-store");
     }
 
+    // The script of a Service Worker that is not the viewer's — a registration that whoever served this origin before
+    // left in a browser, asking for its update: the Worker's answer tells the browser to drop this site's data
+    // (README, "After a change of hands"). The asset layer says nothing of the kind: `/sw.js` is the viewer's own, and
+    // a script someone planted under /a/ is out of this switch's reach.
+    const asScript = { "service-worker": "script", "sec-fetch-dest": "serviceworker", "sec-fetch-site": "same-origin" };
+    for (const path of ["/planted-sw.js", "/v/sw.js", "/SW.js"]) {
+      const res = await request(dev, path, { headers: asScript });
+      equal(`GET ${path} as a Service Worker's script: status`, res.status, 404);
+      equal(`GET ${path} as a Service Worker's script: clear-site-data`, res.headers.get("clear-site-data"), '"cache", "storage"');
+    }
+    equal("GET /planted-sw.js as an ordinary request: no clear-site-data", (await request(dev, "/planted-sw.js")).headers.get("clear-site-data"), null);
+    const own = await request(dev, "/sw.js", { headers: asScript });
+    equal("GET /sw.js as a Service Worker's script: status", own.status, 200);
+    equal("GET /sw.js as a Service Worker's script: no clear-site-data", own.headers.get("clear-site-data"), null);
+    const planted = await request(dev, `/a/${build}/planted-sw.js`, { headers: asScript });
+    equal(`GET /a/${build}/planted-sw.js as a Service Worker's script: the asset layer's 404`, `${planted.status} ${planted.body.length}`, "404 0");
+    equal(`GET /a/${build}/planted-sw.js as a Service Worker's script: no clear-site-data (the Worker does not run there)`, planted.headers.get("clear-site-data"), null);
+
     // The viewer's sign-in routes (none of these makes the Worker ask Google).
     const challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
     const started = await post(dev, "/web/start", { challenge, state: "AAAAAAAAAAAAAAAAAAAAAA" });
@@ -265,7 +283,7 @@ async function main() {
     equal("POST /refresh from a web page: error", errorCode(fromPage), "cross_origin");
 
     // The log: one line per Worker request, with route, status and error code — and nothing else.
-    await settled(dev, 4 + 10 + 7 + 7 + 3);
+    await settled(dev, 4 + 10 + 4 + 7 + 7 + 3);
     const lines = dev.logLines();
     check("every log line has only route, status and error", lines.every((line) => Object.keys(line).every((key) => ["route", "status", "error"].includes(key))));
     check("no log line carries a query string or a code", !JSON.stringify(lines).includes("smoke-code") && !JSON.stringify(lines).includes("?"));

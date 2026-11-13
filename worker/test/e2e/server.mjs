@@ -6,7 +6,8 @@
 //                            `304`; a miss under /a/ is an empty 404 (the asset layer's answers)
 //   /, /callback             `dist/index.html` with the status line, the header set, `no-store`
 //   POST /web/start|token|refresh|logout   the shapes of worker/test/contract.json
-//   anything else            the Worker's JSON 404
+//   anything else            the Worker's JSON 404 (with `Clear-Site-Data` when the request is
+//                            for the script of a Service Worker, as the Worker answers it)
 //
 // One thing differs from the deployment, and only on the way out: the Drive host. The bundle
 // names `https://www.googleapis.com` in exactly two places — `connect-src` of the policy and
@@ -186,7 +187,10 @@ export class ViewerServer {
     }
     if (!url.pathname.startsWith('/web/')) {
       this.strays.push(`${req.method} ${url.pathname}${url.search}`);
-      return fail(404, 'not_found', 'There is nothing here.');
+      // As the Worker: the script of a Service Worker that is not the viewer's is answered with Clear-Site-Data too.
+      const dest = req.headers['sec-fetch-dest'];
+      const foreign = req.headers['service-worker'] === 'script' && (dest === undefined || dest === 'serviceworker');
+      return fail(404, 'not_found', 'There is nothing here.', foreign ? { 'Clear-Site-Data': '"cache", "storage"' } : {});
     }
     // The common rules of the four browser routes (worker/src/web.ts), in their order.
     if (req.method !== 'POST') return fail(405, 'method_not_allowed', 'Use POST.', { Allow: 'POST' });

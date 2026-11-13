@@ -1,10 +1,66 @@
 version: 2
+# What each entry is for:
+#   github-actions  the workflows pin every action to a commit; this keeps the pins current.
+#   cargo           the CLI's lockfile and the hosted viewer core's (web-core/ has a lockfile of its own, which
+#                   web-core/build.sh holds to the CLI's versions: a version bump of a crate that both use has to
+#                   land in both, so the two cargo entries are merged together or not at all).
+#   npm             the Worker's build and test toolchain (wrangler, vitest, TypeScript; the Worker itself and the
+#                   viewer's page have no npm dependency), and the pinned Playwright driver of the browser tests.
+#
+# Version updates wait: a release has to be two weeks old before it is proposed (`cooldown`), because a new
+# version of a dependency is also the newest place for a mistake or a planted change. A SECURITY update does not
+# wait - it needs "Dependabot alerts" and "Dependabot security updates" switched on in the repository's settings
+# (Settings → Advanced Security), which no file in the repository can do. .github/workflows/audit.yml is the second
+# pair of eyes (RustSec, weekly).
 updates:
-  # The workflows pin every action to a commit; this keeps the pins current.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     groups:
       actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /web-core
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    groups:
+      cargo-web-core:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /worker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    groups:
+      worker:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /worker/test/e2e
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    groups:
+      playwright:
         patterns: ["*"]

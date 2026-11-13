@@ -30,7 +30,7 @@ For the wire-level details (routes, parameters, error codes) see [`SPEC.md`](SPE
 |---|---|---|
 | **Auth Worker** (Worker secrets) | the device client's ID and secret; the allowed Google account(s); for the hosted viewer: the "Web application" client's ID and secret, and `SEAL_KEY`, the key that seals browser sessions | refresh tokens, device codes, file data, the passphrase, the vault key |
 | **Auth Worker** (static files, part of the deployment) | the hosted viewer's page, scripts and WebAssembly — the same bytes for everyone | anything of a user |
-| **Each device** (owner-only files) | its own refresh token, a cached access token (about 1 hour), the unlocked vault key | the Google client secret |
+| **Each device** (owner-only files) | its own refresh token, a cached access token (about 1 hour), the unlocked vault key — in the plain file `secrets.json`, or, on a Mac after `gclone keystore use enclave`, in `secrets.sealed`, encrypted to a key that only that Mac's Secure Enclave can use | the Google client secret |
 | **A browser signed in to the hosted viewer** | a cookie with that browser's refresh token **sealed under `SEAL_KEY`** (scripts cannot read it; the browser cannot open it); in the tab's memory, while it is open: an access token, and after the passphrase the vault's keys | the refresh token in the clear, the client secret; on disk: no key, nothing derived from the passphrase, no file name |
 | **Google** (during a login) | the pending login: device code, user code, whether the code was entered | — |
 | **Google Drive** (the vault folder) | encrypted blobs, the encrypted index, the vault key wrapped by the passphrase | the passphrase, any plaintext |
@@ -201,12 +201,34 @@ sequenceDiagram
 |---|---|---|---|
 | Passphrase | typed, or filled in by a password manager | the input field; one string handed to a short-lived worker — **and the browser's password store, if you let the browser save it** (the viewer cannot see or prevent that) | the field is cleared and the worker ended at once. A saved copy lives until you delete it in the password manager. |
 | What the passphrase is stretched into (Argon2id), and the key that opens the keyfile | a worker that exists only for the unlock | that worker's memory (256 MiB for a moment) | the worker is ended on success, when the unlock screen is left, and after two idle minutes |
-| The vault's master keys | that worker | handed directly to a second worker, which holds them and the decrypted index while the vault is unlocked. Never on the page itself, never stored. | Lock, reload, closing the tab |
-| The key of one opened file (a "ticket") | the second worker | passed directly to the Service Worker, which decrypts that file's bytes as they stream. Never on the page itself. | Lock and Sign out, and when the tab is closed, reloaded or taken to another address; otherwise when the browser stops the Service Worker. It opens that one file and nothing else. |
+| The vault's master keys | that worker | handed to a second worker, which holds them and the decrypted index while the vault is unlocked. The page's own scripts never hold them, and they are never stored. (The hand-over uses a channel the page sets up, and is not encrypted: a script that is in the page at that moment could divert it — and has the passphrase anyway.) | Lock, reload, closing the tab |
+| The key of one opened file (a "ticket") | the second worker | the Service Worker, which decrypts that file's bytes as they stream. The channel between the two is one the page sets up, so the ticket crosses it **sealed**: encrypted to a key pair that exists only in the Service Worker's memory, whose public half the second worker fetches from the Service Worker itself. The page, and any script in it, sees ciphertext. | Lock and Sign out, and when the tab is closed, reloaded or taken to another address — the Service Worker then drops the tickets and the key pair they were sealed to; otherwise when the browser stops the Service Worker. It opens that one file and nothing else. |
 | Access token (about an hour) | the Worker, from Google | a variable in the page and its workers | its expiry; never in an address, never stored |
 | Refresh token | Google, at `/web/token` | sealed, in the `HttpOnly` cookie; in the Worker's memory during a request | the session's sealed end; Sign out; a new `SEAL_KEY`; revocation at Google |
 | PKCE verifier and state | the page | the tab's session storage | removed on return from Google; ignored after ten minutes |
 | `SEAL_KEY`, the client secrets | you (`SEAL_KEY`: 32 fresh random bytes) | Worker secrets | when you replace them |
+
+**What a script in the page can and cannot get.** The page is where the passphrase is typed and where
+the files are shown, so a script that runs in it — a malicious browser extension, in practice — sees
+what the page sees: the passphrase, whenever it is typed or filled in while the script is there, and
+every name and the contents of every file, for as long as the vault is unlocked. What it does not get
+after the unlock is a **key**: no call hands out a master key, and tickets cross the page's channel
+sealed (the table above). So a script that is gone before the passphrase is entered again takes away
+what it read while it ran, not a handful of bytes per file that would open the whole vault later.
+
+Two limits of that, stated exactly. **A script in the unlocked page can keep that tab from locking or
+signing out.** The lock is code of the page the script is in: it can swallow the click or move the
+clock the idle lock reads, and the tab then keeps the open vault — the worker with the master keys
+goes on issuing tickets — for as long as the tab lives, not merely until the browser stops the
+Service Worker. (The lock does its irreversible steps first and with functions taken before any
+later script ran, so the cheap ways — making one statement of it throw — no longer work; the
+principle stands.) **And it has the passphrase the next time it is entered in that tab**: it can
+answer a click on Lock with the page's own unlock screen. So, if anything looks wrong: **close the
+tab or the browser rather than pressing Lock, and do not enter the passphrase in that tab again.**
+A password manager that fills login fields without a click would hand the passphrase to such a
+script without your typing anything; one that fills on your click is the better setting here.
+The Worker's own script cannot be held to any of this — whoever serves the page serves these scripts
+too (below).
 
 What a visit leaves behind in the browser: the cookie (until Sign out or its end), the sort order you
 chose, and history entries that hold two numbers and a flag — no address, title or history entry ever
@@ -245,6 +267,24 @@ Worker reaches ciphertext only. With it:
   the ciphertext, the keyfile and the passphrase.
 
 The threat model with all rows: [`SPEC.md`](SPEC.md) §1.3; the viewer itself: §7.5.
+
+### Where the refresh token lives on a device
+
+The refresh token and the unlocked vault key are one small document. By default it is the file
+`secrets.json` in gclone's state folder (`~/.local/state/gclone`), readable by its owner only and
+refused by gclone when anyone else can read it. A copy of that file is the login and the vault
+key — so gclone keeps the folder out of Time Machine backups and marks it for other backup tools
+(README, "Local files").
+
+On a Mac with a Secure Enclave, `gclone keystore use enclave` moves the document into
+`secrets.sealed`: the same content, encrypted to a key that never leaves that Mac's Secure
+Enclave. A copy of `secrets.sealed` — from a backup, a synced folder, a disk image — opens
+nowhere else. It is not a wall between programs: anything that runs as you on that Mac can ask
+the Secure Enclave the way gclone does. The command first checks that your passphrase opens the
+vault, because after it the passphrase is the only way back for that device if the Mac is erased
+or repaired. `gclone keystore use file` moves everything back. The cached access token
+(`token.json`, good for about an hour) stays a plain file in both cases. Nothing about this
+reaches the Worker or Google: it is only where the device keeps what it already had.
 
 ## Everyday use (every sync)
 
@@ -302,7 +342,9 @@ vault — so let an attached device go first.
 
 - **A device's refresh token.** With the `drive.file` scope it reaches only files gclone created, and
   those are ciphertext. A thief could delete them but not read them. Revoke gclone's access in the
-  Google account and run `gclone login` again on the remaining devices.
+  Google account and run `gclone login` again on the remaining devices. (A *copy* of a Mac's
+  `secrets.sealed` is neither a token nor a key to anyone without that Mac; a copy of a
+  `secrets.json` is both.)
 - **The Worker's secrets.** A client secret alone grants nothing without the account owner's consent
   at Google. Rotate it in the Google Cloud console and update the Worker secret. `SEAL_KEY` opens
   the session cookies of browsers — to someone who also has such a cookie. Replace it
@@ -314,8 +356,43 @@ vault — so let an attached device go first.
   and the device can be unlocked, that is a stolen unlocked device: revoke, sign in again, and know
   that the data it could reach stays exposed.
 - **Control of the Worker or the domain**, if you use the hosted viewer: whoever has it can serve a
-  page that takes the passphrase. `node scripts/verify-deployed.mjs https://<host> <tag>` (in
-  `worker/`) compares what is served with the signed release; after a suspected change of hands,
-  redeploy, rotate every secret, and stop using the viewer until you trust the host again.
+  page that takes the passphrase. After a suspected change of hands — someone else had your
+  Cloudflare account, the Worker's deploy token or the domain's DNS, even briefly:
+  1. Take the host back, deploy the release again (`worker/README.md`, "Deploying the viewer") and
+     rotate every secret: both client secrets in the Google console, `SEAL_KEY`, the Cloudflare
+     credentials themselves.
+  2. `node scripts/verify-deployed.mjs https://<host> <tag>` (in `worker/`) compares what the host
+     serves with the signed release. **It cannot see a browser, and it does not cover the Worker's
+     own code**: it checks the static files and the page as served to its own requests. The Worker
+     script is outside the release's signature — it is whatever was last uploaded, so step 1 is a
+     deploy from a clean checkout of the tag, not a look at the dashboard.
+  3. **In every browser that had the viewer open during that time — each phone, each laptop, each
+     profile — clear the site's data before you type the passphrase there again.** A page served by
+     someone else can leave a Service Worker in the browser that keeps answering your viewer's
+     address from inside the browser, without asking the host: it survives the redeploy, a restart
+     and an ordinary reload, and it shows *their* page — which asks for your passphrase — under the
+     real address. Nothing on the server can remove it for certain.
+     - Chrome, Edge, Brave (desktop): the icon left of the address → *Site settings* → *Delete data*
+       (or *Settings → Privacy and security → Site settings → View permissions and data stored
+       across sites*, search for the host, delete).
+     - Chrome on Android: ⋮ → *Settings → Site settings → All sites* → the host → *Clear & reset*.
+     - Firefox: the padlock → *Clear cookies and site data*.
+     - Safari on a Mac: *Settings → Privacy → Manage Website Data*, search for the host, *Remove*.
+       iPhone and iPad: *Settings → Apps → Safari → Advanced → Website Data*, the host, *Delete*.
+     - Then close every tab of the viewer, open it from the bookmark, and sign in again (clearing
+       the data signs that browser out).
+     If you cannot be sure which browsers that was, do it in all of them. A browser you no longer
+     have is not a problem: it holds no key.
+  4. If the passphrase was typed into the viewer during that time, treat it — and the vault key —
+     as known to whoever served the page: see the README, "If a passphrase or a device's key file
+     leaked".
+
+  The Worker helps a little with step 3 and must not be relied on: a request for the script of any
+  Service Worker other than the viewer's own is answered with `Clear-Site-Data`, on which Chrome
+  drops such a worker the next time it checks for an update — after a visit that still showed the
+  other page. Firefox ignores that header there, Safari's engine kept the worker in our tests, and a
+  worker whose script was placed among the viewer's static files is never asked of the Worker at
+  all. The viewer's own page also removes Service Workers that are not its own whenever it loads —
+  which is exactly what a worker for the whole address prevents.
 - **The passphrase.** It is the only thing protecting the vault key stored on Drive, so it should be
   long and random. It cannot be recovered.

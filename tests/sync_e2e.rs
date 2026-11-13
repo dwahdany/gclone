@@ -2425,6 +2425,75 @@ async fn a_removed_directory_is_listed_and_restored_in_one_segment() {
     );
 }
 
+/// Two devices on different clocks (§5.2.2). X's clock is three days ahead when it overwrites
+/// the file; Y, on the right clock, overwrites it afterwards. The version X wrote is the one
+/// that existed last, and it is what `restore` offers first and what `restore -r` brings back
+/// after a delete — whatever the removal times say. 0.5.0 once ordered by `removed_ms`, which
+/// since the L5 fix followed the writer's clock: the removal by X stood three days in the
+/// future, sorted as the newest, and the default `restore` silently returned version 1.
+#[tokio::test]
+async fn restore_orders_versions_causally_when_a_writer_clock_is_ahead() {
+    let (net, y) = Net::new().await;
+    y.write("doc", b"version 1");
+    clean(&y.up().await);
+    let x = net.device().await;
+    clean(&x.down().await);
+
+    // X overwrites, three days ahead: its segment's time, sealed and listed, is in the future.
+    let honest = net.backend.now_ms();
+    net.backend.set_now_ms(honest + 3 * DAY_MS);
+    x.write("doc", b"version 2 (written by X)");
+    clean(&x.up().await);
+    // Y, later, on the right clock.
+    net.backend.set_now_ms(honest + 2_000);
+    clean(&y.down().await);
+    y.write("doc", b"version 3 (written by Y, later)");
+    clean(&y.up().await);
+    y.settle().await;
+
+    let v = &y.vault;
+    let now = net.backend.now_ms();
+    let offered = remote_ops::restore_candidates(v, "doc", now).await.unwrap();
+    let sizes: Vec<u64> = offered.iter().map(|c| c.entry.size).collect();
+    assert_eq!(sizes, [24, 9], "newest first: X's version, then version 1");
+    assert!(
+        offered[0].removed_ms < offered[1].removed_ms,
+        "the times say the opposite: the removal by X is three days ahead"
+    );
+    assert!(
+        offered[0].by > offered[1].by,
+        "the superseding ops are ordered"
+    );
+    // A device that learns all of it at once agrees.
+    let z = net.device().await;
+    clean(&z.down().await);
+    let on_z = remote_ops::restore_candidates(&z.vault, "doc", now)
+        .await
+        .unwrap();
+    assert_eq!(on_z, offered);
+
+    // Deleted, the path comes back with what existed last — through the single-path restore
+    // (the newest candidate) and through the directory restore alike.
+    remote_ops::rm(v, &["doc".into()], false).await.unwrap();
+    let under = remote_ops::restorable_under(v, "", now).await.unwrap();
+    assert_eq!(under.len(), 1);
+    assert_eq!(
+        under[0].version.entry.size, 31,
+        "version 3 was the last one"
+    );
+    // All three removed versions handed to one call: the one removed last wins the path.
+    let all = remote_ops::restore_candidates(v, "doc", now).await.unwrap();
+    assert_eq!(all.len(), 3);
+    let mut shuffled = all.clone();
+    shuffled.reverse();
+    let done = remote_ops::restore_many(v, &shuffled).await.unwrap();
+    assert_eq!(done.restored, 1);
+    assert_eq!(
+        y.remote_content("doc").await,
+        b"version 3 (written by Y, later)"
+    );
+}
+
 /// A mistyped remote path in a download or a check must not look like success.
 #[tokio::test]
 async fn reading_from_a_remote_path_that_does_not_exist_is_an_error() {
@@ -2927,4 +2996,86 @@ async fn check_download_detects_tampering() {
     // an honest md5; authentication does not depend on that.
     let blobs = sync::check_blobs(v).await.unwrap();
     assert_eq!((blobs.missing.len(), blobs.mismatched.len()), (1, 1));
+}
+
+/// Regression (§5.9, §17.26, audit L3): `gc --purge` on a replica whose refresh had ignored an
+/// index object deleted, for good, a blob that a live file on another device points at. A
+/// file is deleted on day 0 and restored on day 24 (index only: the old blob gets a head
+/// again); the segment that carries the restore fails verification for device c; on day 31
+/// c's `gc --purge` found the blob dead and purged it in the same run.
+#[tokio::test]
+async fn gc_purge_refuses_on_a_replica_with_an_ignored_segment() {
+    let (net, a) = Net::new().await;
+    a.write("doc", &pattern(5, 50_000));
+    a.up().await;
+    a.write("keep", &pattern(6, 2_000));
+    a.up().await;
+    let c = net.device().await;
+    let blob = {
+        let head = a.vault.head("doc").unwrap().unwrap();
+        a.vault
+            .blob(&head.entry.loc.unwrap().blob)
+            .unwrap()
+            .unwrap()
+    };
+    // day 0: the file is deleted (both devices see it)
+    a.remove("doc");
+    a.up().await;
+    c.vault.refresh().await.unwrap();
+    // day 24: device a restores it
+    net.backend.advance_ms(24 * DAY_MS);
+    a.settle().await;
+    let now = net.backend.now_ms();
+    let offered = remote_ops::restore_candidates(&a.vault, "doc", now)
+        .await
+        .unwrap();
+    remote_ops::restore(&a.vault, "doc", &offered[0])
+        .await
+        .unwrap();
+    a.vault.finish_mutation().await.unwrap();
+
+    // junk under the name of the segment that carries the restore
+    let index = net.handles.index.clone();
+    let newest = net
+        .backend
+        .all_objects()
+        .into_iter()
+        .filter(|m| m.parent == index && !m.trashed && m.name.starts_with("s-"))
+        .max_by_key(|m| m.created_ms)
+        .unwrap();
+    assert!(net.backend.hard_delete(&newest.handle));
+    let id = net.backend.new_ids(1).await.unwrap().remove(0);
+    let junk = gclone::backend::stream_body(bytes::Bytes::from(vec![0x33u8; newest.size as usize]));
+    net.backend
+        .put(&id, &index, &newest.name, junk)
+        .await
+        .unwrap();
+
+    // day 31: device c collects garbage — and must not
+    net.backend.advance_ms(7 * DAY_MS);
+    let report = c.vault.refresh().await.unwrap();
+    assert_eq!(report.corrupt_objects, vec![newest.name.clone()]);
+    assert_eq!(report.blocked_young, 0);
+    let now = net.backend.now_ms();
+    assert_eq!(
+        c.vault.dead_blobs(now).unwrap().len(),
+        1,
+        "on c's incomplete view the blob is dead"
+    );
+    for (orphans, purge) in [(false, false), (false, true), (true, true)] {
+        match sync::gc(&c.vault, false, orphans, purge).await {
+            Err(gclone::error::SyncError::Index(gclone::error::IndexError::Incomplete(why))) => {
+                assert!(why.contains(&newest.name), "{why}")
+            }
+            other => panic!("gc must refuse: {other:?}"),
+        }
+    }
+    let left = net
+        .backend
+        .stat(&Handle(blob.file_id.clone()))
+        .await
+        .unwrap()
+        .expect("the blob of a's live file exists");
+    assert!(!left.trashed);
+    assert_eq!(a.remote_content("doc").await, pattern(5, 50_000));
 }

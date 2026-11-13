@@ -432,11 +432,12 @@ pub async fn restore_many<B: Backend>(
 ) -> Result<Restored, SyncError> {
     let mut out = Restored::default();
     // Newest removal first: where a file and a directory of the same name both ask to come
-    // back, the state that existed last is the one restored.
+    // back, the state that existed last is the one restored. "Newest" is the causal order of
+    // the superseding ops (`by`), not the removal times: those follow the clocks of the
+    // writers and of the store (§5.2.2).
     let mut order: Vec<&RemovedVersion> = versions.iter().collect();
     order.sort_by(|a, b| {
-        b.removed_ms
-            .cmp(&a.removed_ms)
+        b.by.cmp(&a.by)
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| b.stamp.cmp(&a.stamp))
     });

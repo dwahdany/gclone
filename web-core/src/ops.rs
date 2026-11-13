@@ -4,12 +4,10 @@
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::consts::{KEYFILE_MAX, KEYFILE_TRY_MAX};
-use crate::crypto::{
-    HEADER_LEN, KdfPreamble, Keyring, MasterKey, PREAMBLE_LEN, Passphrase, TAG_LEN,
-};
+use crate::consts::KEYFILE_TRY_MAX;
+use crate::crypto::{Keyring, MasterKey, Passphrase};
 use crate::error::{CryptoError, FormatError};
-use crate::format::{VaultDescriptor, open_keyfile, parse_keyfile_name};
+use crate::format::{VaultDescriptor, check_keyfile, open_keyfile, parse_keyfile_name};
 use crate::web::{mime, rules};
 use crate::{Code, Error, Result, util};
 
@@ -88,16 +86,11 @@ fn keyfile_error(e: FormatError) -> Error {
 /// passes — it can ask for that). The checks `open_keyfile` makes before it derives a key, in
 /// its order: name, size, the name's hash, the KDF preamble.
 pub fn keyfile_cost(name: &str, bytes: &[u8]) -> Result<CostJson> {
-    let damaged = || keyfile_error(FormatError::KeyfileDamaged);
-    let (generation, h8) = parse_keyfile_name(name)
-        .ok_or_else(|| Error::new(Code::BadInput, "not the name of a keyfile"))?;
-    if bytes.len() < PREAMBLE_LEN + HEADER_LEN + TAG_LEN || bytes.len() as u64 > KEYFILE_MAX {
-        return Err(damaged());
+    if parse_keyfile_name(name).is_none() {
+        return Err(Error::new(Code::BadInput, "not the name of a keyfile"));
     }
-    if blake3::hash(bytes).as_bytes()[..4] != h8 {
-        return Err(damaged());
-    }
-    let pre = KdfPreamble::decode(bytes).map_err(keyfile_error)?;
+    // The same function the CLI's ATTACH uses to tell a keyfile from a planted object.
+    let (generation, pre) = check_keyfile(name, bytes).map_err(keyfile_error)?;
     Ok(CostJson {
         generation,
         m_kib: pre.params.m_kib,

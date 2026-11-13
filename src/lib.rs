@@ -10,6 +10,7 @@ pub mod crypto;
 pub mod error;
 pub mod format;
 pub mod index;
+pub mod keystore;
 pub mod path;
 pub mod restic;
 pub mod state;

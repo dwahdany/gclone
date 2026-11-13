@@ -108,6 +108,10 @@ pub const HISTORY_KEEP: Duration = Duration::from_secs(35 * 86_400);
 pub const HISTORY_KEEP_MS: u64 = 35 * DAY_MS;
 pub const ORPHAN_GRACE: Duration = Duration::from_secs(14 * 86_400);
 pub const ORPHAN_GRACE_MS: u64 = 14 * DAY_MS;
+/// `gc` measures every age on the store's clock — this device's clock plus the offset that
+/// the `Date` header of the store's answers gave — and refuses while that offset is larger
+/// than this, in either direction (§5.9).
+pub const GC_CLOCK_SKEW_MAX_MS: u64 = DAY_MS;
 /// The local index cache keeps an object until the base covers it **and** it is this old (§5.6).
 pub const INDEX_CACHE_KEEP_MS: u64 = 30 * DAY_MS;
 /// Google keeps trashed objects this long (§3.2, §5.9).
@@ -214,13 +218,23 @@ pub const PROMPT_ATTEMPTS: u32 = 3;
 
 /// Unicode scalar values, for a typed passphrase.
 pub const PASSPHRASE_MIN_CHARS: usize = 12;
-/// A generated passphrase has this many Crockford symbols (100 bits).
-pub const PASSPHRASE_GENERATED_SYMBOLS: usize = 20;
-/// Below this many characters a typed passphrase gets a warning (§2.6).
+/// A generated passphrase has this many Crockford symbols: 26 × 5 = 130 bits (§2.6).
+pub const PASSPHRASE_GENERATED_SYMBOLS: usize = 26;
+/// What gclone before 0.5.0 generated: 20 symbols, 100 bits. Still recognised when a passphrase
+/// is entered or set — a passphrase generated then stays the same passphrase (§2.6).
+pub const PASSPHRASE_GENERATED_SYMBOLS_OLD: usize = 20;
+/// A typed passphrase shorter than this many characters gets a warning and a question (§2.6).
+/// Length is all the device can judge; four random words reach it, a word and a year do not.
 pub const PASSPHRASE_WARN_CHARS: usize = 20;
 pub const KEYFILE_MAX: u64 = 64 * KIB;
-/// A new device looks at the keyfiles with the highest generation only.
+/// A passphrase is tried on this many keyfiles — one key derivation each, highest generation
+/// first — unless the person asks for the rest (§2.6 ATTACH).
 pub const KEYFILE_TRY_MAX: usize = 4;
+/// Objects with a keyfile's name that a new device fetches and looks at (64 KiB each). The
+/// ones that are no keyfile are refused there and take none of the `KEYFILE_TRY_MAX` places.
+pub const KEYFILE_LOOK_MAX: usize = 32;
+/// The same with `gclone login --all-keyfiles`.
+pub const KEYFILE_LOOK_ALL_MAX: usize = 1024;
 /// Written keyfile KDF parameters: Argon2id v1.3, 256 MiB, t = 3, p = 1, 16-byte salt.
 pub const KDF_M_KIB: u32 = 262_144;
 pub const KDF_T: u32 = 3;

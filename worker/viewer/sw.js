@@ -1,10 +1,17 @@
 // gclone viewer — the Service Worker. It answers `GET /v/<id>` with the decrypted bytes of
 // one file, with `Range`, for the page's <img>, <video>, <audio>, <iframe>, fetch() and
-// download links. Nothing else is touched.
+// download links, and `GET /seal-key` (below). Nothing else is touched.
 //
 // It never holds the passphrase or a master key. What it holds is tickets — the key of one
-// file's stream and where its ciphertext is — which the vault worker sends over a port the
-// page hands to both sides, and an access token. A ticket opens one file and nothing else.
+// file's stream and where its ciphertext is — and an access token. A ticket opens one file
+// and nothing else. Tickets come from the vault worker over a port that the page hands to
+// both sides, so they come sealed (seal.js) to a key pair that exists only in this instance's
+// memory: the vault worker asks this worker for the public half with a request of its own
+// (`GET /seal-key`, answered here and nowhere else), and what then crosses the port can be
+// opened here and not by the page. `forget` (Lock, sign-out, a page that leaves) drops the
+// tickets and the key pair, so a sealed ticket that someone kept opens nothing afterwards.
+// No message of this worker to a page carries a key or a ticket; what a page gets from it
+// is the bytes of the file an id stands for.
 //
 // Every answer's type, policy and disposition come from the file NAME through the core's
 // table (`src/web/mime.rs`); content is never sniffed. Only a download carries the name: an
@@ -22,7 +29,7 @@ const BUILD = '__GCLONE_BUILD__';
 const BASE = `/a/${BUILD}/`;
 // This context's one Trusted Types policy: script URLs of this build only.
 const scriptUrl = (() => {
-  const allowed = ['core.js', 'token.js', 'drive.js'].map((name) => BASE + name);
+  const allowed = ['core.js', 'token.js', 'drive.js', 'seal.js'].map((name) => BASE + name);
   const check = (url) => {
     if (!allowed.includes(url)) throw new TypeError('not a script of this build');
     return url;
@@ -31,11 +38,26 @@ const scriptUrl = (() => {
   const policy = self.trustedTypes.createPolicy('gclone', { createScriptURL: check });
   return (url) => policy.createScriptURL(url);
 })();
-importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptUrl(`${BASE}drive.js`));
+// The viewer's Service Worker is the one registered for the whole origin (scope `/`), and
+// `forget` reaches that one. This script behaves as the viewer's Service Worker only there. A
+// script in the unlocked page could register a second instance of it for a narrower scope
+// (`/a/<build>/`): its `clients.claim()` took the running vault worker over, which then sealed
+// real tickets to the second instance — one that no Lock ever reached, and that went on
+// answering a window inside its scope with the files in full after the Lock. An instance for
+// any other scope is therefore inert: it loads nothing, answers nothing, holds no key pair,
+// claims no client, and removes its own registration as soon as it is activated.
+const WHOLE_ORIGIN = new URL(self.registration.scope).pathname === '/';
+if (WHOLE_ORIGIN) {
+  importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptUrl(`${BASE}drive.js`), scriptUrl(`${BASE}seal.js`));
+} else {
+  self.addEventListener('install', () => self.skipWaiting());
+  self.addEventListener('activate', (event) => event.waitUntil(self.registration.unregister()));
+}
 
 (() => {
+  if (!WHOLE_ORIGIN) return;
   const core = wasm_bindgen;
-  const { token, DriveError } = self.gclone;
+  const { token, DriveError, seal } = self.gclone;
   const MIB = 1024 * 1024;
   // Someone is looking at what is read here: a store that is out of reach is said so after
   // about ten seconds of pauses, not after the half minute of the index load.
@@ -55,6 +77,9 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
   const STREAM_RETRIES = 5; // consecutive failures of the store without a verified byte
   const EXPIRED = 'This link has expired. Open the file from the viewer again.';
   const UNREADABLE = 'The file could not be read from the vault: ';
+  const CHANNELS_MAX = 8; // channel keys kept at a time (one per unlocked tab is in use)
+  const RESEAL_MAX = 3; // times in a row a page is asked for a ticket this instance can open
+  const NO_SEAL = 'the viewer\'s Service Worker and its vault worker could not agree on a key. Reload the page.';
 
   let wasm = null;
   let memory = null; // the core's linear memory, for the size the page may ask about
@@ -75,6 +100,14 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
   /** client id → the ticket port that client's page handed over */
   const ports = new Map();
   let streams = 0;
+  /** The seal's key pair of this instance (seal.js): a promise of `{ secret, raw }`. Never stored. */
+  let sealing = null;
+  /** A vault worker's public key, as text → a promise of the key agreed with it. */
+  const channels = new Map();
+  /** Counts every `forget`: what was on its way when one arrived is not kept. */
+  let era = 0;
+  /** id → how often in a row its ticket arrived sealed to someone else */
+  const unopened = new Map();
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -87,8 +120,53 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
     for (const client of await self.clients.matchAll({ type: 'window', includeUncontrolled: true })) client.postMessage(message);
   }
 
+  function sealPair() {
+    if (!sealing) {
+      const mine = seal.generate();
+      sealing = mine;
+      mine.catch(() => { if (sealing === mine) sealing = null; });
+    }
+    return sealing;
+  }
+
+  /** `GET /seal-key`: the public half, for the vault worker's own request. A public key: whoever asks gets it. */
+  async function sealKey() {
+    const { raw } = await sealPair();
+    return new Response(raw, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(raw.length),
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        [seal.BUILD_HEADER]: BUILD,
+      },
+    });
+  }
+
+  /** What a sealed ticket holds — `{ ticket, token, exp }` — or `null`: not sealed to this instance, or not by anyone who had its key. */
+  async function unseal(id, sealed) {
+    if (!sealing || !sealed || !seal.isPublic(sealed.to) || !seal.isPublic(sealed.from)) return null;
+    try {
+      const mine = await sealing;
+      if (!seal.same(sealed.to, mine.raw)) return null;
+      const name = String.fromCharCode(...sealed.from);
+      let agreed = channels.get(name);
+      if (!agreed) {
+        if (channels.size >= CHANNELS_MAX) channels.delete(channels.keys().next().value);
+        agreed = seal.agree(mine.secret, sealed.from, mine.raw, sealed.from, 'decrypt');
+        channels.set(name, agreed);
+      }
+      const message = JSON.parse(await seal.open(await agreed, id, sealed.iv, sealed.data));
+      return message && typeof message.ticket === 'string' ? message : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /** What arrives on the ticket port of the page `who`, from its vault worker. */
-  function onPort(who, data) {
+  async function onPort(who, data) {
     if (!data || typeof data.id !== 'string') return;
     if (data.build !== BUILD) {
       // A page of another build: it — and only it — has to load the files this Service Worker
@@ -96,13 +174,36 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
       self.clients.get(who).then((client) => { if (client) client.postMessage({ type: 'reload', build: BUILD }); }, () => {});
       return;
     }
-    if (data.type === 'ticket' && typeof data.ticket === 'string') {
+    if (data.type === 'ticket') {
+      const since = era;
+      const message = await unseal(data.id, data.sealed);
+      if (since !== era) return; // a `forget` came in between
+      if (!message) {
+        // Sealed to another instance of this worker (it was restarted, or told to forget,
+        // after the vault worker had asked for its key) — or not a sealed ticket at all. This
+        // page's channel is dropped; with a new one the vault worker asks for the key again.
+        const port = ports.get(who);
+        if (port) port.close();
+        ports.delete(who);
+        const times = (unopened.get(data.id) || 0) + 1;
+        if (times >= RESEAL_MAX) {
+          unopened.delete(data.id);
+          refused.set(data.id, NO_SEAL);
+          wake(data.id);
+          return;
+        }
+        if (unopened.size >= 4096) unopened.clear();
+        unopened.set(data.id, times);
+        self.clients.get(who).then((client) => { if (client) client.postMessage({ type: 'need-ticket', id: data.id, port: false }); }, () => {});
+        return;
+      }
+      unopened.delete(data.id);
       const known = tickets.get(data.id);
-      if (!known || known.json !== data.ticket) {
-        tickets.set(data.id, { json: data.ticket, ticket: JSON.parse(data.ticket), blob: null, next: -1, win: MEDIA_WINDOW_MIN, failed: null });
+      if (!known || known.json !== message.ticket) {
+        tickets.set(data.id, { json: message.ticket, ticket: JSON.parse(message.ticket), blob: null, next: -1, win: MEDIA_WINDOW_MIN, failed: null });
       }
       refused.delete(data.id);
-      if (data.token) token.seed(data.token, data.exp);
+      if (message.token) token.seed(message.token, message.exp);
       wake(data.id);
     } else if (data.type === 'ticket-error') {
       refused.set(data.id, String(data.message || 'it cannot be opened'));
@@ -121,14 +222,19 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
       const old = ports.get(who);
       if (old) old.close();
       ports.set(who, event.ports[0]);
-      event.ports[0].onmessage = (message) => onPort(who, message.data);
+      event.ports[0].onmessage = (message) => { onPort(who, message.data).catch(() => {}); };
     } else if (data.type === 'forget') {
-      // Lock and sign-out: tickets, the token and the ports go; streams already open finish.
+      // Lock and sign-out: tickets, the token, the ports and the seal's key pair go — a
+      // sealed ticket that anyone kept opens nothing from here on. Streams already open finish.
+      era += 1;
       tickets.clear();
       refused.clear();
       token.forget();
       for (const port of ports.values()) port.close();
       ports.clear();
+      sealing = null;
+      channels.clear();
+      unopened.clear();
     } else if (data.type === 'claim') {
       // A page that this worker does not control yet (it was loaded past it — a forced
       // reload — or before the worker was active) asks to be taken over.
@@ -365,7 +471,12 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
     const request = event.request;
     if (request.method !== 'GET') return;
     const url = new URL(request.url);
-    if (url.origin !== self.location.origin || !/^\/v\/[A-Za-z0-9_-]{22}$/.test(url.pathname)) return;
+    if (url.origin !== self.location.origin) return;
+    if (url.pathname === seal.PATH) {
+      event.respondWith(sealKey().catch(() => plain(503, 'The seal of the ticket channel could not be made.')));
+      return;
+    }
+    if (!/^\/v\/[A-Za-z0-9_-]{22}$/.test(url.pathname)) return;
     event.respondWith(serve(request, url).catch((error) => plain(502, UNREADABLE + why(error))));
   });
 })();

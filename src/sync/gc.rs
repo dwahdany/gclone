@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 
 use crate::backend::{Backend, Handle};
-use crate::consts::ORPHAN_GRACE_MS;
-use crate::error::{BackendError, SyncError};
+use crate::consts::{GC_CLOCK_SKEW_MAX_MS, ORPHAN_GRACE_MS};
+use crate::error::{BackendError, IndexError, SyncError};
 use crate::format::blob_name;
 use crate::index::Vault;
 
@@ -28,15 +28,37 @@ async fn trash<B: Backend>(backend: &B, handle: &Handle) -> Result<(), BackendEr
     }
 }
 
-/// §5.9; the caller checked the refresh verdict. Publishes nothing, so it works on a full
-/// Drive and with a stuck outbox. All ages are server times (`Backend::now_ms`).
+/// Every age `gc` computes is measured on the store's clock (`Backend::now_ms`: this device's
+/// clock plus the offset the store's `Date` header gave). That offset is the store's word and
+/// has no bound of its own: a clock that jumps ahead by a grace period would make everything
+/// removed today look dead. `gc` therefore runs only while the two clocks are within
+/// `GC_CLOCK_SKEW_MAX_MS` of each other (§5.9, §17.26).
+pub fn check_gc_clock(offset_ms: i64) -> Result<(), SyncError> {
+    if offset_ms.unsigned_abs() <= GC_CLOCK_SKEW_MAX_MS {
+        return Ok(());
+    }
+    Err(SyncError::ClockSkew {
+        offset_ms,
+        limit_ms: GC_CLOCK_SKEW_MAX_MS,
+    })
+}
+
+/// §5.9. Refuses on a replica whose last refresh failed or ignored index objects
+/// (`Vault::index_incomplete`) — the caller still checks that a refresh ran at all. Publishes
+/// nothing, so it works on a full Drive and with a stuck outbox. All ages are server times
+/// (`Backend::now_ms`), and the store's clock must be near this device's ([`check_gc_clock`]).
 pub async fn gc<B: Backend>(
     vault: &Vault<B>,
     dry_run: bool,
     orphans: bool,
     purge: bool,
 ) -> Result<GcReport, SyncError> {
+    // A replica that is missing index state must not judge what is dead — in any of the steps.
+    if let Some(why) = vault.index_incomplete() {
+        return Err(IndexError::Incomplete(why).into());
+    }
     let backend = &**vault.backend();
+    check_gc_clock(backend.clock_offset_ms())?;
     let now = backend.now_ms();
     let mut report = GcReport {
         dry_run,
@@ -76,7 +98,7 @@ pub async fn gc<B: Backend>(
         }
     }
 
-    // 3. Purge — the single place where gclone deletes permanently. Only ids from the blob
+    // 3. Purge — the single place where gclone deletes data permanently. Only ids from the blob
     //    table, and only objects that are in the trash exactly as they were uploaded.
     if purge {
         for rec in vault.purge_candidates(now)? {

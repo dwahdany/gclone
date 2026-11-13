@@ -792,6 +792,12 @@ fn create_params(vault_id: [u8; 16], cache_dir: PathBuf) -> CreateParams {
 
 async fn world() -> (World, V) {
     let mem = MemBackend::new();
+    // The store's clock stands an hour ahead of this machine's, and it moves only when a test
+    // moves it: every time asserted below is the store's. A removal counts from the later of
+    // the store's creation time and the `created_ms` the writer sealed in
+    // (`index::removal_time`) — which is the writer's reading of the store's clock
+    // (`Backend::now_ms`), so nothing here may depend on this machine's own.
+    mem.advance_ms(3_600_000);
     let net = Arc::new(Flaky::new(mem.clone()));
     let tmp = tempfile::tempdir().unwrap();
     let keys = keyring(VAULT);
@@ -3418,6 +3424,201 @@ async fn replace_keyfile_trashes_lower_generations_after_the_put() {
         a.replace_keyfile(&bad).await,
         Err(IndexError::Format(_))
     ));
+}
+
+/// §2.7, §17.26: with `purge`, the retired keyfiles are deleted for good — the listed ones
+/// and the ones earlier runs left in the trash — and nothing else is: not the new keyfile,
+/// not a keyfile of the same generation, not another object of the root, trashed or not.
+#[tokio::test]
+async fn retired_keyfiles_can_be_deleted_for_good_trash_included() {
+    use gclone::index::RetiredKeyfiles;
+    let (w, a) = world().await;
+    let first = a.keyfiles().await.unwrap().remove(0);
+
+    // The new keyfile is read back from the store before anything is retired: one that the
+    // store does not return as it was sealed is trashed, and the old one stays.
+    let second = fake_keyfile(2, 2);
+    w.net
+        .fail_next(OpKind::Get, 1, || BackendError::Transient("cut".into()));
+    assert!(a.put_keyfile(&second).await.is_err());
+    assert_eq!(a.keyfiles().await.unwrap().len(), 2, "nothing was retired");
+    let stray = a
+        .keyfiles()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.name == second.name)
+        .unwrap();
+    assert!(w.mem.hard_delete(&stray.handle));
+
+    // Generation 2 the usual way: generation 1 goes to the trash.
+    let new = a.put_keyfile(&second).await.unwrap();
+    assert_eq!(
+        a.retire_keyfiles(&new, false).await.unwrap(),
+        RetiredKeyfiles {
+            trashed: 1,
+            ..Default::default()
+        }
+    );
+    assert!(w.net.stat(&first.handle).await.unwrap().unwrap().trashed);
+
+    // Other things in and around the root that a purge must leave alone.
+    let plant = async |name: &str, trashed: bool| {
+        let id = w.net.new_ids(1).await.unwrap().remove(0);
+        w.net
+            .put(&id, &w.handles.root, name, PutBody::Small(Bytes::new()))
+            .await
+            .unwrap();
+        if trashed {
+            w.net.trash(&id).await.unwrap();
+        }
+        id
+    };
+    let twin = fake_keyfile(3, 9); // a concurrent `passwd`: the same generation as the next
+    let twin_id = plant(&twin.name, false).await;
+    let trashed_twin = plant("gclone-key-00000003-0000aaaa", true).await;
+    let newer_in_trash = plant("gclone-key-00000007-0000bbbb", true).await;
+    let other_in_trash = plant("notes.txt", true).await;
+    let junk_low = plant("gclone-key-00000001-00000000", false).await;
+
+    // Listed apart, each highest generation first: what `passwd` numbers the next keyfile by.
+    let (live, trashed) = a.keyfiles_and_trashed().await.unwrap();
+    let names =
+        |found: &[ObjMeta]| -> Vec<String> { found.iter().map(|m| m.name.clone()).collect() };
+    assert_eq!(
+        names(&live),
+        [
+            twin.name.clone(),
+            second.name.clone(),
+            "gclone-key-00000001-00000000".into()
+        ]
+    );
+    assert_eq!(
+        names(&trashed),
+        [
+            "gclone-key-00000007-0000bbbb".to_string(),
+            "gclone-key-00000003-0000aaaa".to_string(),
+            first.name.clone(),
+        ]
+    );
+
+    // Generation 3 with `purge`: generation 2 (listed) and the junk under a lower number are
+    // deleted for good — and so is EVERY keyfile name in the trash, whatever its generation:
+    // nothing in the trash is a keyfile in use, each opens with an old passphrase, and
+    // "trash included" must be true also when the current keyfile was trashed by hand.
+    let third = fake_keyfile(3, 4);
+    let new = a.put_keyfile(&third).await.unwrap();
+    assert_eq!(
+        a.retire_keyfiles(&new, true).await.unwrap(),
+        RetiredKeyfiles {
+            trashed: 0,
+            deleted: 2,
+            deleted_from_trash: 3,
+        }
+    );
+    for gone in [&first.handle, &junk_low, &trashed_twin, &newer_in_trash] {
+        assert!(
+            w.net.stat(gone).await.unwrap().is_none(),
+            "deleted for good"
+        );
+    }
+    let listed: Vec<String> = a
+        .keyfiles()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    assert!(listed.contains(&third.name) && listed.contains(&twin.name));
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(!w.net.stat(&twin_id).await.unwrap().unwrap().trashed);
+    assert!(
+        w.net.stat(&other_in_trash).await.unwrap().unwrap().trashed,
+        "what is no keyfile is left in the trash"
+    );
+    let (live, trashed) = a.keyfiles_and_trashed().await.unwrap();
+    assert_eq!((live.len(), trashed.len()), (2, 0));
+    // The new keyfile itself is never touched, not even when it is in the trash.
+    w.net.trash(&new.handle).await.unwrap();
+    assert_eq!(
+        a.retire_keyfiles(&new, true).await.unwrap(),
+        RetiredKeyfiles::default()
+    );
+    assert!(w.net.stat(&new.handle).await.unwrap().unwrap().trashed);
+    w.net.untrash(&new.handle).await.unwrap();
+    // The index folder, the data folder and the journal are not touched.
+    assert_eq!(w.listed("s-").len(), 1);
+    a.refresh().await.unwrap();
+}
+
+/// §5.2.2: the removed versions of a path are listed in the order they were superseded — by
+/// the stamp of the superseding op — and not by `removed_ms`, which follows clocks: the
+/// writer's (sealed into the segment) and the store's.
+#[tokio::test]
+async fn removed_versions_are_ordered_by_the_superseding_op_not_by_time() {
+    let (w, y) = world().await;
+    let x = w.join("x").await;
+    y.commit_ops(vec![put("doc", 1), put("dir/other", 5)])
+        .await
+        .unwrap();
+    x.refresh().await.unwrap();
+    let honest = w.net.now_ms();
+    // X overwrites with its clock three days ahead; the segment is sealed with what its
+    // backend calls now.
+    w.mem.set_now_ms(honest + 3 * 86_400_000);
+    x.commit_ops(vec![put_over(&x, "doc", 2)]).await.unwrap();
+    let sealed = &w.listed(&format!("s-{}", x.device_id().hex()))[0];
+    assert_eq!(sealed.created_ms, honest + 3 * 86_400_000);
+    // Y, on the right clock, sees it and overwrites again; then deletes.
+    w.mem.set_now_ms(honest + 2_000);
+    y.refresh().await.unwrap();
+    y.commit_ops(vec![put_over(&y, "doc", 3), put_over(&y, "dir/other", 6)])
+        .await
+        .unwrap();
+    w.mem.advance_ms(1_000);
+    y.commit_ops(vec![del(&y, "doc")]).await.unwrap();
+
+    let tags = |v: &V| -> Vec<(Entry, u64)> {
+        v.removed_versions("doc")
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.entry, r.removed_ms))
+            .collect()
+    };
+    let on_y = tags(&y);
+    assert_eq!(
+        on_y.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        [file(3), file(2), file(1)],
+        "newest removal first"
+    );
+    // The times alone would put version 1 — removed "three days from now" — first.
+    assert_eq!(on_y[2].1, honest + 3 * 86_400_000);
+    assert!(on_y[0].1 < on_y[2].1 && on_y[1].1 < on_y[2].1);
+    // Every replica orders alike: one that applied the segments one by one, one that learns
+    // them at once, and one that starts from a snapshot.
+    x.refresh().await.unwrap();
+    assert_eq!(tags(&x), on_y);
+    let fresh = w.join("fresh").await;
+    assert_eq!(tags(&fresh), on_y);
+    y.write_snapshot().await.unwrap();
+    let from_snapshot = w.join("snap").await;
+    assert_eq!(tags(&from_snapshot), on_y);
+    // The listing by directory uses the same order within a path.
+    let under: Vec<(String, Entry)> = y
+        .removed_under("", 0)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.path, r.entry))
+        .collect();
+    assert_eq!(
+        under,
+        [
+            ("dir/other".to_string(), file(5)),
+            ("doc".to_string(), file(3)),
+            ("doc".to_string(), file(2)),
+            ("doc".to_string(), file(1)),
+        ]
+    );
 }
 
 // --- data folder, queries, lock --------------------------------------------------------------

@@ -1306,6 +1306,92 @@ fn unlock_tells_a_wrong_passphrase_from_everything_else() {
     );
 }
 
+/// A passphrase a keyfile is sealed under, and what typing each text must give (§2.6). The
+/// third is sealed as gclone before 0.5.0 sealed it: under the text as typed.
+fn passphrase_shapes() -> Vec<(Passphrase, Vec<(&'static str, &'static str)>)> {
+    const WORDS: &str = "maple tiger candle stone wharf";
+    vec![
+        (
+            Passphrase::from_input("7K2M9-QXA41-TBZR8-D0HNW"),
+            vec![
+                ("7K2M9-QXA41-TBZR8-D0HNW", "ok"),
+                ("7k2m9 qxa41 tbzr8 d0hnw\n", "ok"),
+                ("7k2m9qxa4ltbzr8dohnw", "ok"),
+                ("7K2M9-QXA41-TBZR8-D0HNX", "wrong-passphrase"),
+            ],
+        ),
+        (
+            Passphrase::from_input("ABCDE-FGHJK-MNPQR-STVWX-YZ0123"),
+            vec![
+                ("ABCDE-FGHJK-MNPQR-STVWX-YZ0123", "ok"),
+                ("abcde fghjk mnpqr stvwx yzo123", "ok"),
+                ("abcdefghjkmnpqrstvwxyz0123\r\n", "ok"),
+                ("ABCDE-FGHJK-MNPQR-STVWX-YZ0124", "wrong-passphrase"),
+                ("ABCDE-FGHJK-MNPQR-STVWX", "wrong-passphrase"),
+            ],
+        ),
+        (
+            Passphrase::from_input(WORDS).legacy().unwrap(),
+            vec![
+                (WORDS, "ok"),
+                ("Maple Tiger Candle Stone Wharf", "wrong-passphrase"),
+                ("MAP1E-T1GER-CAND1-EST0N-EWHARF", "wrong-passphrase"),
+            ],
+        ),
+    ]
+}
+
+/// The viewer normalises a passphrase exactly as the CLI does — it is the same code — and
+/// opens what the CLI opens: both generated shapes however they are typed, and the keyfiles
+/// that gclone 0.4.0 sealed (the frozen vectors of the main crate).
+#[test]
+fn unlock_accepts_both_generated_shapes_and_the_keyfiles_of_0_4_0() {
+    let bundle = ops::bundle_of(&core_keys());
+    for (sealed_under, cases) in passphrase_shapes() {
+        let payload = KeyfilePayload::from_keyring(&native_keys(), 1, "parity", 5);
+        let sealed = seal_keyfile(&payload, &sealed_under, FAST_KDF).unwrap();
+        for (typed, expect) in cases {
+            let got = match ops::unlock(&sealed.name, &sealed.bytes, typed, VAULT_HEX) {
+                Ok(opened) => {
+                    assert_eq!(opened.as_slice(), bundle.as_slice());
+                    "ok"
+                }
+                Err(e) => e.code.as_str(),
+            };
+            assert_eq!(got, expect, "{typed:?}");
+        }
+    }
+
+    let frozen: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/vectors/passphrase_v0_4_0.json"
+    )))
+    .unwrap();
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_owned();
+    let (vault_id, mk) = (text(&frozen["vault_id"]), text(&frozen["mk"]));
+    let mut opened = 0;
+    for case in frozen["keyfiles"].as_array().unwrap() {
+        let bytes: Vec<u8> = (0..text(&case["keyfile"]).len() / 2)
+            .map(|i| u8::from_str_radix(&text(&case["keyfile"])[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        let entered = text(&case["entered"]);
+        for typed in [entered.clone(), format!("{entered}\n")] {
+            let bundle = ops::unlock(&text(&case["name"]), &bytes, &typed, &vault_id)
+                .unwrap_or_else(|e| panic!("{}: {}", case["what"], e.message));
+            assert!(
+                gclone::util::hex(&bundle).ends_with(&mk),
+                "the master key of the vector"
+            );
+            opened += 1;
+        }
+        if case["what"] == "generated-20" {
+            let lower = entered.to_lowercase().replace('-', " ");
+            assert!(ops::unlock(&text(&case["name"]), &bytes, &lower, &vault_id).is_ok());
+        }
+    }
+    assert_eq!(opened, 6);
+}
+
 #[test]
 fn keyfile_candidates_are_the_four_highest_generations() {
     let names: Vec<String> = [
@@ -1430,7 +1516,10 @@ async fn tickets_open_their_file_whole_and_by_range() {
     let mut files = 0;
     for head in c.walk("").unwrap() {
         if head.entry.kind != EntryKind::File {
-            assert_eq!(reader.ticket(&head.path).unwrap_err().code, Code::NotAFile);
+            assert_eq!(
+                reader.ticket(&head.path).err().expect("no ticket").code,
+                Code::NotAFile
+            );
             continue;
         }
         files += 1;
@@ -1522,7 +1611,11 @@ async fn tickets_open_their_file_whole_and_by_range() {
         ("", Code::BadInput),
         ("a//b", Code::BadInput),
     ] {
-        assert_eq!(reader.ticket(path).unwrap_err().code, code, "{path:?}");
+        assert_eq!(
+            reader.ticket(path).err().expect("no ticket").code,
+            code,
+            "{path:?}"
+        );
     }
 }
 
@@ -1746,7 +1839,7 @@ async fn an_index_entry_that_contradicts_itself_gets_no_ticket() {
         // A key epoch this keyfile does not carry: written with keys of a later rotation.
         ("new-epoch.bin", Code::NeedsNewer),
     ] {
-        let e = reader.ticket(path).unwrap_err();
+        let e = reader.ticket(path).err().expect("no ticket");
         assert_eq!(e.code, code, "{path}: {e}");
     }
     // They are listed all the same: the listing does not depend on the data.
@@ -1784,7 +1877,7 @@ async fn an_index_entry_that_contradicts_itself_gets_no_ticket() {
             .unwrap()
     );
     assert_eq!(reader.finish().unwrap().files, 7);
-    let e = reader.ticket("overflow.bin").unwrap_err();
+    let e = reader.ticket("overflow.bin").err().expect("no ticket");
     assert_eq!(e.code, Code::Corrupt, "{e}");
 }
 
@@ -2381,6 +2474,19 @@ async fn export_for_the_wasm_suite() {
         "ok",
         "damaged",
     );
+    // --- the generated shapes of §2.6: 26 symbols since 0.5.0, 20 before; and a typed passphrase
+    //     of the 26-symbol shape, which gclone before 0.5.0 used as typed (§17.26)
+    for (sealed_under, cases) in passphrase_shapes() {
+        let payload = KeyfilePayload::from_keyring(&native_keys(), 1, "parity", 5);
+        let sealed = seal_keyfile(&payload, &sealed_under, FAST_KDF).unwrap();
+        write(&format!("keyfiles/{}", sealed.name), &sealed.bytes);
+        for (typed, expect) in cases {
+            keyfiles.push(serde_json::json!({
+                "name": sealed.name, "pass": typed, "vault_id": VAULT_HEX, "expect": expect,
+                "cost": "ok",
+            }));
+        }
+    }
     let all = serde_json::json!({
         "bundle": hex(&ops::bundle_of(&core_keys())),
         "gates": gates,

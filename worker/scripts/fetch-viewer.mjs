@@ -3,8 +3,10 @@
 //   node scripts/fetch-viewer.mjs v0.4.0 [--dist <dir>]
 //
 // The bundle comes from releaseBundle() (release-bundle.mjs): downloaded from the tag's GitHub release, its
-// build-provenance attestation verified with `gh`, unpacked and checked. Only then is `dist/` replaced with that
-// tree. Prints the version, the build id and the tarball's SHA-256.
+// build-provenance attestation verified with `gh` — in a git checkout also against the commit the checkout is at,
+// whose Worker code will be deployed with it —, the release verified to be immutable, the bundle unpacked and
+// checked. Only then is `dist/` replaced with that tree. Prints the version, the build id, the commit and the
+// tarball's SHA-256: keep them, they are what a later check is compared with.
 //
 // It replaces a `dist/` that holds a bundle or the placeholder, and refuses one that holds anything else.
 // Node built-ins and `gh` only: it runs before `npm ci`.
@@ -13,7 +15,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { TOP, inspectDist } from "./check-dist.mjs";
-import { command, compareFiles, releaseBundle } from "./release-bundle.mjs";
+import { checkout, command, compareFiles, releaseBundle } from "./release-bundle.mjs";
 
 /** Replaces the bundle in `dist` with the tree at `from`. Only what a bundle consists of is ever removed. */
 export function replaceDist(dist, from) {
@@ -45,13 +47,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const at = args.indexOf("--dist");
     const dist = at >= 0 ? args.splice(at, 2)[1] : undefined;
     if (args.length !== 1 || (at >= 0 && dist === undefined)) throw new Error("usage: node scripts/fetch-viewer.mjs <tag> [--dist <dir>]     (for example v0.4.0; the default directory is worker/dist)");
-    const done = fetchViewer(args[0], dist === undefined ? {} : { dist });
+    const here = checkout();
+    const done = fetchViewer(args[0], { ...(dist === undefined ? {} : { dist }), commit: here?.commit ?? null });
     console.log(`fetch-viewer: ${done.dist} is the viewer of ${done.repo} ${done.tag}`);
     console.log(`  version   ${done.version}`);
     console.log(`  build     ${done.build}`);
     console.log(`  commit    ${done.manifest.commit}`);
     console.log(`  tarball   ${done.tarball.name}  sha256 ${done.tarball.sha256}`);
-    console.log(`  verified  attestation of ${done.repo}/.github/workflows/release.yml on refs/tags/${done.tag}`);
+    console.log(`  verified  attestation of ${done.repo}/.github/workflows/release.yml on refs/tags/${done.tag}${done.commit === null ? "" : `, built from this checkout's commit ${done.commit}`}`);
+    console.log(`  release   ${done.immutable ? "immutable (gh release verify-asset): the tag, its commit and its files are fixed" : "NOT immutable — see the warning above"}`);
+    if (here === null) console.log("  note      this is not a git checkout: the bundle's commit was not compared with the Worker's code here");
     console.log("Next: npm ci && npm run deploy");
   });
 }

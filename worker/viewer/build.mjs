@@ -30,7 +30,7 @@ const REPO = resolve(HERE, '..', '..');
 
 /** Files of the build directory, by where they come from. Order does not matter. */
 export const SHARED = ['app.js', 'app.css', 'icon.svg']; // src/web/assets/, byte for byte
-export const HOSTED = ['token.js', 'provider.js', 'shell.js', 'drive.js', 'loader.js', 'vault-worker.js', 'kdf-worker.js', 'shell.css', 'noscript.css'];
+export const HOSTED = ['token.js', 'provider.js', 'shell.js', 'drive.js', 'loader.js', 'seal.js', 'vault-worker.js', 'kdf-worker.js', 'shell.css', 'noscript.css'];
 export const CORE = ['core.js', 'core.wasm']; // web-core/pkg/
 
 export const BUILD_MARK = '__GCLONE_BUILD__';

@@ -1,7 +1,6 @@
 //! `gclone web` (SPEC §7.4, §10): the glue between the command line and `crate::web`.
 
 use std::io::IsTerminal as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,7 +14,7 @@ use super::{
     test_env,
 };
 use crate::backend::AnyBackend;
-use crate::config::{BackendCfg, Config, Paths, Secrets, secret_store};
+use crate::config::{BackendCfg, Config, FileStamp, Paths, Secrets, SecretsPresence, secret_store};
 use crate::crypto::Keyring;
 use crate::error::{ConfigError, IndexError};
 use crate::index::RefreshReport;
@@ -45,12 +44,12 @@ const SIGNED_OUT: &str = "The viewer has stopped: this device was signed out, or
 const STATE_GONE: &str = "The viewer has stopped: this device's local state of the vault was \
     removed or replaced while it ran (`gclone logout --forget`). Start `gclone web` again.";
 
-/// What tells one version of a file from the next without reading it.
-type Stamp = (u64, u64, i64, i64, u64);
+type Stamp = FileStamp;
+/// `secrets.json` and `secrets.sealed`.
+type SecretsStamps = (Option<Stamp>, Option<Stamp>);
 
 fn stamp(path: &Path) -> Option<Stamp> {
-    let md = std::fs::symlink_metadata(path).ok()?;
-    Some((md.dev(), md.ino(), md.mtime(), md.mtime_nsec(), md.size()))
+    FileStamp::of(path)
 }
 
 /// The login a secrets file holds, as far as the viewer depends on it: the Google login and
@@ -71,7 +70,8 @@ fn login_digest(key: &[u8; 32], secrets: &Secrets) -> blake3::Hash {
 }
 
 /// Whether this device is still what it was when the viewer started (§7.4): `config.json`
-/// names the same vault, `secrets.json` holds the same login and keys, and `state.db` is the
+/// names the same vault, the key store (`secrets.json` or `secrets.sealed`) holds the same
+/// login and keys, and `state.db` is the
 /// file the viewer has open. `gclone logout` takes the first two away, `--forget` all three;
 /// the viewer keeps keys, backend and an open database in memory and would otherwise go on
 /// serving — and, with the next refresh, write the state back. Once it has failed it stays
@@ -83,8 +83,9 @@ pub(crate) struct DeviceGuard {
     login: blake3::Hash,
     /// Device and inode of `state.db`.
     db: (u64, u64),
-    /// `config.json` and `secrets.json` as last read and found unchanged.
-    seen: Mutex<Option<(Stamp, Stamp)>>,
+    /// `config.json` and the secrets files (`secrets.json`, `secrets.sealed`) as last read
+    /// and found unchanged.
+    seen: Mutex<Option<(Stamp, SecretsStamps)>>,
     gone: OnceLock<&'static str>,
 }
 
@@ -102,7 +103,7 @@ impl DeviceGuard {
             vault_id: config.vault_id.clone(),
             login: login_digest(&digest_key, &secrets),
             digest_key,
-            db: (db.0, db.1),
+            db: db.file_id(),
             seen: Mutex::new(None),
             gone: OnceLock::new(),
         })
@@ -110,29 +111,38 @@ impl DeviceGuard {
 
     fn look(&self) -> Result<(), &'static str> {
         match stamp(&self.paths.db_file(&self.vault_id)) {
-            Some(db) if (db.0, db.1) == self.db => {}
+            Some(db) if db.file_id() == self.db => {}
             _ => return Err(STATE_GONE),
         }
-        let files = (
-            stamp(&self.paths.config_file()),
-            stamp(&self.paths.secrets_file()),
-        );
-        let (Some(config), Some(secrets)) = files else {
+        let Some(config) = stamp(&self.paths.config_file()) else {
             return Err(SIGNED_OUT);
+        };
+        // The secrets are in `secrets.json` or in `secrets.sealed`, and `gclone keystore use`
+        // moves them between the two while this viewer runs (§8.3): neither file found while
+        // another gclone holds the secrets lock is a move in progress, not a sign-out.
+        let secrets = match self.paths.secrets_presence() {
+            SecretsPresence::Present(plain, sealed) => (plain, sealed),
+            SecretsPresence::Busy => return Ok(()),
+            SecretsPresence::Absent => return Err(SIGNED_OUT),
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         if *seen == Some((config, secrets)) {
             return Ok(());
         }
         // One of the files was written since: the same vault, the same login?
-        let same_vault = Config::load(&self.paths).is_ok_and(|c| c.vault_id == self.vault_id);
-        let same_login = secret_store(&self.paths)
-            .load()
-            .ok()
-            .flatten()
-            .is_some_and(|s| login_digest(&self.digest_key, &s) == self.login);
-        if !same_vault || !same_login {
+        if !Config::load(&self.paths).is_ok_and(|c| c.vault_id == self.vault_id) {
             return Err(SIGNED_OUT);
+        }
+        match secret_store(&self.paths).load() {
+            Ok(Some(s)) if login_digest(&self.digest_key, &s) == self.login => {}
+            // Signed out, or another login or other keys.
+            Ok(_) => return Err(SIGNED_OUT),
+            // The files could not be read at this moment — a sealed store in the middle of
+            // being replaced, a session hiccup: not a sign-out. Look again at the next tick.
+            Err(e) => {
+                tracing::debug!("the viewer could not re-read this device's secrets: {e}");
+                return Ok(());
+            }
         }
         *seen = Some((config, secrets));
         Ok(())
@@ -570,6 +580,74 @@ mod tests {
         assert_eq!(guard2.check(), Err(STATE_GONE));
         // A device without state has no viewer to guard.
         assert!(DeviceGuard::new(&paths, &config).is_err());
+    }
+
+    /// `gclone keystore use` moves the secrets between `secrets.json` and `secrets.sealed`
+    /// while a viewer runs (§8.3): the same login in another file is not a sign-out, a
+    /// moment in which another gclone holds the secrets lock is not one, and neither is a
+    /// sealed file that cannot be read at the moment of the look. A logout is, from either.
+    #[test]
+    fn the_guard_survives_the_key_store_moves() {
+        use crate::keystore::{self, LayeredStore};
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, config, secrets) = device(tmp.path());
+        let store = LayeredStore::new(&paths);
+        let sealer = store.sealer().clone().unwrap();
+        let guard = DeviceGuard::new(&paths, &config).unwrap();
+        assert_eq!(guard.check(), Ok(()));
+
+        for _ in 0..3 {
+            let document = std::fs::read(paths.secrets_file()).unwrap();
+            let (blob, public) = sealer.create().unwrap();
+            keystore::move_to_enclave(&store, &document, &blob, &public).unwrap();
+            assert!(!paths.secrets_file().exists() && paths.sealed_file().exists());
+            assert_eq!(guard.check(), Ok(()), "moved into the sealed store");
+            assert_eq!(guard.check(), Ok(()));
+            keystore::move_to_file(&store, false).unwrap();
+            assert!(paths.secrets_file().exists() && !paths.sealed_file().exists());
+            assert_eq!(guard.check(), Ok(()), "moved back");
+        }
+
+        // Sealed, and the file cannot be read right now: look again, do not stop.
+        let document = std::fs::read(paths.secrets_file()).unwrap();
+        let (blob, public) = sealer.create().unwrap();
+        keystore::move_to_enclave(&store, &document, &blob, &public).unwrap();
+        assert_eq!(guard.check(), Ok(()));
+        let good = std::fs::read(paths.sealed_file()).unwrap();
+        std::fs::write(paths.sealed_file(), b"{ damaged").unwrap();
+        assert_eq!(guard.check(), Ok(()), "a load error is not a sign-out");
+        assert_eq!(guard.check(), Ok(()));
+        std::fs::write(paths.sealed_file(), &good).unwrap();
+        assert_eq!(guard.check(), Ok(()));
+
+        // Neither file while a writer holds the lock: a move in progress.
+        let aside = tmp.path().join("aside");
+        std::fs::rename(paths.sealed_file(), &aside).unwrap();
+        let lock = std::fs::File::open(paths.secrets_lock()).unwrap();
+        lock.lock().unwrap();
+        assert_eq!(guard.check(), Ok(()), "busy: look again next tick");
+        std::fs::rename(&aside, paths.sealed_file()).unwrap();
+        lock.unlock().unwrap();
+        assert_eq!(guard.check(), Ok(()));
+
+        // Another login in the sealed store: signed in anew.
+        let mut other = secrets.clone();
+        other.keys[0].key = util::b64url(&[8; 32]);
+        secret_store(&paths).save(&other).unwrap();
+        assert!(
+            !paths.secrets_file().exists(),
+            "the save stayed in the sealed store"
+        );
+        assert_eq!(guard.check(), Err(SIGNED_OUT));
+
+        // A logout of a sealed device.
+        secret_store(&paths).save(&secrets).unwrap();
+        let guard = DeviceGuard::new(&paths, &config).unwrap();
+        assert_eq!(guard.check(), Ok(()));
+        secret_store(&paths).delete().unwrap();
+        assert!(!paths.sealed_file().exists());
+        assert_eq!(guard.check(), Err(SIGNED_OUT));
+        assert_eq!(guard.check(), Err(SIGNED_OUT), "tripped for good");
     }
 
     #[test]
