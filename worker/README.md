@@ -404,24 +404,24 @@ Then [deploy](#deploying-the-viewer), and go through the [checklist](#first-depl
 
 ## Deploying the viewer
 
-From a checkout of the release's tag (`git checkout v0.4.0`: the Worker's code and the header set the scripts
+From a checkout of the release's tag (`git checkout v0.5.0`: the Worker's code and the header set the scripts
 compare against come from the checkout; the viewer's files come from the release):
 
 ```sh
 cd worker
-node scripts/fetch-viewer.mjs v0.4.0                       # 1
+node scripts/fetch-viewer.mjs v0.5.0                       # 1
 npm ci                                                     # 2
 npm run deploy                                             # 3
-node scripts/verify-deployed.mjs https://<host> v0.4.0     # 4
+node scripts/verify-deployed.mjs https://<host> v0.5.0     # 4
 ```
 
-1. **`fetch-viewer`** downloads `gclone-viewer-0.4.0.tar.gz` from the tag's release into a temporary directory,
+1. **`fetch-viewer`** downloads `gclone-viewer-0.5.0.tar.gz` from the tag's release into a temporary directory,
    verifies its attestation —
 
    ```sh
-   gh attestation verify gclone-viewer-0.4.0.tar.gz --repo <owner>/<repo> \
+   gh attestation verify gclone-viewer-0.5.0.tar.gz --repo <owner>/<repo> \
      --signer-workflow <owner>/<repo>/.github/workflows/release.yml \
-     --source-ref refs/tags/v0.4.0 --deny-self-hosted-runners
+     --source-ref refs/tags/v0.5.0 --deny-self-hosted-runners
    ```
 
    — and only then unpacks it, checks it (`scripts/check-dist.mjs`) and replaces `./dist` with it. It prints the
@@ -490,7 +490,7 @@ note what you saw.
       ```
 
       `200` with the policy, `200` with the policy, `404` — and `tail` shows **no** line for any of the three.
-      (`<build>` is printed by `fetch-viewer`.) `node scripts/verify-deployed.mjs https://<host> v0.4.0` passes.
+      (`<build>` is printed by `fetch-viewer`.) `node scripts/verify-deployed.mjs https://<host> v0.5.0` passes.
 - [ ] **4. Cloudflare accepted the deployment** (`npm run deploy` ended without an error about the main module
       `src/entry.ts` or the assets).
 - [ ] **5. The phone** (iOS Safari; see also [the phone test](#the-phone-test-15-minutes)):

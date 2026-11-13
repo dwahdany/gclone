@@ -479,6 +479,10 @@ pub fn init_logging(verbose: u8) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(io::stderr)
+        // A log line that cannot be written is dropped. The default reports the failure with
+        // `eprintln!`, which panics on a closed stderr — and under `serve restic --stdio`
+        // stderr closes whenever restic exits first.
+        .log_internal_errors(false)
         // Colour only for a terminal: a log line in a file or a pipe carries no escape codes.
         .with_ansi(io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
         .with_target(verbose >= 2)

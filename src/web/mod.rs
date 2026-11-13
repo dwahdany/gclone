@@ -62,7 +62,7 @@ const BARE_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 pub const STREAMS_MAX: usize = 16;
 const STREAM_WAIT: Duration = Duration::from_secs(5);
 /// Connections at a time.
-const CONNECTIONS_MAX: usize = 128;
+pub const CONNECTIONS_MAX: usize = 128;
 /// Time for a client to send its request head, and the size that head may have: request
 /// line and header lines as they were sent. `handle` enforces the number; hyper's read buffer
 /// (`max_buf_size`, which grows past it before it gives up) only bounds what is read at all.
@@ -361,26 +361,70 @@ pub fn launch_page(link: &str) -> String {
 // The server
 // ---------------------------------------------------------------------------------------------
 
+/// What `bind` does when `[::1]:port` is already taken by someone else.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum V6 {
+    /// Serve on `127.0.0.1` alone (`gclone web`: a browser volunteers no secret).
+    IfFree,
+    /// Fail with `AddrInUse` (`gclone serve restic`: its client sends a token unasked, and
+    /// `localhost` may resolve to `::1` first). A machine without an IPv6 loopback — any other
+    /// bind error — still serves on `127.0.0.1` alone.
+    Required,
+}
+
 /// Listens on `127.0.0.1:port` (`0`: a free port) and, when that address is free as well, on
 /// `[::1]` with the same port. Never on anything but loopback.
 pub async fn bind(port: u16) -> std::io::Result<(Vec<TcpListener>, u16)> {
+    bind_v6(port, V6::IfFree).await
+}
+
+/// [`bind`], with the choice of what a taken `[::1]:port` means.
+pub async fn bind_v6(port: u16, v6: V6) -> std::io::Result<(Vec<TcpListener>, u16)> {
     let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let port = v4.local_addr()?.port();
     let mut listeners = vec![v4];
     match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
         Ok(v6) => listeners.push(v6),
+        Err(e) if v6 == V6::Required && e.kind() == std::io::ErrorKind::AddrInUse => {
+            let text = format!("port {port} is in use on [::1]");
+            return Err(std::io::Error::new(e.kind(), text));
+        }
         Err(e) => tracing::debug!("web: not listening on [::1]:{port}: {e}"),
     }
     Ok((listeners, port))
 }
 
-/// Serves until `cancel` fires. Connections still open then are dropped.
-pub async fn serve(listeners: Vec<TcpListener>, app: Arc<App>, cancel: CancellationToken) {
-    let connections = Arc::new(Semaphore::new(CONNECTIONS_MAX));
+/// Whether a request names this server: exactly one `Host` header, readable, one of `hosts`
+/// (ASCII case-insensitive) — and the same for the authority of an absolute-form request
+/// target. A page of another site that points its own host name at 127.0.0.1 (DNS rebinding)
+/// still sends that name.
+pub fn host_allowed(headers: &header::HeaderMap, uri: &hyper::Uri, hosts: &[String]) -> bool {
+    let host_ok = |host: &str| hosts.iter().any(|h| h.eq_ignore_ascii_case(host));
+    let mut named = headers.get_all(header::HOST).iter();
+    let named = match (named.next().map(|h| h.to_str()), named.next()) {
+        (Some(Ok(host)), None) => host_ok(host),
+        _ => false,
+    };
+    named && uri.authority().is_none_or(|a| host_ok(a.as_str()))
+}
+
+/// Serves `handler` on `listeners` — at most `connections` connections at a time, HTTP/1.1,
+/// loopback peers only — until `cancel` fires. Connections still open then are dropped.
+/// Shared by `gclone web` and the listener of `gclone serve restic`.
+pub async fn serve<H, F>(
+    listeners: Vec<TcpListener>,
+    handler: H,
+    connections: usize,
+    cancel: CancellationToken,
+) where
+    H: Fn(Request<Incoming>) -> F + Clone + Send + Sync + 'static,
+    F: Future<Output = Response<Body>> + Send + 'static,
+{
+    let connections = Arc::new(Semaphore::new(connections));
     for listener in listeners {
         tokio::spawn(accept(
             listener,
-            app.clone(),
+            handler.clone(),
             connections.clone(),
             cancel.clone(),
         ));
@@ -388,12 +432,15 @@ pub async fn serve(listeners: Vec<TcpListener>, app: Arc<App>, cancel: Cancellat
     cancel.cancelled().await;
 }
 
-async fn accept(
+async fn accept<H, F>(
     listener: TcpListener,
-    app: Arc<App>,
+    handler: H,
     connections: Arc<Semaphore>,
     cancel: CancellationToken,
-) {
+) where
+    H: Fn(Request<Incoming>) -> F + Clone + Send + Sync + 'static,
+    F: Future<Output = Response<Body>> + Send + 'static,
+{
     loop {
         let accepted = async {
             let permit = connections.clone().acquire_owned().await.ok()?;
@@ -416,11 +463,11 @@ async fn accept(
                 continue;
             }
         };
-        let (app, cancel) = (app.clone(), cancel.clone());
+        let (handler, cancel) = (handler.clone(), cancel.clone());
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
-                let app = app.clone();
-                async move { Ok::<_, std::convert::Infallible>(app.handle(req).await) }
+                let answer = handler(req);
+                async move { Ok::<_, std::convert::Infallible>(answer.await) }
             });
             let mut http = hyper::server::conn::http1::Builder::new();
             http.timer(hyper_util::rt::TokioTimer::new())
@@ -608,7 +655,7 @@ impl App {
     }
 
     /// One request → one response, with the headers every response carries.
-    async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
+    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
         // Never the query: it carries paths, and the key of the link.
         tracing::debug!("web: {} {}", req.method(), logged_path(req.uri().path()));
         let answer = match head_bytes(&req) > HEADER_BYTES_MAX {
@@ -647,15 +694,8 @@ impl App {
     }
 
     async fn answer(self: &Arc<Self>, req: &Request<Incoming>) -> Outcome<Response<Body>> {
-        // 1. Host: only the names this server listens under. A page of another site that
-        //    points its own host name at 127.0.0.1 (DNS rebinding) still sends that name.
-        let host_ok = |host: &str| self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host));
-        let mut hosts = req.headers().get_all(header::HOST).iter();
-        let named = match (hosts.next().map(|h| h.to_str()), hosts.next()) {
-            (Some(Ok(host)), None) => host_ok(host),
-            _ => false,
-        };
-        if !named || req.uri().authority().is_some_and(|a| !host_ok(a.as_str())) {
+        // 1. Host: only the names this server listens under (`host_allowed`).
+        if !host_allowed(req.headers(), req.uri(), &self.hosts) {
             return Err(refuse(
                 StatusCode::FORBIDDEN,
                 format!(
@@ -1355,5 +1395,85 @@ mod tests {
             assert!(PAGE_CSP.contains(directive), "{directive}");
         }
         assert!(!PAGE_CSP.contains("unsafe"));
+    }
+
+    /// The `Host` check that `gclone web` and `gclone serve restic` share.
+    #[test]
+    fn host_allow_list() {
+        let hosts: Vec<String> = ["127.0.0.1:8377", "localhost:8377", "[::1]:8377"]
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        let check = |named: &[&str], uri: &str| {
+            let mut headers = header::HeaderMap::new();
+            for host in named {
+                headers.append(header::HOST, HeaderValue::from_str(host).unwrap());
+            }
+            host_allowed(&headers, &uri.parse().unwrap(), &hosts)
+        };
+        for ok in [
+            "127.0.0.1:8377",
+            "localhost:8377",
+            "LOCALHOST:8377",
+            "[::1]:8377",
+        ] {
+            assert!(check(&[ok], "/"), "{ok}");
+        }
+        for bad in [
+            "127.0.0.1",
+            "127.0.0.1:8378",
+            "localhost",
+            "evil.example:8377",
+            "127.0.0.1:8377.evil.example",
+            "[::1]",
+            "",
+        ] {
+            assert!(!check(&[bad], "/"), "{bad:?}");
+        }
+        assert!(!check(&[], "/"), "no Host at all");
+        assert!(!check(&["127.0.0.1:8377", "127.0.0.1:8377"], "/"), "twice");
+        let mut unreadable = header::HeaderMap::new();
+        unreadable.insert(header::HOST, HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(!host_allowed(&unreadable, &"/".parse().unwrap(), &hosts));
+        // An absolute-form request target has to name this server as well.
+        assert!(check(&["127.0.0.1:8377"], "http://localhost:8377/x"));
+        assert!(!check(&["127.0.0.1:8377"], "http://evil.example:8377/x"));
+        assert!(!check(&["127.0.0.1:8377"], "http://127.0.0.1/x"));
+    }
+
+    /// `[::1]:N` in someone else's hands: `gclone web` serves on 127.0.0.1 alone, a server
+    /// whose client volunteers a secret does not start.
+    #[tokio::test]
+    async fn a_taken_ipv6_loopback_port() {
+        // Find a port that is free on 127.0.0.1 while this test holds it on [::1].
+        let mut held = None;
+        for _ in 0..50 {
+            let Ok(v6) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+                // No IPv6 loopback on this machine: nothing to tell apart.
+                return;
+            };
+            let port = v6.local_addr().unwrap().port();
+            if let Ok(probe) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                drop(probe);
+                held = Some((v6, port));
+                break;
+            }
+        }
+        let (_v6, port) = held.expect("a port that is free on 127.0.0.1");
+        let failed = bind_v6(port, V6::Required).await.unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(
+            failed.to_string(),
+            format!("port {port} is in use on [::1]")
+        );
+        let (listeners, bound) = bind_v6(port, V6::IfFree).await.unwrap();
+        assert_eq!((listeners.len(), bound), (1, port));
+        drop(listeners);
+        let (listeners, _) = bind(port).await.unwrap();
+        assert_eq!(listeners.len(), 1);
+        // Both free: both are bound, in either mode.
+        drop((listeners, _v6));
+        let (listeners, _) = bind_v6(0, V6::Required).await.unwrap();
+        assert!(!listeners.is_empty());
     }
 }

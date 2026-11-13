@@ -660,8 +660,9 @@ impl Inner {
     }
 
     /// All pages of one `q`; a rejected page token restarts the listing. A `404` (the folder
-    /// named in `q` is gone) is an empty listing, as on the other backends.
-    async fn list_query(&self, q: &str) -> Result<Vec<File>, BackendError> {
+    /// named in `q` is gone) is an empty listing, as on the other backends — or, `strict`,
+    /// `NotFound`: a caller that must never take "not found" for "empty" (§7.6, R2).
+    async fn list_query(&self, q: &str, strict: bool) -> Result<Vec<File>, BackendError> {
         let url = self.files_url();
         let mut restarts = 0;
         'listing: loop {
@@ -684,6 +685,7 @@ impl Inner {
                     .await;
                 let reply = match page {
                     Ok(reply) => reply,
+                    Err(Failure::NotFound) if strict => return Err(BackendError::NotFound),
                     Err(Failure::NotFound) => return Ok(Vec::new()),
                     Err(Failure::Other(BackendError::Fatal { status: 400, .. }))
                         if page_token.is_some() && restarts < LIST_RESTARTS =>
@@ -704,13 +706,26 @@ impl Inner {
     }
 
     pub(super) async fn list(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        self.list_children(parent, false).await
+    }
+
+    /// `Backend::list_strict`: a `404` is `NotFound`.
+    pub(super) async fn list_strict(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        self.list_children(parent, true).await
+    }
+
+    async fn list_children(
+        &self,
+        parent: &Handle,
+        strict: bool,
+    ) -> Result<Vec<ObjMeta>, BackendError> {
         let id = if parent.is_top() {
             "root"
         } else {
             parent.0.as_str()
         };
         let q = format!("'{}' in parents and trashed = false", q_escape(id));
-        let files = self.list_query(&q).await?;
+        let files = self.list_query(&q, strict).await?;
         if parent.is_top()
             && let Some(root) = files.first().and_then(File::parent_id)
         {
@@ -727,7 +742,7 @@ impl Inner {
         let q = format!("name = '{}' and trashed = false", q_escape(name));
         let mut found = Vec::new();
         // Whatever Drive's `name =` matches, the contract is byte-exact.
-        for file in self.list_query(&q).await? {
+        for file in self.list_query(&q, false).await? {
             if file.name.as_deref() == Some(name) {
                 let parent = self.parent_of(&file).await?;
                 found.push(file.into_meta(parent));

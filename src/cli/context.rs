@@ -445,7 +445,8 @@ pub fn build_backend(
 /// cache file at all. `login` ALWAYS passes false (§2.6: an access token obtained while signing
 /// in must never reach token.json); every other command passes true. Honours the debug-only
 /// `GCLONE_TEST_DRIVE_*` switches of §7.1 (as `build_backend` does). `client`: the OAuth client
-/// `refresh_token` belongs to (`Secrets::client`).
+/// `refresh_token` belongs to (`Secrets::client`). `GCLONE_TEST_FAST_PACER=1` (debug builds
+/// only, like the other switches) takes the pacing away.
 pub fn drive_backend(
     ep: AuthEndpoints,
     refresh_token: &str,
@@ -477,7 +478,28 @@ pub fn drive_backend(
         cfg.transfers,
         cfg.endpoints.api
     );
+    // Tests that drive the binary against the fake Drive: no pacing, millisecond backoff (the
+    // settings of the library tests' `fast_pacer`).
+    let fast = test_env("GCLONE_TEST_FAST_PACER").as_deref() == Some("1");
+    if fast {
+        let (rate, floor) = (1_000_000.0, 10_000.0);
+        cfg.pacer = crate::backend::drive::PacerConfig {
+            write_start: rate,
+            write_min: floor,
+            write_max: rate,
+            read_start: rate,
+            read_min: floor,
+            read_max: rate,
+            units_per_min: u32::MAX,
+            ..Default::default()
+        };
+    }
     let backend = DriveBackend::new(tokens.clone(), cfg)?;
+    if fast {
+        backend
+            .pacer()
+            .set_backoff_unit(std::time::Duration::from_millis(2));
+    }
     Ok((backend, tokens))
 }
 

@@ -333,6 +333,10 @@ impl Backend for DriveBackend {
         self.inner.list(parent).await
     }
 
+    async fn list_strict(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        self.inner.list_strict(parent).await
+    }
+
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {
         self.inner.find_by_name(name).await
     }

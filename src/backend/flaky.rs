@@ -384,6 +384,11 @@ impl<B: Backend> Backend for Flaky<B> {
         Ok(self.lagging(self.inner.list(parent).await?))
     }
 
+    async fn list_strict(&self, parent: &Handle) -> Result<Vec<ObjMeta>, BackendError> {
+        self.enter(OpKind::List).await?;
+        Ok(self.lagging(self.inner.list_strict(parent).await?))
+    }
+
     async fn find_by_name(&self, name: &str) -> Result<Vec<ObjMeta>, BackendError> {
         self.enter(OpKind::FindByName).await?;
         Ok(self.lagging(self.inner.find_by_name(name).await?))

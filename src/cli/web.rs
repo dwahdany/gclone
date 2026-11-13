@@ -409,7 +409,11 @@ pub async fn run(g: &GlobalOpts, args: WebArgs) -> anyhow::Result<i32> {
             serving.cancel();
         }
     });
-    web::serve(listeners, app.clone(), serving).await;
+    let handler = {
+        let app = app.clone();
+        move |req| app.clone().handle(req)
+    };
+    web::serve(listeners, handler, web::CONNECTIONS_MAX, serving).await;
     app.close();
     match app.check_alive() {
         Ok(()) => Ok(0),
