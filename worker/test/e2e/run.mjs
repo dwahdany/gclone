@@ -710,7 +710,8 @@ steps.media = async (s, page) => {
     a.muted = true;
     const from = a.currentTime;
     await a.play();
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    // Up to 15 s for half a second of sound: a shared CI runner starts its audio output slowly.
+    for (let i = 0; i < 150 && a.currentTime - from <= 0.5; i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
     a.pause();
     return a.currentTime - from;
   });
@@ -738,7 +739,7 @@ steps.media = async (s, page) => {
       await new Promise((resolve) => v.addEventListener('seeked', resolve, { once: true }));
       const from = v.currentTime;
       await v.play();
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      for (let i = 0; i < 150 && v.currentTime - from <= 0.5; i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
       v.pause();
       return v.currentTime - from;
     });
