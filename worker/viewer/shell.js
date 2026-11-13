@@ -270,7 +270,7 @@
   setInterval(async () => {
     if (!unlocked && openStreams === 0) return;
     if (unlocked && !navigator.serviceWorker.controller) {
-      lock(NO_SERVICE_WORKER);
+      lock(outElsewhere ? OUT_ELSEWHERE : NO_SERVICE_WORKER);
       return;
     }
     const pong = await ping();
@@ -610,7 +610,10 @@
   }
 
   // The other tabs of the viewer in this browser. Nothing of the vault is ever said here:
-  // two words, "lock" and "out".
+  // three words, "lock", "outgoing" and "out".
+  // "outgoing" comes before the sign-out's request: its answer clears this site's data, and a
+  // tab may see its Service Worker go before "out" arrives. It then says the true reason.
+  let outElsewhere = false;
   const tabs = (() => {
     try { return new BroadcastChannel('gclone'); } catch (_) { return null; }
   })();
@@ -621,7 +624,10 @@
     tabs.onmessage = (event) => {
       const type = event.data && event.data.type;
       if (leaving) return;
-      if (type === 'lock') {
+      if (type === 'outgoing') {
+        outElsewhere = true;
+      } else if (type === 'lock') {
+        outElsewhere = false;
         if (unlocked) lock(LOCKED_ELSEWHERE);
       } else if (type === 'out') {
         if (unlocked) lock(OUT_ELSEWHERE);
@@ -653,6 +659,7 @@
     if (vault) vault.terminate();
     endKdf();
     history.replaceState(null, '', '/');
+    tellTabs('outgoing');
     try {
       await token.post('/web/logout', {});
       // The answer cleared this site's storage; what a browser left is removed here.
@@ -739,7 +746,7 @@
     // Without its Service Worker the viewer reads no file: said on the passphrase screen,
     // not as a failure of every file that is opened.
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (unlocked && !navigator.serviceWorker.controller) lock(NO_SERVICE_WORKER);
+      if (unlocked && !navigator.serviceWorker.controller) lock(outElsewhere ? OUT_ELSEWHERE : NO_SERVICE_WORKER);
     });
   }
 
