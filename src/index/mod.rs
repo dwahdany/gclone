@@ -24,6 +24,7 @@ use crate::util;
 
 pub mod apply;
 mod commit;
+mod history;
 mod query;
 mod refresh;
 mod repair;
@@ -33,6 +34,7 @@ pub use apply::{
     ApplyStats, HeadStore, MemIndex, apply_segment, causal_order, check_snapshot_format,
     removal_time,
 };
+pub use history::{HistoryDb, SqlSource};
 
 #[derive(Clone, Debug)]
 pub struct VaultHandles {

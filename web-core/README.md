@@ -124,11 +124,21 @@ class Vault
   finish() -> JSON {snapshot, applied, blocked, missing: [[device, seq, hash, file_id]],
                     corrupt: ["<name>: <why>"], files, dirs, bytes, conflicts, head, vault_name}
   info(refresh_json) -> JSON InfoJson + "head"
-  list(path, sort?, order?, offset?, limit?) -> JSON ListJson
-  stat(path) -> JSON EntryJson (with path)
-  search(q, limit?, sort?, order?) -> JSON SearchJson
-  ticket(path) -> JSON {v: 1, name, size, file_id, blob_name, off, clen, chunk_log2, key, header}
+  list(path, sort?, order?, offset?, limit?, at?, now?) -> JSON ListJson
+  stat(path, at?, v?, now?) -> JSON EntryJson (with path)
+  search(q, limit?, sort?, order?, at?, now?) -> JSON SearchJson
+  versions(path, at?, now) -> JSON VersionsJson      the file as it is and its kept earlier versions
+  deleted(path, sort?, order?, offset?, limit?, now) -> JSON DeletedJson   what was deleted from a folder
+  timeline(now) -> JSON TimelineJson                 the moments at which the vault changed
+  ticket(path, v?, now?) -> JSON {v: 1, name, size, file_id, blob_name, off, clen, chunk_log2, key, header}
   free()
+
+  The time machine (SPEC §7.4): `at` is a moment in milliseconds since 1970 — the answer is
+  for the vault as it was then, with `"at"` (moved into the last 25 days) and `"since"` on
+  entries, and `"approx": true` on an entry that may have come later than that moment
+  (nothing records when it came); `v` is a version id (12 hex digits) — `stat` describes that version of the file,
+  `ticket` opens it. `now` is the caller's clock in milliseconds: the module reads none, and
+  it is required with `at` or `v`. Old call shapes are valid as they were.
 
 // Service Worker
 served(name, download) -> JSON {kind, mime, csp, disposition}   disposition: a bare "inline" for what is shown;

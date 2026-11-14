@@ -23,6 +23,10 @@
   --t-pdf: #c23b2e;
   --t-archive: #8c6d14;
   --t-file: #717a86;
+  /* The past (the time machine): the bars of the page while it shows an earlier moment. */
+  --past-bg: #fff1cc;
+  --past-fg: #4d3200;
+  --past-line: #a96f00;
   --row: 40px;
   --row-2: 56px;
   --pad: 20px;
@@ -53,6 +57,9 @@
     --t-pdf: #f08a7e;
     --t-archive: #d6b655;
     --t-file: #9aa3ae;
+    --past-bg: #3b2d0b;
+    --past-fg: #ffdc94;
+    --past-line: #c99a35;
   }
 }
 
@@ -225,6 +232,27 @@ code { padding: 1px 5px; border-radius: 5px; background: var(--code); font: 0.92
 /* A download that is being asked of the store. */
 .dl.wait { opacity: 0.6; cursor: progress; }
 
+/* A small button with a border: a switch, a step, "Copy". */
+.chip-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.chip-btn:hover { background: var(--hover); }
+.chip-btn:disabled { opacity: 0.45; cursor: default; }
+.chip-btn .i { width: 16px; height: 16px; }
+.chip-btn .short { display: none; }
+.chip-btn[aria-pressed="true"], .chip-btn[aria-expanded="true"] { border-color: var(--accent); background: var(--selected); }
+
 .progress { flex: none; height: 2px; background: var(--line); overflow: hidden; }
 .busy .progress::before {
   content: "";
@@ -257,8 +285,45 @@ code { padding: 1px 5px; border-radius: 5px; background: var(--code); font: 0.92
 .popover dd { overflow-wrap: anywhere; }
 .popover .hint { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px; }
 
+/* ---- the time machine ------------------------------------------------------------------------- */
+
+/* While the page shows an earlier moment its bars change colour — and say so in words. */
+.past .bar, .past .time { background: var(--past-bg); color: var(--past-fg); }
+.past .bar .icon-btn, .past .bar .brand .i, .past .time .time-end, .past .time .time-note { color: inherit; }
+.past .progress { background: var(--past-line); }
+
+.time { flex: none; padding: 6px var(--pad) 10px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.past .time { border-bottom: 2px solid var(--past-line); }
+.time-head { display: flex; align-items: center; gap: 10px; min-height: 36px; }
+.time-head > .i { width: 18px; height: 18px; }
+.time-label { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.time .btn { height: 32px; }
+.time .btn .short { display: none; }
+.time-track { margin-top: 2px; }
+/* The bars stand over the slider's track: the thumb's centre travels 8px short of each end. */
+.time-strip { display: flex; align-items: flex-end; gap: 1px; height: 26px; padding: 0 8px; }
+.time-strip span { flex: 1 1 0; min-width: 0; border-radius: 1px 1px 0 0; background: currentColor; opacity: 0.45; }
+.time-range { display: block; width: 100%; height: 22px; margin: 0; accent-color: var(--accent); }
+.past .time-range { accent-color: var(--past-line); }
+.time-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.time-end { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.time-end:first-child { margin-right: auto; }
+.time-end:last-child { margin-left: auto; }
+.time-when {
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+.time-note { margin-top: 6px; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+
 /* ---- path ------------------------------------------------------------------------------------ */
 
+.crumbs-row { flex: none; display: flex; align-items: center; gap: 8px; padding-right: var(--pad); }
+.crumbs-row .crumbs { flex: 1 1 auto; min-width: 0; }
 .crumbs { flex: none; padding: 10px var(--pad) 8px; }
 .crumbs ol {
   display: flex;
@@ -292,6 +357,7 @@ code { padding: 1px 5px; border-radius: 5px; background: var(--code); font: 0.92
 .crumbs a { color: var(--muted); }
 .crumbs a:hover { background: var(--hover); color: var(--text); }
 .crumbs [aria-current] { font-weight: 600; }
+.crumbs [aria-current] .i { width: 16px; height: 16px; margin-right: 5px; vertical-align: -3px; }
 
 .notice {
   flex: none;
@@ -304,9 +370,11 @@ code { padding: 1px 5px; border-radius: 5px; background: var(--code); font: 0.92
   border-radius: 10px;
   background: var(--panel);
 }
-.notice span { flex: 1; min-width: 0; padding-top: 2px; overflow-wrap: anywhere; }
+.notice > span { flex: 1; min-width: 0; padding-top: 2px; overflow-wrap: anywhere; }
 .notice.error { border-color: transparent; background: var(--error-bg); color: var(--error); }
 .notice.error .icon-btn { color: inherit; }
+/* A command in a sentence: it wraps, and one click selects all of it. */
+.cmd { white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
 
 /* ---- list ------------------------------------------------------------------------------------ */
 
@@ -387,6 +455,20 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; flex-di
    box runs right to left for that; its text (in a <bdi>) does not. */
 .row .sub.where { direction: rtl; text-align: left; }
 
+/* What became of an entry of the past, or how a deleted one went: after the name, where
+   rows have one line (in two-line rows the second line says it). */
+.row .since { flex: none; margin-left: auto; padding-left: 12px; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.two-line .row .since { display: none; }
+/* Deleted: dimmed, and said in words. */
+.row.gone .name { color: var(--muted); }
+.row.gone .c-name > .i { opacity: 0.55; }
+/* The line between a folder's rows and what was deleted from it. */
+.row.sep { display: flex; cursor: default; background: var(--panel); color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.row.sep:hover { background: var(--panel); }
+.row.sep .c-sep { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.row.sep .i { width: 16px; height: 16px; color: inherit; }
+.row.sep span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .t-folder { color: var(--t-folder) !important; }
 .t-image { color: var(--t-image) !important; }
 .t-video { color: var(--t-video) !important; }
@@ -411,6 +493,7 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; flex-di
 @media (prefers-color-scheme: dark) { .empty .i { color: #3a414b; } }
 .empty h2 { color: var(--text); font-size: 17px; font-weight: 600; }
 .empty p { max-width: 46ch; overflow-wrap: anywhere; }
+.empty .btn { margin-top: 12px; }
 
 .status {
   flex: none;
@@ -430,8 +513,60 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; flex-di
 
 /* ---- preview --------------------------------------------------------------------------------- */
 
-.viewer { position: fixed; inset: 0; z-index: 40; display: flex; flex-direction: column; background: var(--bg); }
-.viewer-bar { border-bottom: 1px solid var(--line); padding-left: 10px; }
+/* The bar, and under it the file — with the versions beside it when they are open. */
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--bg);
+}
+.viewer-bar { grid-column: 1 / -1; border-bottom: 1px solid var(--line); padding-left: 10px; }
+.viewer-body { grid-column: 1 / -1; grid-row: 2; }
+.viewer.sided .viewer-body { grid-column: 1; }
+.viewer-names { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.chip {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--past-bg);
+  color: var(--past-fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.versions {
+  grid-column: 2;
+  grid-row: 2;
+  width: min(340px, 42vw);
+  padding: 12px 12px 20px;
+  overflow-y: auto;
+  border-left: 1px solid var(--line);
+  background: var(--bg);
+}
+.versions-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 0 2px; }
+.versions-head h2 { padding-top: 3px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; unicode-bidi: isolate; }
+.versions-note { margin: 6px 2px 0; color: var(--muted); font-size: 12.5px; }
+.versions-list { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; list-style: none; }
+.versions-list button {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: none;
+  text-align: left;
+}
+.versions-list button:hover { background: var(--hover); }
+.versions-list button[aria-current="true"] { border-color: var(--accent); background: var(--selected); }
+.v-when { display: flex; justify-content: space-between; gap: 12px; font-weight: 600; }
+.v-size { flex: none; font-weight: 400; font-variant-numeric: tabular-nums; }
+.v-what { display: block; color: var(--muted); font-size: 12.5px; }
+.v-then { color: inherit; font-weight: 600; }
+.versions-restore { margin-top: 12px; padding: 12px 2px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
+.versions-restore .cmd { display: block; margin: 8px 0; padding: 8px 10px; }
 .viewer-title { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; margin: 0 8px 0 4px; }
 .viewer-title span { overflow: hidden; text-overflow: ellipsis; white-space: pre; unicode-bidi: isolate; }
 #viewer-name { font-size: 15px; font-weight: 600; }
@@ -439,7 +574,7 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; flex-di
 
 .viewer-body {
   position: relative;
-  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
@@ -537,6 +672,68 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; flex-di
   .btn { width: 38px; padding: 0; justify-content: center; }
   .card .btn { width: auto; padding: 0 14px; }
   .card .btn span { display: inline; }
+  .empty .btn { width: auto; padding: 0 14px; }
+  /* The time machine on a phone: short lines, and controls a thumb can hit. */
+  .time { padding-top: 4px; }
+  .time-label { white-space: normal; overflow-wrap: anywhere; }
+  .time .btn { width: auto; height: 44px; padding: 0 14px; }
+  .time .btn .long { display: none; }
+  .time .btn .short { display: inline; }
+  .time-range { height: 44px; }
+  .time-end { display: none; }
+  .time .chip-btn, .time-when { height: 44px; }
+  .time-when { flex: 1 1 150px; min-width: 0; font-size: 16px; }
+  .crumbs-row { padding-right: 6px; }
+  /* A word stays on the switch: a lone trash can would read as "delete this". */
+  #gone-btn { height: 44px; }
+  #gone-btn .long, #viewer-versions span { display: none; }
+  #gone-btn .short { display: inline; }
+  #viewer-versions { width: 38px; height: 38px; padding: 0; justify-content: center; border-color: transparent; background: none; color: var(--muted); }
+  #viewer-versions[aria-expanded="true"] { background: var(--selected); color: var(--text); }
+  #viewer-versions .i { width: 20px; height: 20px; }
+  /* The chip — the moment a file is shown at, which is the point of it — has no room beside
+     the name here: it is a line of its own under the bar, as wide as the screen. */
+  .viewer-bar { position: relative; }
+  .viewer.chipped .viewer-bar { margin-bottom: 24px; }
+  .viewer-names .chip {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    height: 24px;
+    padding: 0 14px;
+    border-radius: 0;
+    line-height: 24px;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The versions: a sheet under the file, never more than most of the screen. */
+  .viewer, .viewer.sided { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
+  .viewer.sided .viewer-body { grid-column: 1; }
+  .versions { grid-column: 1; grid-row: 3; width: auto; max-height: 60dvh; border-left: 0; border-top: 1px solid var(--line); }
+  .versions-list button { min-height: 44px; }
+  .versions .chip-btn { height: 44px; }
+  /* The sentence with the command gets a line of its own; the buttons go under it. */
+  #gone-note { flex-wrap: wrap; }
+  #gone-text { flex: 1 1 100%; }
+  #gone-note .chip-btn { height: 44px; }
+}
+
+/* A low window (a phone on its side, a small browser window): in the past the bar cannot be
+   closed, so it keeps to what is needed — the moment, the way back, the slider and the
+   steps — and leaves the room to the list. */
+@media (max-height: 600px) {
+  .time { display: flex; flex-wrap: wrap; align-items: center; gap: 0 10px; padding-top: 2px; padding-bottom: 4px; }
+  .time-head { flex: 1 1 100%; min-height: 32px; }
+  .time-track { flex: 1 1 140px; min-width: 0; margin-top: 0; }
+  .time-row { flex: 0 1 auto; margin-top: 0; }
+  .time-note { flex: 1 1 100%; margin-top: 0; }
+  .time-strip, .time-end, #time-hint { display: none; }
+}
+@media (max-height: 600px) and (max-width: 719px) {
+  .time-when { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

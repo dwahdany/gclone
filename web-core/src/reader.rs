@@ -18,10 +18,11 @@ use crate::format::{
     IndexName, Op, SegmentV1, blob_name, open_segment, open_snapshot, parse_index_name,
 };
 use crate::index::{MemIndex, apply_segment, causal_order, check_snapshot_format, removal_time};
-use crate::types::{BlobId, BlobRec, CoveredSeg, DeviceId, EntryKind, Head, SegRef};
+use crate::types::{CoveredSeg, DeviceId, Entry, EntryKind, Head, SegRef};
+use crate::web::past::{self, History, MemSource, Resolved};
 use crate::web::rules::{
-    self, EntryJson, InfoJson, LIST_PAGE, LIST_PAGE_MAX, ListJson, RefreshState, RowView,
-    SEARCH_HITS, SEARCH_HITS_MAX, SearchJson, SortOrder,
+    self, DeletedJson, EntryJson, InfoJson, LIST_PAGE, LIST_PAGE_MAX, ListJson, RefreshState,
+    RowView, SEARCH_HITS, SEARCH_HITS_MAX, SearchJson, SortOrder, TimelineJson, VersionsJson,
 };
 use crate::{Code, Error, Result, util};
 
@@ -166,7 +167,9 @@ pub struct Reader {
     // The view, rebuilt by `finish`.
     /// Winners, sorted by path.
     winners: Vec<Head>,
-    blobs: BTreeMap<BlobId, BlobRec>,
+    /// What the questions about the past derive once per state of the index (`past`): built
+    /// by the first of them, dropped by `finish`.
+    history: Option<History>,
     conflicts: u64,
     files: u64,
     dirs: u64,
@@ -213,7 +216,7 @@ impl Reader {
             corrupt: BTreeMap::new(),
             last_seen: BTreeMap::new(),
             winners: Vec::new(),
-            blobs: BTreeMap::new(),
+            history: None,
             conflicts: 0,
             files: 0,
             dirs: 0,
@@ -472,10 +475,30 @@ impl Reader {
     }
 
     fn rebuild_view(&mut self) {
-        let all = self.mem.all_heads();
-        self.conflicts = all.iter().filter(|h| !h.winner).count() as u64;
-        self.winners = all.into_iter().filter(|h| h.winner).collect();
-        self.blobs = self.mem.blobs().into_iter().map(|b| (b.id, b)).collect();
+        // The index changed: what was derived from it is void.
+        self.history = None;
+        // The heads come by `(path, stamp, hash)`: the last head of a path is its winner.
+        // Borrowed, one at a time — no second copy of every head on the way.
+        let mut winners: Vec<Head> = Vec::new();
+        self.conflicts = 0;
+        for (path, stamp, entry, origin) in self.mem.heads_iter() {
+            let head = |path: String| Head {
+                path,
+                stamp: *stamp,
+                entry: entry.clone(),
+                origin: origin.copied(),
+                winner: true,
+            };
+            match winners.last_mut().filter(|w| w.path == path) {
+                Some(loser) => {
+                    self.conflicts += 1;
+                    *loser = head(std::mem::take(&mut loser.path));
+                }
+                None => winners.push(head(path.to_owned())),
+            }
+        }
+        winners.shrink_to_fit();
+        self.winners = winners;
         (self.files, self.dirs, self.bytes) = (0, 0, 0);
         for h in &self.winners {
             match h.entry.kind {
@@ -487,18 +510,12 @@ impl Reader {
             }
         }
         // `SELECT name, last_ms FROM devices ORDER BY last_ms DESC, id LIMIT 1`.
-        let names: BTreeMap<DeviceId, String> = self
-            .mem
-            .devices()
-            .into_iter()
-            .map(|d| (d.id, d.name))
-            .collect();
         self.last_change = self
             .last_seen
             .iter()
-            .filter_map(|(id, ms)| Some((*ms, std::cmp::Reverse(*id), names.get(id)?)))
+            .filter_map(|(id, ms)| Some((*ms, std::cmp::Reverse(*id), self.mem.device_name(id)?)))
             .max()
-            .map(|(ms, _, name)| (ms, name.clone()));
+            .map(|(ms, _, name)| (ms, name.to_owned()));
     }
 
     /// §2.6: the value `gclone status` prints on a device that has applied the same journal.
@@ -683,7 +700,6 @@ impl Reader {
     /// and its location agree; the location lies inside the blob.
     pub fn ticket(&self, path: &str) -> Result<Ticket> {
         let path = rules::entry_path(Some(path)).map_err(bad_input)?;
-        let name = crate::path::file_name(&path).to_owned();
         let entry = match self.head(&path) {
             Some(head) if head.entry.kind == EntryKind::File => &head.entry,
             Some(_) => return Err(Error::new(Code::NotAFile, format!("{path:?} is a folder."))),
@@ -692,6 +708,40 @@ impl Reader {
             }
             None => return Err(Error::new(Code::NotFound, rules::no_file(&path))),
         };
+        self.mint(&path, entry)
+    }
+
+    /// The ticket of one version of the file at `path` — the one the id `v` names
+    /// (`past::resolve`: a file head, or a removed version inside the restore window at
+    /// `now`) — after the same checks, by the same code. Without `v`: [`Reader::ticket`].
+    pub fn ticket_of(&self, path: &str, v: Option<&str>, now: Option<f64>) -> Result<Ticket> {
+        let Some(v) = v else {
+            return self.ticket(path);
+        };
+        let path = rules::entry_path(Some(path)).map_err(bad_input)?;
+        let v = rules::parse_v(v).map_err(bad_input)?;
+        let now = now_of(now)?;
+        let not_kept = || Error::new(Code::NotFound, rules::NOT_KEPT);
+        let found = match past::resolve(&mut MemSource(&self.mem), &path, v, now) {
+            Ok(found) => found,
+            Err(never) => match never {},
+        };
+        let Resolved::One(ver) = found else {
+            return Err(not_kept());
+        };
+        let entry = self
+            .mem
+            .version(&path, &ver.stamp, &ver.hash)
+            .ok_or_else(not_kept)?;
+        self.mint(&path, entry)
+    }
+
+    /// The ticket of a file entry of `path`: every check, whichever version it is.
+    fn mint(&self, path: &str, entry: &Entry) -> Result<Ticket> {
+        let name = crate::path::file_name(path).to_owned();
+        if entry.kind != EntryKind::File {
+            return Err(Error::new(Code::NotAFile, format!("{path:?} is a folder.")));
+        }
         let corrupt = |what: &str| Error::new(Code::Corrupt, format!("{path:?}: {what}"));
         let Some(loc) = &entry.loc else {
             return if entry.size == 0 {
@@ -717,7 +767,7 @@ impl Reader {
             }
             e => corrupt(&e.to_string()),
         })?;
-        let Some(blob) = self.blobs.get(&loc.blob) else {
+        let Some(blob) = self.mem.blob(&loc.blob) else {
             return Err(corrupt(&format!("blob {} is not in the index", loc.blob)));
         };
         if entry.size == 0 || loc.clen != ciphertext_len(entry.size, loc.chunk_log2) {
@@ -744,6 +794,258 @@ impl Reader {
             header: Some(util::b64url(&header)),
         })
     }
+
+    // -----------------------------------------------------------------------------------------
+    // The past (`web::past`, the main crate's `src/web/past.rs`): the same questions for an
+    // earlier moment, the versions of a file, what was deleted, the timeline. This module
+    // reads no clock: `now` — milliseconds since 1970 — comes from the caller.
+    // -----------------------------------------------------------------------------------------
+
+    /// The index as a source of history, and what is derived from it once (built here by the
+    /// first question, or again when `now` went back behind the floor it was built with).
+    fn past(&mut self, now: u64) -> (ViewSource<'_>, &History) {
+        if !self.history.as_ref().is_some_and(|h| h.serves(now)) {
+            self.history = None;
+        }
+        let mem = &self.mem;
+        let history = self
+            .history
+            .get_or_insert_with(|| History::of_mem(mem, now));
+        // Without conflicts the winners are all the heads there are.
+        let winners = (self.conflicts == 0).then_some(self.winners.as_slice());
+        (ViewSource { mem, winners }, history)
+    }
+
+    /// `list` for the moment `at` (moved into the window and echoed): the folder as it was.
+    /// A folder that did not exist then is no error: `absent`, with the nearest that did.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_at(
+        &mut self,
+        path: &str,
+        sort: Option<&str>,
+        order: Option<&str>,
+        offset: Option<f64>,
+        limit: Option<f64>,
+        at: f64,
+        now: Option<f64>,
+    ) -> Result<ListJson> {
+        let path = rules::dir_path(Some(path)).map_err(bad_input)?;
+        let by = SortOrder::parse(sort, order).map_err(bad_input)?;
+        let offset = count(offset, "offset", 0, usize::MAX)?;
+        let limit = count(limit, "limit", LIST_PAGE, LIST_PAGE_MAX)?;
+        if limit == 0 {
+            return Err(bad_input(rules::LIMIT_IS_ZERO));
+        }
+        let (at, t, now) = moment_of(at, now)?;
+        let (mut src, history) = self.past(now);
+        let listing = infallible(past::list_at(&mut src, history, &path, t));
+        Ok(past::list_answer(path, listing, by, offset, limit, at))
+    }
+
+    /// `stat` for the moment `at`, or of the version `v` (not both): the entry with the id of
+    /// the version shown.
+    pub fn stat_at(
+        &mut self,
+        path: &str,
+        at: Option<f64>,
+        v: Option<&str>,
+        now: Option<f64>,
+    ) -> Result<EntryJson> {
+        let path = rules::entry_path(Some(path)).map_err(bad_input)?;
+        let row = match (at, v) {
+            (Some(_), Some(_)) => return Err(bad_input(rules::AT_OR_V)),
+            (None, None) => return self.stat(&path),
+            (None, Some(v)) => {
+                let v = rules::parse_v(v).map_err(bad_input)?;
+                let now = now_of(now)?;
+                infallible(past::stat_version(&mut MemSource(&self.mem), &path, v, now))
+                    .ok_or_else(|| Error::new(Code::NotFound, rules::NOT_KEPT))?
+            }
+            (Some(at), None) => {
+                let (_, t, now) = moment_of(at, now)?;
+                let (mut src, history) = self.past(now);
+                infallible(past::stat_at(&mut src, history, &path, t))
+                    .ok_or_else(|| Error::new(Code::NotFound, rules::not_then(&path)))?
+            }
+        };
+        Ok(row.json())
+    }
+
+    /// `search` for the moment `at`.
+    pub fn search_at(
+        &mut self,
+        q: &str,
+        limit: Option<f64>,
+        sort: Option<&str>,
+        order: Option<&str>,
+        at: f64,
+        now: Option<f64>,
+    ) -> Result<SearchJson> {
+        let q = q.trim().to_owned();
+        let limit = count(limit, "limit", SEARCH_HITS, SEARCH_HITS_MAX)?;
+        let by = SortOrder::parse(sort, order).map_err(bad_input)?;
+        let (at, t, now) = moment_of(at, now)?;
+        let (mut src, history) = self.past(now);
+        let (hits, more) = infallible(past::search_at(&mut src, history, &q, limit, t));
+        Ok(past::search_answer(q, hits, more, by, at))
+    }
+
+    /// `versions`: the versions of one file that are kept; `at` marks the one of that moment.
+    pub fn versions(
+        &mut self,
+        path: &str,
+        at: Option<f64>,
+        now: Option<f64>,
+    ) -> Result<VersionsJson> {
+        let path = rules::entry_path(Some(path)).map_err(bad_input)?;
+        let (t, now) = match at {
+            Some(at) => {
+                let (_, t, now) = moment_of(at, now)?;
+                (Some(t), now)
+            }
+            None => (None, now_of(now)?),
+        };
+        let (mut src, history) = self.past(now);
+        Ok(infallible(past::versions(&mut src, history, &path, t, now)))
+    }
+
+    /// `deleted`: what was deleted from a folder and is kept, in pages like a listing.
+    pub fn deleted(
+        &self,
+        path: &str,
+        sort: Option<&str>,
+        order: Option<&str>,
+        offset: Option<f64>,
+        limit: Option<f64>,
+        now: Option<f64>,
+    ) -> Result<DeletedJson> {
+        let path = rules::dir_path(Some(path)).map_err(bad_input)?;
+        let by = SortOrder::parse(sort, order).map_err(bad_input)?;
+        let offset = count(offset, "offset", 0, usize::MAX)?;
+        let limit = count(limit, "limit", LIST_PAGE, LIST_PAGE_MAX)?;
+        if limit == 0 {
+            return Err(bad_input(rules::LIMIT_IS_ZERO));
+        }
+        let now = now_of(now)?;
+        match infallible(past::deleted(&mut MemSource(&self.mem), &path, now)) {
+            Some(found) => Ok(past::deleted_json(path, found, by, offset, limit)),
+            None => Err(Error::new(Code::NotFound, rules::no_folder(&path))),
+        }
+    }
+
+    /// `timeline`: the moments inside the window at which the vault changed.
+    pub fn timeline(&mut self, now: Option<f64>) -> Result<TimelineJson> {
+        let now = now_of(now)?;
+        let (src, history) = self.past(now);
+        Ok(past::timeline(&src, history, now))
+    }
+}
+
+/// The index as `web::past` reads it: the in-memory index, and — for the one pass over
+/// everything that a search of the past makes — the view's winners in place of the index's
+/// heads, when they are the same heads (no conflict loser): the rows a search of the present
+/// reads, laid out side by side.
+struct ViewSource<'a> {
+    mem: &'a MemIndex,
+    winners: Option<&'a [Head]>,
+}
+
+impl past::Source for ViewSource<'_> {
+    type Err = std::convert::Infallible;
+
+    fn heads_from(&mut self, from: &str, hi: Option<&str>) -> PastRows {
+        MemSource(self.mem).heads_from(from, hi)
+    }
+
+    fn removed_from(&mut self, from: &str, hi: Option<&str>) -> PastRows {
+        MemSource(self.mem).removed_from(from, hi)
+    }
+
+    fn device_name(&self, id: &DeviceId) -> Option<String> {
+        self.mem.device_name(id).map(str::to_owned)
+    }
+
+    fn walk(
+        &mut self,
+        from: &str,
+        hi: Option<&str>,
+        visit: &mut dyn FnMut(&past::Group) -> bool,
+    ) -> std::result::Result<(), Self::Err> {
+        let (Some(winners), true, None) = (self.winners, from.is_empty(), hi) else {
+            return MemSource(self.mem).walk(from, hi, visit);
+        };
+        // Each winner is a path of its own: one comparison per path decides which side is next.
+        use std::cmp::Ordering;
+        let mut heads = winners.iter().peekable();
+        let mut removed = self.mem.removed_range("", None).peekable();
+        let mut group = past::Group::default();
+        loop {
+            let next = match (heads.peek(), removed.peek()) {
+                (None, None) => return Ok(()),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(head), Some(gone)) => head.path.as_str().cmp(gone.0),
+            };
+            group.heads.clear();
+            group.removed.clear();
+            match (next, heads.peek(), removed.peek()) {
+                (Ordering::Greater, _, Some(gone)) => {
+                    group.path.clear();
+                    group.path.push_str(gone.0);
+                }
+                (_, Some(head), _) => {
+                    group.path.clone_from(&head.path);
+                    group
+                        .heads
+                        .push(past::Ver::of(&head.stamp, &head.entry, None));
+                    heads.next();
+                }
+                _ => return Ok(()),
+            }
+            if next != Ordering::Less {
+                while let Some((_, stamp, entry, ms, by)) =
+                    removed.next_if(|gone| gone.0 == group.path)
+                {
+                    group
+                        .removed
+                        .push(past::Ver::of(stamp, entry, Some((*by, ms))));
+                }
+                if group.removed.len() > 1 {
+                    past::by_removal(&mut group.removed);
+                }
+            }
+            if !visit(&group) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// What a source over the in-memory index answers: it cannot fail.
+type PastRows = std::result::Result<Option<past::PathVers>, std::convert::Infallible>;
+
+/// The in-memory index never fails to answer.
+fn infallible<T>(answer: std::result::Result<T, std::convert::Infallible>) -> T {
+    match answer {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+/// "Now" of a question about the past: required, a whole number of milliseconds.
+fn now_of(now: Option<f64>) -> Result<u64> {
+    match now {
+        Some(now) => crate::integer(now, "now"),
+        None => Err(bad_input("now is missing")),
+    }
+}
+
+/// `at` of a call: `(the value to echo, the moment it stands for, now)`.
+fn moment_of(at: f64, now: Option<f64>) -> Result<(u64, u64, u64)> {
+    let now = now_of(now)?;
+    let at = crate::integer(at, "at").map_err(|_| bad_input(rules::BAD_TIME))?;
+    let at = past::clamp_at(at, now);
+    Ok((at, past::moment(at, now), now))
 }
 
 fn newer(what: String) -> Error {

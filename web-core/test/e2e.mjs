@@ -44,7 +44,8 @@ section('module');
   const exported = Object.keys(core).filter((k) => k !== 'initSync').sort();
   assert.deepEqual(exported, [...functions, 'Vault', 'FileReader'].sort());
   const methods = (cls) => Object.getOwnPropertyNames(cls.prototype).filter((n) => !n.startsWith('__') && n !== 'constructor' && n !== 'free').sort();
-  assert.deepEqual(methods(core.Vault), ['add_segment', 'finish', 'info', 'list', 'load_snapshot', 'needed_segments', 'reset', 'search', 'snapshot_candidates', 'stat', 'ticket', 'vault_id'].sort());
+  // (0.6.0, the time machine: `versions`, `deleted`, `timeline`.)
+  assert.deepEqual(methods(core.Vault), ['add_segment', 'deleted', 'finish', 'info', 'list', 'load_snapshot', 'needed_segments', 'reset', 'search', 'snapshot_candidates', 'stat', 'ticket', 'timeline', 'versions', 'vault_id'].sort());
   assert.equal(typeof core.Vault.from_keys, 'function');
   assert.deepEqual(methods(core.FileReader), ['cipher_end', 'cipher_start', 'push', 'remaining', 'resume_at']);
   assert.equal(core.parse_rfc3339_ms('2026-11-13T10:14:00.250Z'), Date.parse('2026-11-13T10:14:00.250Z'));
@@ -196,6 +197,41 @@ async function replayNative() {
     assert.equal(thrown(() => vault.ticket(p)), code, p);
   }
 
+  // Versions (the time machine): the ticket of a version by its id points where the native
+  // build's does and opens that version's bytes; a version that is the current file has the
+  // current file's ticket.
+  let earlier = 0;
+  for (const version of busy.versions) {
+    const plain = fs.readFileSync(path.join(EXPORT, 'busy', version.plain));
+    const ticketJson = vault.ticket(version.path, version.v, busy.now);
+    const { v, key, header, ...where } = JSON.parse(ticketJson);
+    assert.equal(v, 1);
+    assert.deepEqual(where, version.ticket, `${version.path} @${version.v}`);
+    if (where.size === 0) continue;
+    const blob = fs.readFileSync(path.join(EXPORT, 'busy/blobs', where.file_id));
+    const reader = new core.FileReader(ticketJson, 0, where.size);
+    const out = [];
+    for (let pos = reader.cipher_start(); pos < reader.cipher_end(); pos += 50000) {
+      out.push(reader.push(blob.subarray(pos, Math.min(pos + 50000, reader.cipher_end()))));
+    }
+    assert.equal(reader.remaining(), 0);
+    reader.free();
+    assert.ok(Buffer.concat(out).equals(plain), `${version.path} @${version.v}`);
+    const current = busy.files.find((f) => f.path === version.path);
+    if (current && JSON.stringify(current.ticket) === JSON.stringify(version.ticket)) assert.equal(ticketJson, vault.ticket(version.path));
+    else earlier += 1;
+  }
+  assert.ok(earlier >= 6, `${earlier} earlier versions`);
+  const some = busy.versions[0];
+  assert.equal(thrown(() => vault.ticket(some.path, '0123456789ab', busy.now)), 'not-found');
+  assert.equal(thrown(() => vault.ticket(some.path, 'not-an-id', busy.now)), 'bad-input');
+  assert.equal(thrown(() => vault.ticket(some.path, some.v)), 'bad-input', 'a version needs "now"');
+  assert.equal(thrown(() => vault.ticket(some.path, some.v, 1.5)), 'bad-input');
+  // The module reads no clock: "now" is the caller's, and decides what is still kept.
+  const old = busy.versions.find((x) => !busy.files.some((f) => f.path === x.path && JSON.stringify(f.ticket) === JSON.stringify(x.ticket)));
+  assert.equal(thrown(() => vault.ticket(old.path, old.v, busy.now + 26 * 86400000)), 'not-found');
+  assert.equal(thrown(() => vault.timeline()), 'bad-input');
+
   // What the Service Worker asks.
   for (const s of busy.served) {
     assert.deepEqual(JSON.parse(core.served(s.name, false)), s.shown, s.name);
@@ -206,7 +242,7 @@ async function replayNative() {
     assert.deepEqual(got, { kind: r.kind, start: r.start, end: r.end }, JSON.stringify(r));
   }
   vault.free();
-  note(`native rules: ${Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ')} answers byte-identical; ${busy.files.length} files and ${ranges} ranges decrypted; ${busy.served.length} names served, ${busy.ranges.length} Range headers`);
+  note(`native rules: ${Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ')} answers byte-identical; ${busy.files.length} files, ${busy.versions.length} versions and ${ranges} ranges decrypted; ${busy.served.length} names served, ${busy.ranges.length} Range headers`);
 
   // --- format gates: fail closed, in the wasm, with the right code ---------------------------
   const gates = JSON.parse(fs.readFileSync(path.join(EXPORT, 'gates/expect.json'), 'utf8'));

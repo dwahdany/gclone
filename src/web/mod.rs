@@ -31,16 +31,18 @@ use tokio_util::sync::{CancellationToken, PollSender};
 
 use crate::backend::{AnyBackend, Backend as _};
 use crate::error::{IndexError, TransferError};
-use crate::index::{ListRow, SearchHit, Vault};
+use crate::index::{HistoryDb, ListRow, SearchHit, SqlSource, Vault};
 use crate::state::{Db, LedgerDir};
 use crate::types::{BlobRec, EntryKind, Head};
 use crate::util;
 
 pub mod http;
 pub mod mime;
+pub mod past;
 pub mod rules;
 
 use http::{BadRequest, Body, ByteRange, Failure};
+use past::History;
 use rules::{EntryJson, InfoJson, RowView, SortOrder};
 pub use rules::{LIST_PAGE, LIST_PAGE_MAX, RefreshState, SEARCH_HITS, SEARCH_HITS_MAX};
 
@@ -90,6 +92,10 @@ pub struct Options {
     /// A connection of its own for the download ledger, so that a ledger write that waits for
     /// another gclone's transaction holds up no listing.
     pub ledger: Option<Db>,
+    /// A third connection, for questions about the past (the time machine): a long walk
+    /// through the history holds up neither a listing of the present nor a download.
+    /// `None`: those questions are answered through the vault's own connection.
+    pub history: Option<Db>,
     pub refresher: Refresher,
     pub refreshed: RefreshState,
     /// Shown until the replica knows the vault's name.
@@ -145,10 +151,23 @@ enum Redeemed {
 
 /// Opaque names for files in URLs the browser may keep (a tab's address, the download list):
 /// the path, encrypted under a key that lives as long as this process. Deterministic — the
-/// nonce is a keyed hash of the path — so one file has one address.
+/// nonce is a keyed hash of what is sealed — so one file has one address.
+///
+/// The id of an earlier version of a file seals `0x00 ‖ version id ‖ path`: no path holds a
+/// NUL (§5.1), so the two kinds cannot be taken for each other, and the id of a current file
+/// is what it was before versions had ids.
 struct FileIds {
     cipher: XChaCha20Poly1305,
     nonce_key: [u8; 32],
+}
+
+/// What a file id names.
+#[derive(Debug, PartialEq, Eq)]
+enum FileRef {
+    /// The file at the path, as it is now.
+    Current(String),
+    /// One version of it: `(path, version id)`.
+    Version(String, String),
 }
 
 impl FileIds {
@@ -159,25 +178,49 @@ impl FileIds {
         }
     }
 
-    fn seal(&self, path: &str) -> Option<String> {
-        let hash = blake3::keyed_hash(&self.nonce_key, path.as_bytes());
+    fn seal_bytes(&self, plain: &[u8]) -> Option<String> {
+        let hash = blake3::keyed_hash(&self.nonce_key, plain);
         let nonce: [u8; 24] = hash.as_bytes()[..24].try_into().ok()?;
-        let sealed = self.cipher.encrypt(&nonce.into(), path.as_bytes()).ok()?;
+        let sealed = self.cipher.encrypt(&nonce.into(), plain).ok()?;
         Some(util::b64url(&[&nonce[..], &sealed].concat()))
     }
 
-    fn open(&self, id: &str) -> Option<String> {
+    fn seal(&self, path: &str) -> Option<String> {
+        self.seal_bytes(path.as_bytes())
+    }
+
+    fn seal_version(&self, path: &str, v: &str) -> Option<String> {
+        self.seal_bytes(&[&[0u8][..], v.as_bytes(), path.as_bytes()].concat())
+    }
+
+    fn open(&self, id: &str) -> Option<FileRef> {
         let raw = util::unb64url(id)?;
         let (nonce, sealed) = raw.split_at_checked(24)?;
         let nonce: [u8; 24] = nonce.try_into().ok()?;
         let plain = self.cipher.decrypt(&nonce.into(), sealed).ok()?;
-        String::from_utf8(plain).ok()
+        let (path, v) = match plain.split_first() {
+            Some((0, rest)) => {
+                let (v, path) = rest.split_at_checked(12)?;
+                (
+                    path,
+                    Some(rules::parse_v(std::str::from_utf8(v).ok()?).ok()?),
+                )
+            }
+            _ => (&plain[..], None),
+        };
+        let path = std::str::from_utf8(path).ok()?;
+        Some(match v {
+            Some(v) => FileRef::Version(path.to_owned(), v.to_owned()),
+            None => FileRef::Current(path.to_owned()),
+        })
     }
 }
 
 pub struct App {
     vault: Arc<Vault<AnyBackend>>,
     ledger: Option<Db>,
+    /// The past, read through a connection of its own.
+    history: Arc<HistoryDb>,
     refresher: Refresher,
     refreshed: Mutex<RefreshState>,
     /// One refresh at a time.
@@ -493,9 +536,11 @@ impl App {
             .iter()
             .map(|host| format!("{host}:{port}"))
             .collect();
+        let history = o.history.unwrap_or_else(|| o.vault.db().clone());
         Arc::new(App {
             vault: Arc::new(o.vault),
             ledger: o.ledger,
+            history: Arc::new(HistoryDb::new(history)),
             refresher: o.refresher,
             refreshed: Mutex::new(o.refreshed),
             refreshing: tokio::sync::Mutex::new(()),
@@ -791,7 +836,8 @@ impl App {
             "api/refresh" if *req.method() == Method::POST => self.refresh().await?,
             "api/refresh" => allow("POST"),
             "" | "assets/app.css" | "assets/app.js" | "assets/icon.svg" | "api/info"
-            | "api/list" | "api/stat" | "api/search" | "file"
+            | "api/list" | "api/stat" | "api/search" | "api/versions" | "api/deleted"
+            | "api/timeline" | "file"
                 if !read =>
             {
                 allow("GET, HEAD")
@@ -804,6 +850,9 @@ impl App {
             "api/list" => self.list(&query).await?,
             "api/stat" => self.stat(&query).await?,
             "api/search" => self.search(&query).await?,
+            "api/versions" => self.versions(&query).await?,
+            "api/deleted" => self.deleted(&query).await?,
+            "api/timeline" => self.timeline().await?,
             "file" => self.file(req, &query, &session).await?,
             _ => return Err(refuse(StatusCode::NOT_FOUND, "Not found.")),
         })
@@ -883,6 +932,51 @@ impl App {
         self.info().await
     }
 
+    /// A question about the past, off the async threads, over one read snapshot of the
+    /// replica and the history of that state.
+    async fn past<T: Send + 'static>(
+        &self,
+        now: u64,
+        f: impl FnOnce(&mut SqlSource<'_>, &History) -> Result<T, crate::error::StateError>
+        + Send
+        + 'static,
+    ) -> Outcome<T> {
+        let history = self.history.clone();
+        Self::off_thread(move || history.read(now, f)).await
+    }
+
+    /// The same without a history: the questions that need none (one version, `deleted`).
+    async fn past_rows<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut SqlSource<'_>) -> Result<T, crate::error::StateError> + Send + 'static,
+    ) -> Outcome<T> {
+        let history = self.history.clone();
+        Self::off_thread(move || history.rows(f)).await
+    }
+
+    async fn off_thread<T: Send + 'static>(
+        read: impl FnOnce() -> Result<T, crate::error::IndexError> + Send + 'static,
+    ) -> Outcome<T> {
+        match tokio::task::spawn_blocking(read).await {
+            Ok(out) => Ok(out?),
+            Err(_) => Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the query was interrupted",
+            )),
+        }
+    }
+
+    /// `at` of a call, moved into the window: `(the value to echo, the moment it stands for)`.
+    fn at_param(&self, query: &[(String, String)]) -> Outcome<Option<(u64, u64, u64)>> {
+        let Some(text) = http::param(query, "at") else {
+            return Ok(None);
+        };
+        let at = rules::parse_at(text).map_err(|what| refuse(StatusCode::BAD_REQUEST, what))?;
+        let now = self.vault.backend().now_ms();
+        let at = past::clamp_at(at, now);
+        Ok(Some((at, past::moment(at, now), now)))
+    }
+
     async fn list(&self, query: &[(String, String)]) -> Outcome<Response<Body>> {
         let path = dir_param(query)?;
         let by = sort_params(query)?;
@@ -892,6 +986,16 @@ impl App {
             return Err(refuse(StatusCode::BAD_REQUEST, rules::LIMIT_IS_ZERO));
         }
         let dir = path.clone();
+        if let Some((at, t, now)) = self.at_param(query)? {
+            let listing = self
+                .past(now, move |src, history| {
+                    past::list_at(src, history, &dir, t)
+                })
+                .await?;
+            return Ok(json(&past::list_answer(
+                path, listing, by, offset, limit, at,
+            )));
+        }
         let rows = self
             .query(move |v| {
                 Ok(match v.exists_dir(&dir)? {
@@ -906,9 +1010,51 @@ impl App {
         Ok(json(&rules::list_json(path, rows, by, offset, limit)))
     }
 
+    /// The entry of a file row of the past or of one version, with the id its bytes are
+    /// fetched by.
+    fn version_entry(&self, path: &str, row: &past::Row) -> EntryJson {
+        let id = match (row.is_dir, &row.v) {
+            (false, Some(v)) => self.ids.seal_version(path, v),
+            _ => None,
+        };
+        EntryJson { id, ..row.json() }
+    }
+
     async fn stat(&self, query: &[(String, String)]) -> Outcome<Response<Body>> {
         let path = file_param(query)?;
         let target = path.clone();
+        let v = match http::param(query, "v") {
+            Some(_) if http::param(query, "at").is_some() => {
+                return Err(refuse(StatusCode::BAD_REQUEST, rules::AT_OR_V));
+            }
+            Some(v) => Some(
+                rules::parse_v(v)
+                    .map_err(|what| refuse(StatusCode::BAD_REQUEST, what))?
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        if let Some(v) = v {
+            let now = self.vault.backend().now_ms();
+            let found = self
+                .past_rows(move |src| past::stat_version(src, &target, &v, now))
+                .await?;
+            return match found {
+                Some(row) => Ok(json(&self.version_entry(&path, &row))),
+                None => Err(refuse(StatusCode::NOT_FOUND, rules::NOT_KEPT)),
+            };
+        }
+        if let Some((_, t, now)) = self.at_param(query)? {
+            let found = self
+                .past(now, move |src, history| {
+                    past::stat_at(src, history, &target, t)
+                })
+                .await?;
+            return match found {
+                Some(row) => Ok(json(&self.version_entry(&path, &row))),
+                None => Err(refuse(StatusCode::NOT_FOUND, rules::not_then(&path))),
+            };
+        }
         let found = self
             .query(move |v| Ok((v.head(&target)?, v.exists_dir(&target)?)))
             .await?;
@@ -932,13 +1078,70 @@ impl App {
         let limit = number(query, "limit", SEARCH_HITS, SEARCH_HITS_MAX)?;
         let by = sort_params(query)?;
         let needle = q.clone();
+        if let Some((at, t, now)) = self.at_param(query)? {
+            let (hits, more) = self
+                .past(now, move |src, history| {
+                    past::search_at(src, history, &needle, limit, t)
+                })
+                .await?;
+            return Ok(json(&past::search_answer(q, hits, more, by, at)));
+        }
         let (hits, more) = self.query(move |v| v.search(&needle, limit)).await?;
         Ok(json(&rules::search_json(q, hits, more, by)))
     }
 
+    /// `GET api/versions?path=…[&at=…]`: the versions of one file that are kept.
+    async fn versions(&self, query: &[(String, String)]) -> Outcome<Response<Body>> {
+        let path = file_param(query)?;
+        let (t, now) = match self.at_param(query)? {
+            Some((_, t, now)) => (Some(t), now),
+            None => (None, self.vault.backend().now_ms()),
+        };
+        let found = self
+            .past(now, move |src, history| {
+                past::versions(src, history, &path, t, now)
+            })
+            .await?;
+        Ok(json(&found))
+    }
+
+    /// `GET api/deleted?path=…`: what was deleted from a folder and is still kept, in pages
+    /// like a listing.
+    async fn deleted(&self, query: &[(String, String)]) -> Outcome<Response<Body>> {
+        let path = dir_param(query)?;
+        let by = sort_params(query)?;
+        let offset = number(query, "offset", 0, usize::MAX)?;
+        let limit = number(query, "limit", LIST_PAGE, LIST_PAGE_MAX)?;
+        if limit == 0 {
+            return Err(refuse(StatusCode::BAD_REQUEST, rules::LIMIT_IS_ZERO));
+        }
+        let now = self.vault.backend().now_ms();
+        let dir = path.clone();
+        let found = self
+            .past_rows(move |src| past::deleted(src, &dir, now))
+            .await?;
+        match found {
+            Some(found) => Ok(json(&past::deleted_json(path, found, by, offset, limit))),
+            None => Err(refuse(StatusCode::NOT_FOUND, rules::no_folder(&path))),
+        }
+    }
+
+    /// `GET api/timeline`: the moments inside the window at which the vault changed.
+    async fn timeline(&self) -> Outcome<Response<Body>> {
+        let now = self.vault.backend().now_ms();
+        let found = self
+            .past(now, move |src, history| {
+                Ok(past::timeline(src, history, now))
+            })
+            .await?;
+        Ok(json(&found))
+    }
+
     /// `GET|HEAD file?path=…|id=…[&dl=1]`: the bytes of one file, decrypted as they are sent.
     /// `id` is the path as `/api/stat` sealed it (`FileIds`): what the page uses, so that no
-    /// file name is in an address the browser keeps.
+    /// file name is in an address the browser keeps. The id of an earlier version (`stat` with
+    /// `at` or `v`) names that version: it is looked up again here, and served only while
+    /// `gclone restore` would still offer it.
     async fn file(
         self: &Arc<Self>,
         req: &Request<Incoming>,
@@ -946,13 +1149,18 @@ impl App {
         session: &Arc<Session>,
     ) -> Outcome<Response<Body>> {
         let bad = |what: &'static str| refuse(StatusCode::BAD_REQUEST, what);
-        let path = match http::param(query, "id") {
-            None => file_param(query)?,
+        let (path, version) = match http::param(query, "id") {
+            None => (file_param(query)?, None),
             Some(_) if http::param(query, "path").is_some() => {
                 return Err(bad("path or id, not both"));
             }
             Some(id) => match self.ids.open(id) {
-                Some(path) if crate::path::validate(&path).is_ok() => path,
+                Some(FileRef::Current(path)) if crate::path::validate(&path).is_ok() => {
+                    (path, None)
+                }
+                Some(FileRef::Version(path, v)) if crate::path::validate(&path).is_ok() => {
+                    (path, Some(v))
+                }
                 _ => return Err(bad("id is not one this viewer gave out")),
             },
         };
@@ -962,8 +1170,16 @@ impl App {
             Some(_) => return Err(refuse(StatusCode::BAD_REQUEST, "dl is 1 or absent")),
         };
         let target = path.clone();
+        let now = self.vault.backend().now_ms();
+        let of_version = version.is_some();
         let (head, blob) = self
             .query(move |v| {
+                if let Some(id) = version {
+                    return Ok(match v.version(&target, &id, now)? {
+                        Some((head, blob)) => (Some(head), blob),
+                        None => (None, None),
+                    });
+                }
                 let head = v.head(&target)?;
                 let loc = head.as_ref().and_then(|h| h.entry.loc.as_ref());
                 let blob = match loc {
@@ -975,6 +1191,7 @@ impl App {
             .await?;
         let head = match head {
             Some(head) if head.entry.kind == EntryKind::File => head,
+            _ if of_version => return Err(refuse(StatusCode::NOT_FOUND, rules::NOT_KEPT)),
             _ => return Err(not_in_vault(&path)),
         };
 
@@ -1244,7 +1461,18 @@ mod tests {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
                 "{id}"
             );
-            assert_eq!(ids.open(&id).as_deref(), Some(path));
+            assert_eq!(ids.open(&id), Some(FileRef::Current(path.to_owned())));
+            // A version of the file has an id of its own, which names the path and the
+            // version and is never taken for the file's.
+            let v = "0123456789ab";
+            let of_version = ids.seal_version(path, v).unwrap();
+            assert_ne!(of_version, id);
+            assert_eq!(
+                ids.open(&of_version),
+                Some(FileRef::Version(path.to_owned(), v.to_owned()))
+            );
+            assert_eq!(ids.seal_version(path, v).unwrap(), of_version);
+            assert_ne!(ids.seal_version(path, "0123456789ac").unwrap(), of_version);
             // One file, one address.
             assert_eq!(ids.seal(path).unwrap(), id);
             // Authenticated: any change is refused, as is another viewer's id.
@@ -1262,6 +1490,11 @@ mod tests {
         let raw = util::unb64url(&id).unwrap();
         assert!(!raw.windows(6).any(|w| w == b"Geheim" || w == b"Steuer"));
         assert_ne!(ids.seal("a/b").unwrap(), ids.seal("a/c").unwrap());
+        // What follows the NUL has to be a version id: 12 hexadecimal digits, then the path.
+        for forged in ["\0", "\0short", "\0XXXXXXXXXXXXa", "\0zzzzzzzzzzzza"] {
+            let id = ids.seal(forged).unwrap();
+            assert_eq!(ids.open(&id), None, "{forged:?}");
+        }
         for junk in ["", "AAAA", "not base64!", "docs/a.txt"] {
             assert_eq!(ids.open(junk), None, "{junk:?}");
         }

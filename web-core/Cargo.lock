@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "gclone"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "gclone-web-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",

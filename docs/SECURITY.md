@@ -145,6 +145,22 @@ them. What limits it:
   [After a change of hands](#after-a-change-of-hands-the-hosted-viewer).
 - A device that never opens the hosted viewer is exposed exactly as before.
 
+**The time machine changes none of this.** An earlier version of a file reaches the browser
+the way a current file does: the vault worker makes a ticket for that one version, by the
+same checks, and the ticket leaves it only sealed to the Service Worker; the page gets an
+opaque address and never a key. What the page newly sees are the names, sizes and times of
+removed entries in the folders it asks for, the names of your devices, and 12-digit version
+ids that reveal neither the content hash nor the order of changes. Only versions that
+`gclone restore` would still offer are listed or served, and that is checked in the vault
+worker (in `gclone web`: by the server), not in the page. Both viewers stay read-only: they
+show the restore command and run nothing. A file's name is part of that command, and names
+in a vault are not trusted: the command is quoted for sh, bash, zsh and fish, and a name that
+cannot be carried safely in all of them — a control character, a backslash, a character
+that turns text around — gets no command at all. Nothing of a chosen moment or version is stored:
+it is gone at Lock and at reload. The hosted viewer counts the 25 days on the clock of the
+browser's device, so a wrong clock can hide recent history or offer a version whose data is
+already gone, which then ends in an error message.
+
 If you would rather not extend that trust, do not set the viewer up; `gclone web` over SSH
 ([`gclone web`, "From another machine"](USAGE.md#browse-the-vault-in-your-browser)) covers a machine you can reach.
 

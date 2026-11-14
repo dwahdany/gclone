@@ -29,6 +29,15 @@ export const ENGINES = {
 };
 
 /**
+ * Chrome for a picture, British. The page's dates follow the context's `locale`; the
+ * browser's own controls (a date field) follow the browser's language, which `--lang` sets
+ * — on Linux and Windows. On a Mac Chrome takes language and region from the system's
+ * settings and nothing short of changing those moves it: there the date field of a picture
+ * is written the way the machine's region writes dates.
+ */
+export const britishChrome = (playwright) => ENGINES.chrome(playwright, { args: ['--lang=en-GB'] });
+
+/**
  * The bundle to test: GCLONE_VIEWER_DIST (a built `dist/`, used as it is), else a fresh build
  * into `work/dist` from this tree and web-core/pkg.
  */

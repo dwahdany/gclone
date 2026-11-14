@@ -5,6 +5,7 @@ use crate::backend::Backend as _;
 use crate::sync::remote_ops::{self, Restorable};
 use crate::types::RemovedVersion;
 use crate::util::{format_local_minute, group_thousands, human_size};
+use crate::web::{past, rules};
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct RestoreArgs {
@@ -19,10 +20,34 @@ pub struct RestoreArgs {
     /// restorable files under a directory (`:` = the whole vault).
     #[arg(long, conflicts_with = "version")]
     pub list: bool,
-    /// Which version of a file to restore (the K column of `--list`; default: the newest).
-    /// Takes exactly one file PATH.
-    #[arg(long, value_name = "K", value_parser = clap::value_parser!(u32).range(1..))]
-    pub version: Option<u32>,
+    /// Which version of a file to restore: K, the first column of `--list` (1 is the newest,
+    /// the default), or @ID, the last column — an id names the same version whatever is
+    /// removed later, and is what the viewer's "Versions" panel shows. Takes exactly one file
+    /// PATH.
+    #[arg(long, value_name = "K|@ID", value_parser = parse_pick)]
+    pub version: Option<Pick>,
+}
+
+/// `--version`: a position in the list, or the id of one version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// 1-based, newest first.
+    Position(u32),
+    /// `past::version_id`: 12 hexadecimal digits.
+    Id(String),
+}
+
+fn parse_pick(text: &str) -> Result<Pick, String> {
+    if let Some(id) = text.strip_prefix('@') {
+        return match rules::parse_v(id) {
+            Ok(id) => Ok(Pick::Id(id.to_owned())),
+            Err(_) => Err("an id is @ and 12 hexadecimal digits, as `--list` shows it".into()),
+        };
+    }
+    match text.parse::<u32>() {
+        Ok(k) if k >= 1 => Ok(Pick::Position(k)),
+        _ => Err("K is a number from 1, or @ID (see `gclone restore --list :PATH`)".into()),
+    }
 }
 
 /// The versions `--list` shows and `--version K` counts: newest first. The vault root is no
@@ -34,26 +59,30 @@ async fn candidates(ctx: &Ctx, path: &str, now: u64) -> anyhow::Result<Vec<Remov
     Ok(remote_ops::restore_candidates(&ctx.vault, path, now).await?)
 }
 
-/// `(deleted)` when no version of this path took the removed one's place: the op that
-/// superseded it (`by`) was a delete or a move away, not a new upload.
-fn why(
-    ctx: &Ctx,
-    path: &str,
-    version: &RemovedVersion,
-    all: &[RemovedVersion],
-) -> anyhow::Result<&'static str> {
-    let replaced = all.iter().any(|v| v.stamp == version.by)
-        || ctx.vault.heads(path)?.iter().any(|h| h.stamp == version.by)
-        || ctx
-            .vault
-            .removed_versions(path)?
-            .iter()
-            .any(|v| v.stamp == version.by);
-    Ok(if replaced {
-        "(overwritten)"
-    } else {
-        "(deleted)"
-    })
+/// `(overwritten)` when the path still held a file after the op that superseded this version,
+/// `(deleted)` when it did not: a delete, or a move away (`past::why`, which the viewer's list
+/// of versions uses as well).
+fn why(ctx: &Ctx, path: &str, version: &RemovedVersion) -> anyhow::Result<String> {
+    let heads: Vec<past::Ver> = ctx
+        .vault
+        .heads(path)?
+        .iter()
+        .map(|h| past::Ver::of(&h.stamp, &h.entry, None))
+        .collect();
+    let mut removed: Vec<past::Ver> = ctx
+        .vault
+        .removed_versions(path)?
+        .iter()
+        .map(|v| past::Ver::of(&v.stamp, &v.entry, Some((v.by, v.removed_ms))))
+        .collect();
+    past::by_removal(&mut removed);
+    let at = removed
+        .iter()
+        .position(|v| v.stamp == version.stamp && v.hash == version.entry.hash);
+    Ok(format!(
+        "({})",
+        at.map_or("deleted", |at| past::why(&removed, &heads, at))
+    ))
 }
 
 fn files(n: usize) -> String {
@@ -82,21 +111,32 @@ async fn list(ctx: &Ctx, path: &str, now: u64) -> anyhow::Result<()> {
     }
     if !versions.is_empty() {
         let devices = ctx.vault.devices()?;
-        ctx.ui.out(&format!(
-            "{:>3}  {:<16}   {:<9} {}",
-            "K", "removed", "size", "by"
-        ));
-        for (k, v) in versions.iter().enumerate() {
+        // Names and reasons differ in length: the id column starts where the longest ends.
+        let mut lines = Vec::with_capacity(versions.len());
+        for v in &versions {
             let by = devices
                 .iter()
                 .find(|d| d.id == v.by.device)
                 .map_or_else(|| v.by.device.short(), |d| d.name.clone());
+            lines.push(format!("{by}   {}", why(ctx, path, v)?));
+        }
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        ctx.ui.out(&format!(
+            "{:>3}  {:<16}   {:<9} {:<width$}   id",
+            "K",
+            "removed",
+            "size",
+            "by",
+            width = width.max(2)
+        ));
+        for (k, (v, line)) in versions.iter().zip(&lines).enumerate() {
             ctx.ui.out(&format!(
-                "{:>3}  {:<16}   {:<9} {by}   {}",
+                "{:>3}  {:<16}   {:<9} {line:<width$}   @{}",
                 k + 1,
                 format_local_minute(v.removed_ms),
                 human_size(v.entry.size),
-                why(ctx, path, v, &versions)?
+                past::version_id(path, &v.stamp, &v.entry.hash),
+                width = width.max(2)
             ));
         }
     }
@@ -168,8 +208,25 @@ pub async fn run(g: &GlobalOpts, args: RestoreArgs) -> anyhow::Result<i32> {
     let mut left_alone = 0;
     for path in &paths {
         let versions = candidates(&ctx, path, now).await?;
-        if let Some(k) = args.version {
-            let Some(version) = versions.get(k as usize - 1) else {
+        if let Some(pick) = &args.version {
+            let found = match pick {
+                Pick::Position(k) => versions.get(*k as usize - 1),
+                Pick::Id(id) => {
+                    let named = |v: &&RemovedVersion| {
+                        past::version_id(path, &v.stamp, &v.entry.hash) == *id
+                    };
+                    // An id that two versions share (12 digits can collide) names neither.
+                    match versions.iter().filter(named).count() {
+                        1 => versions.iter().find(named),
+                        _ => None,
+                    }
+                }
+            };
+            let Some(version) = found else {
+                let asked = match pick {
+                    Pick::Position(k) => k.to_string(),
+                    Pick::Id(id) => format!("@{id}"),
+                };
                 return Err(not_found(if versions.is_empty() {
                     format!(
                         "{}: no restorable version (removed versions are kept for 25 days)",
@@ -177,7 +234,7 @@ pub async fn run(g: &GlobalOpts, args: RestoreArgs) -> anyhow::Result<i32> {
                     )
                 } else {
                     format!(
-                        "{}: there is no version {k} (see `gclone restore --list {}`)",
+                        "{}: there is no version {asked} (see `gclone restore --list {}`)",
                         shown(path),
                         shown(path)
                     )

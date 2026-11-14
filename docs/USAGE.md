@@ -83,7 +83,7 @@ whoever controls the repository controls the script.
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.5.1` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.6.0` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`), `--require-attestation` (install nothing that `gh` did
 not verify), `--no-attestation` (checksum only: releases before 0.5.0 carry no attestation
@@ -112,8 +112,8 @@ this order: the argument (`gclone login https://<host>`), the environment variab
 and the compiled-in URL:
 
 ```
-gclone 0.5.1 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
-gclone 0.5.1 (aarch64-apple-darwin, no auth URL built in)
+gclone 0.6.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.6.0 (aarch64-apple-darwin, no auth URL built in)
 ```
 
 The release workflow compiles in the repository variable `GCLONE_DEFAULT_AUTH_URL`, so this
@@ -281,6 +281,12 @@ All three change only the index; no data moves.
   replacing the current one (which stays restorable). Several paths can be given. Empty
   directories are not restored.
 
+  `restore --list :FILE` shows the versions of one file, newest first, with a number `K` and
+  an id in the last column. `--version` takes either: `--version 2`, or `--version
+  @3fa9c2d1e07b`. A number is a position, and it moves when another version is removed; an
+  id names the same version for as long as it is kept, which is why the viewers'
+  [time machine](#the-time-machine) shows commands with ids.
+
 ### How `gc`, `repair` and `passwd` behave
 
 - **`gc` runs only on a complete index.** It is the one command that judges what is dead, so
@@ -383,6 +389,69 @@ ssh -t -L 8377:127.0.0.1:8377 nas gclone web --port 8377
 
 (`-t` gives the remote gclone a terminal, so that Ctrl-C and a closed connection end it; under
 SSH it prints the link and does not look for a browser.)
+
+### The time machine
+
+Both viewers, `gclone web` and the hosted one, also show what the vault held before: the
+versions that `gclone restore` can bring back. They are kept for 25 days after they were
+replaced or deleted.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/viewer-timemachine-dark.png">
+  <img src="images/viewer-timemachine-light.png" width="880" alt="The viewer showing the vault as it was before its last five changes: a bar with a slider over the last 25 days and a 'Back to now' button, and rows marked 'changed since' and 'deleted since'">
+</picture>
+
+- **Versions of a file.** In a preview, **Versions** lists the file as it is now and every
+  earlier version that is kept: until when it was the current one, its size, which device
+  replaced or deleted it, and which device wrote it. Choosing a version shows it in the
+  preview; Download saves that version.
+- **Deleted files.** **Show deleted**, at the right of the folder path, adds a section below
+  the folder's rows with what was deleted from it: files, and folders with the number of
+  kept files in them (where nothing was deleted, the line under the list says so). A
+  deleted file opens on its last version. A deleted folder opens with its deleted content,
+  and can be shown as it was just before it went.
+- **The vault at an earlier moment.** The clock button opens a bar with a slider over the
+  last 25 days (one step is an hour), buttons that step from one change of the vault to the
+  next, and a date field. At an earlier moment the list, the folders, the search and the
+  previews show the vault as it was then. The bars change colour, the bar and the line under
+  the list name the moment, and rows say what became of an entry: "changed since" or
+  "deleted since". **Back to now** returns, and so does the right end of the slider.
+
+**Bringing something back** stays a command. For an earlier version the Versions panel shows
+`gclone restore :PATH --version @ID`, for a deleted folder the page shows `gclone restore -r
+:DIR`, each with a Copy button. Run it on a device that is attached to the vault. The
+command is written for sh, bash, zsh and fish. A name that cannot be carried safely in all
+of them gets no command — one with a line break or another control character, with a
+backslash, or with a character that turns the text around it (U+202E and its kin) — and
+`gclone restore --list` on its folder shows what can be brought back.
+
+**How exact the times are.** The index records when a version was *removed*, not when it was
+written. What follows holds when the clocks of your devices are right.
+
+- Everything that replaced or removed something is placed exactly: an overwrite, a deletion,
+  a move.
+- A file that was added without replacing anything appears at the time its upload was made,
+  usually a few seconds before the change was complete, and such times carry "≈" in the
+  list of versions. A file put over another one with `copy --force` shows that early, too:
+  for those seconds the new content stands in the old one's place.
+- An entry that came without an upload of its own — a folder made with `mkdir`, an empty
+  file, a restored file, a copy of content the vault already had — has no time on record at
+  all. It is shown from the last moment its device is known to have done something before
+  it (never from before the device joined the vault), until the device's next recorded
+  change settles it. In between its row says "≈ may have come later": a file restored on
+  the 20th by a device last seen on the 3rd is listed, with that mark, from the 3rd on —
+  or from its deletion, if that was later — although it was deleted then. Such changes have
+  no stop on the timeline.
+
+Nothing that existed is hidden, and nothing is shown after it was removed. On a directory
+vault (`--vault-dir`) the times are those of the devices' own clocks: a device whose clock
+is ahead places its changes late, so what it added is missing from earlier moments until
+that time is reached, and one whose clock is behind places them early. On Google Drive the
+times are Drive's.
+
+In the hosted viewer the 25 days are counted on the clock of the device you browse with. A
+clock that is far off moves the window: set far ahead it hides recent history, set far back
+it offers versions whose data may be gone, and those end in a message, not in wrong content.
 
 ## Browse from any browser (the hosted viewer)
 
@@ -702,8 +771,9 @@ has exit codes only for its start and end:
   Secure Enclave (expected: an error and the plain file; only simulated). The access token
   cache (`token.json`, valid for about an hour) stays a plain file. There is still no way to change the vault key: a `secrets.json` that
   was copied or backed up in the past stays a key to the vault.
-- `gclone web` is a viewer, not a file manager: read-only, no thumbnails, no list of deleted
-  files (`gclone restore --list` has it), and what the browser cannot show (HEIC outside
+- `gclone web` is a viewer, not a file manager: read-only, no thumbnails, and it brings
+  nothing back itself (its [time machine](#the-time-machine) shows the `gclone restore`
+  command to copy). What the browser cannot show (HEIC outside
   Safari, most video containers) is a download. A folder cannot be bookmarked or opened in a
   second tab (the address is always the same, on purpose). Its page is tested in Chrome,
   WebKit and Firefox on macOS; on Linux, a browser installed as a snap or flatpak may not be able to read the file

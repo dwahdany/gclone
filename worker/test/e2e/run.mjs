@@ -23,7 +23,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { ENGINES, loadPlaywright, startStack } from './harness.mjs';
-import { BIDI_DIR, BIDI_NAME, HOSTILE_HTML, ODD_NAMES, PASS, foreignKeyfile, tree } from './vault.mjs';
+import { MANY, beforePhone, timeMachine, timeMachinePhone } from './timemachine.mjs';
+import { BIDI_DIR, BIDI_NAME, HOSTILE_HTML, ODD_NAMES, PASS, addHistory, foreignKeyfile, tree } from './vault.mjs';
 
 const BIG = process.env.GCLONE_E2E_BIG || null;
 const ONLY = process.env.GCLONE_E2E_ONLY ? process.env.GCLONE_E2E_ONLY.split(',') : null;
@@ -124,6 +125,11 @@ function instrument() {
       provider = value;
       const api = value.api;
       value.api = async (...args) => {
+        // A test may slow the lists down, and see which were asked for (`slowLists`).
+        if (args[0] === 'list' && window.__listDelay) {
+          window.__listCalls.push([(args[1] && args[1].at) || null, (args[1] && args[1].offset) || '0']);
+          await new Promise((done) => { setTimeout(done, window.__listDelay); });
+        }
         const out = await api.apply(value, args);
         if (args[0] === 'list' || args[0] === 'search') {
           window.__listed = args[0] === 'list' ? (args[1] && args[1].path) || '' : `search:${args[1].q}`;
@@ -288,7 +294,7 @@ class Session {
   /** Clicks the row called `name`. (The list draws its rows anew when it has news: a row that went away is looked up again.) */
   async clickRow(page, name) {
     for (let attempt = 0; ; attempt += 1) {
-      const row = await page.evaluateHandle((wanted) => [...document.querySelectorAll('#rows .row')].find((r) => r.querySelector('.name').title === wanted) || null, name);
+      const row = await page.evaluateHandle((wanted) => [...document.querySelectorAll('#rows .row:not(.sep)')].find((r) => r.querySelector('.name').title === wanted) || null, name);
       const element = row.asElement();
       assert.ok(element, `${this.label}: no row named ${JSON.stringify(name)}`);
       try {
@@ -2418,8 +2424,115 @@ steps.big = async (s) => {
 // ------------------------------------------------------------------------------------------------
 
 /** Steps that share one unlocked page, in this order; then the ones that make their own. */
+// --- the time machine (SPEC §7.4): versions, deleted files, the vault at an earlier moment --------
+
+steps.timemachine = async (s) => {
+  // A stack of its own: the vault gets history (runs of the native binary, a second apart),
+  // and the commands the page shows are run on it.
+  const stack = await startStack({ many: MANY });
+  const t = new Session(s.engine, s.playwright, stack);
+  t.browser = s.browser;
+  t.label = s.label;
+  try {
+    const past = addHistory(stack.vault);
+    const { context, page } = await t.fresh();
+    const messagesBefore = await page.evaluate(() => window.__messages.length);
+    await timeMachine({
+      page,
+      label: s.label,
+      vault: stack.vault,
+      past,
+      work: stack.work,
+      api: (name, params) => t.api(page, name, params),
+      download: (click) => t.download(page, click),
+      slowLists: async (ms) => {
+        await page.evaluate((delay) => { window.__listCalls = []; window.__listDelay = delay; }, ms);
+        return {
+          calls: () => page.evaluate(() => window.__listCalls),
+          stop: () => page.evaluate(() => { window.__listDelay = 0; }),
+        };
+      },
+    });
+
+    // What the hosted viewer adds. Nothing of the new flows carries a key, a ticket or bytes
+    // between the page and its workers; versions are asked for by path and id.
+    const seen = await page.evaluate(() => ({ flagged: window.__flagged, bytes: window.__bytes, messages: window.__messages.map((m) => m[1]) }));
+    assert.deepEqual(seen.flagged, [], `${s.label}: a message of the page carries key material`);
+    assert.deepEqual(seen.bytes, [], `${s.label}: bytes crossed the page`);
+    const text = seen.messages.slice(messagesBefore).join('\n');
+    for (const call of ['"name":"versions"', '"name":"deleted"', '"name":"timeline"', '"at":"', '"v":"']) assert.ok(text.includes(call), `the page asked ${call}`);
+    assert.ok(/"call":"issue","args":\{"id":"[A-Za-z0-9_-]{22}","path":"docs\/notes\.txt","v":"[0-9a-f]{12}"\}/.test(text), 'a version is issued by path and id');
+    // Nothing of the vault, of a moment or of a version in storage, in the address, in the
+    // title or in history.state — the places are in the page's memory.
+    const stored = await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage), cookie: document.cookie }));
+    assert.deepEqual(stored.session, []);
+    assert.ok(stored.local.every((k) => k === 'gclone.sort'), `localStorage holds ${stored.local}`);
+    assert.equal(stored.cookie, '');
+    assertNoNames(t, await walkOwnHistory(page), `${s.label}, after the time machine`);
+
+    // An earlier version is a file like any other to the Service Worker: an id, a sealed
+    // ticket. When the Service Worker loses what it holds, the ticket of the version is
+    // issued again — for that version, not for the file as it is now.
+    await t.goDir(page, 'docs');
+    await t.openFile(page, 'notes.txt');
+    await page.click('#viewer-versions');
+    await page.waitForSelector('#versions-list button');
+    await page.locator('#versions-list button').nth(2).click();
+    await page.waitForFunction((wanted) => (document.querySelector('#viewer-body pre') || {}).textContent === wanted, past.notes[0].toString());
+    const url = await t.fileUrl(page);
+    const read = () => page.evaluate(async (u) => { const res = await fetch(u); return [res.status, await res.text()]; }, url);
+    assert.deepEqual(await read(), [200, past.notes[0].toString()]);
+    await page.evaluate(() => navigator.serviceWorker.controller.postMessage({ type: 'forget' }));
+    assert.equal((await t.ping(page)).tickets, 0);
+    assert.deepEqual(await read(), [200, past.notes[0].toString()], 'the version after the Service Worker forgot its tickets');
+    if (s.engine === 'chrome') {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('ServiceWorker.enable');
+      await cdp.send('ServiceWorker.stopAllWorkers');
+      await sleep(300);
+      assert.deepEqual(await read(), [200, past.notes[0].toString()], 'the version after the Service Worker was stopped');
+      await cdp.detach();
+    }
+    // The file is replaced meanwhile by another device's run: the address still gives the
+    // version it was handed out for.
+    fs.writeFileSync(path.join(stack.vault.src, 'docs/notes.txt'), 'a fourth version, written while the page was open\n');
+    stack.vault.device.run('copy', path.join(stack.vault.src, 'docs'), ':docs');
+    await t.api(page, 'refresh');
+    assert.deepEqual(await read(), [200, past.notes[0].toString()]);
+    await page.click('#versions-close');
+    await t.closeFile(page);
+
+    // Lock in the past: a lock is a reload, and nothing of the time machine is kept — the
+    // page comes back at now. (The walk through the history above passed places of the
+    // past, which open the bar: it may be open already.)
+    if (await page.isHidden('#time')) await page.click('#time-btn');
+    await page.waitForFunction(() => !document.getElementById('time-prev').disabled);
+    await page.click('#time-prev');
+    await page.waitForSelector('html.past');
+    await page.click('#lock-btn');
+    await t.screen(page, 'unlock');
+    assert.equal(await page.evaluate(() => history.state), null);
+    await t.unlock(page);
+    assert.deepEqual(await page.evaluate(() => [document.documentElement.classList.contains('past'), document.getElementById('time').hidden, document.querySelectorAll('#crumbs li').length]), [false, true, 1]);
+    await t.settle(page, 'timemachine');
+    await context.close();
+
+    // A phone-sized window.
+    beforePhone(stack.vault);
+    const phone = await t.fresh({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: s.engine !== 'firefox' });
+    await timeMachinePhone(phone.page, s.label);
+    await t.settle(phone.page, 'timemachine on a phone');
+    await phone.context.close();
+    assert.deepEqual(stack.server.strays.filter((line) => line.includes('/v/')), [], 'a /v/ address reached the network');
+    assert.deepEqual([...stack.drive.log.origins], [stack.origin], 'the fake Drive of this step saw the viewer and nothing else');
+    s.note('timemachine: versions previewed, saved and restored by the copied command; deleted files and a deleted folder; the vault at earlier moments — folders included — equals what `gclone tree` printed after each run; a moment chosen while a long list loads; keyboard, phone, a low window; no key, ticket or name left the vault worker or the page');
+  } finally {
+    await stack.close();
+  }
+};
+
 const SHARED = ['listing', 'sort', 'search', 'names', 'previews', 'media', 'download', 'recovery', 'refresh', 'history', 'keys'];
-const OWN = ['signin', 'lock', 'tabs', 'seal', 'planted', 'unskippable', 'second', 'recover', 'signout', 'hardening', 'unreachable', 'states', 'big'];
+const OWN = ['signin', 'lock', 'tabs', 'seal', 'planted', 'unskippable', 'second', 'recover', 'signout', 'hardening', 'unreachable', 'states', 'timemachine', 'big'];
 
 async function runEngine(engine, playwright) {
   const stack = await startStack({ big: BIG || undefined });
@@ -2447,7 +2560,10 @@ async function runEngine(engine, playwright) {
       await s.settle(null, name);
     }
     // What the fake Drive saw of the viewer: its origin, and never a cookie or a token in an address.
-    assert.deepEqual([...stack.drive.log.origins], [stack.origin]);
+    // (A run of one step that has a stack of its own — GCLONE_E2E_ONLY=timemachine — never
+    // asks this one anything.)
+    const untouched = ONLY && ONLY.every((name) => name === 'timemachine');
+    assert.deepEqual([...stack.drive.log.origins], untouched ? [] : [stack.origin]);
     // The vault worker's question for the seal's key is the Service Worker's to answer. Where an
     // engine lets one through to the network (a worker's first request, in Firefox), the "Worker"
     // answers 404 and the vault worker asks again: counted, not a failure — it carries nothing.

@@ -556,6 +556,9 @@ fn the_session_secret_guards_every_route() {
         "/api/list?path=docs",
         "/api/stat?path=docs/a.txt",
         "/api/search?q=a",
+        "/api/versions?path=docs/a.txt",
+        "/api/deleted",
+        "/api/timeline",
         "/file?path=docs/a.txt",
     ];
     let others = ["/nope", "/assets/", "/api/refresh", "/favicon.ico"];
@@ -979,6 +982,9 @@ fn host_and_origin_are_checked() {
     // Methods.
     for (method, target, allow) in [
         ("POST", "/api/list", "GET, HEAD"),
+        ("POST", "/api/versions?path=docs/a.txt", "GET, HEAD"),
+        ("POST", "/api/deleted", "GET, HEAD"),
+        ("DELETE", "/api/timeline", "GET, HEAD"),
         ("PUT", "/file?path=docs/a.txt", "GET, HEAD"),
         ("DELETE", "/file?path=docs/a.txt", "GET, HEAD"),
         ("POST", "/", "GET, HEAD"),
@@ -2735,4 +2741,852 @@ async fn drive_mode_tokens_are_renewed_while_the_viewer_runs() {
         let token = secrets["refresh_token"].as_str().expect("refresh token");
         assert!(!v.log().contains(token));
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The time machine (§7.4): versions, deleted files, the vault at an earlier moment
+// ---------------------------------------------------------------------------------------------
+
+const DAY_MS: u64 = 86_400_000;
+const WINDOW_MS: u64 = 25 * DAY_MS;
+const ODD: &str = "docs/odd name's #1 %.txt";
+const FIRST: &[u8] = b"first\n";
+const SECOND: &[u8] = b"second version\n";
+const THIRD: &[u8] = b"the third and current\n";
+
+/// Longer than the resolution of every clock involved: two runs of gclone on either side of
+/// it are at different times, whatever the vault directory's file system records.
+fn pause() {
+    std::thread::sleep(Duration::from_millis(1_100));
+}
+
+struct WithHistory {
+    lab: Lab,
+    a: Device,
+    /// The blob that holds the second version of `docs/notes.md`, and nothing else.
+    second_blob: PathBuf,
+}
+
+/// A vault whose index holds history, made by runs of gclone more than a second apart: three
+/// versions of `docs/notes.md` (and two of a file with an odd name), a deleted file, a deleted
+/// folder, a moved file, and a file that came last.
+fn vault_with_history() -> WithHistory {
+    let (lab, a) = vault_with(|root| {
+        small_tree(root);
+        write(&root.join("docs/notes.md"), FIRST);
+        write(&root.join(ODD), b"odd one\n");
+        write(&root.join("old/x.txt"), b"x\n");
+        write(&root.join("old/deep/y.txt"), b"y\n");
+        write(&root.join("moved.txt"), b"moving\n");
+    });
+    let src = lab.path("src");
+    let before = lab.blobs();
+    pause();
+    write(&src.join("docs/notes.md"), SECOND);
+    a.ok(&["copy", &s(&src), ":"]);
+    let mut new: Vec<PathBuf> = lab
+        .blobs()
+        .into_iter()
+        .filter(|blob| !before.contains(blob))
+        .collect();
+    assert_eq!(new.len(), 1, "one upload, one blob");
+    pause();
+    write(&src.join("docs/notes.md"), THIRD);
+    write(&src.join(ODD), b"odd two\n");
+    a.ok(&["copy", &s(&src), ":"]);
+    pause();
+    a.ok(&["rm", ":docs/sub/b.txt"]);
+    a.ok(&["rm", "-r", ":old"]);
+    a.ok(&["mv", ":moved.txt", ":docs/moved-here.txt"]);
+    pause();
+    for gone in ["docs/sub/b.txt", "moved.txt"] {
+        std::fs::remove_file(src.join(gone)).expect("remove");
+    }
+    std::fs::remove_dir_all(src.join("old")).expect("remove");
+    write(&src.join("late.txt"), b"late\n");
+    a.ok(&["copy", &s(&src), ":"]);
+    WithHistory {
+        lab,
+        a,
+        second_blob: new.remove(0),
+    }
+}
+
+fn u(value: &serde_json::Value) -> u64 {
+    value
+        .as_u64()
+        .unwrap_or_else(|| panic!("a number: {value}"))
+}
+
+/// `name → entry` of a listing or of search hits.
+fn by_name(entries: &serde_json::Value) -> std::collections::BTreeMap<String, serde_json::Value> {
+    entries
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| (e["name"].as_str().expect("name").to_owned(), e.clone()))
+        .collect()
+}
+
+/// Every table of the device's replica but the download ledger, as text.
+fn replica_dump(d: &Device) -> String {
+    use rusqlite::types::ValueRef;
+    let db = rusqlite::Connection::open_with_flags(
+        d.vault_state().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("state.db");
+    let mut out = String::new();
+    let mut tables = db
+        .prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+        .expect("prepare");
+    let listed: Vec<(String, Option<String>)> = tables
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect();
+    for (name, sql) in listed {
+        out.push_str(&format!("-- {name}: {sql:?}\n"));
+        if name == "ledger" || sql.is_none_or(|sql| !sql.starts_with("CREATE TABLE")) {
+            continue;
+        }
+        let mut rows = db
+            .prepare(&format!("SELECT * FROM {name}"))
+            .expect("prepare");
+        let columns = rows.column_count();
+        let mut found = rows.query([]).expect("query");
+        let mut lines = Vec::new();
+        while let Some(row) = found.next().expect("row") {
+            let mut line = String::new();
+            for i in 0..columns {
+                match row.get_ref(i).expect("value") {
+                    ValueRef::Null => line.push_str("NULL|"),
+                    ValueRef::Integer(n) => line.push_str(&format!("{n}|")),
+                    ValueRef::Real(x) => line.push_str(&format!("{x}|")),
+                    ValueRef::Text(t) => {
+                        line.push_str(&format!("{:?}|", String::from_utf8_lossy(t)));
+                    }
+                    ValueRef::Blob(b) => line.push_str(&format!("x{}|", gclone::util::hex(b))),
+                }
+            }
+            lines.push(line);
+        }
+        lines.sort();
+        out.push_str(&lines.join("\n"));
+        out.push('\n');
+    }
+    out
+}
+
+/// Every file below the vault directory, with its size.
+fn store_files(lab: &Lab) -> Vec<(PathBuf, u64)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            let meta = std::fs::symlink_metadata(&path).expect("stat");
+            if meta.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push((path, meta.len()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&lab.path("vault"), &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn the_versions_of_a_file_are_listed_and_served() {
+    let WithHistory {
+        lab,
+        a,
+        second_blob,
+    } = vault_with_history();
+    let v = Viewer::start(&a, &lab);
+    let before = replica_dump(&a);
+    let listed = v.json("/api/versions?path=docs/notes.md");
+    assert_eq!(listed["path"], "docs/notes.md");
+    assert_eq!(
+        (&listed["deleted"], &listed["more"]),
+        (&false.into(), &false.into())
+    );
+    assert_eq!(u(&listed["now_ms"]) - u(&listed["from_ms"]), WINDOW_MS);
+    let rows = listed["versions"].as_array().expect("versions").clone();
+    let sizes: Vec<u64> = rows.iter().map(|r| u(&r["size"])).collect();
+    assert_eq!(
+        sizes,
+        [THIRD.len() as u64, SECOND.len() as u64, FIRST.len() as u64]
+    );
+    let (third, second, first) = (&rows[0], &rows[1], &rows[2]);
+    assert_eq!(third["current"], true);
+    for key in ["until_ms", "by", "why", "restore"] {
+        assert!(third.get(key).is_none(), "{key}: {third}");
+    }
+    for old in [second, first] {
+        assert!(old.get("current").is_none());
+        assert_eq!(
+            (&old["why"], &old["by"]),
+            (&"overwritten".into(), &"a".into())
+        );
+        assert_eq!(old["written_by"], "a");
+        let command = format!(
+            "gclone restore :docs/notes.md --version @{}",
+            old["v"].as_str().expect("v")
+        );
+        assert_eq!(old["restore"], command);
+    }
+    // A version that took another one's place came exactly when that one went; the first
+    // upload replaced nothing — its time is an estimate, and not after the truth.
+    assert!(u(&first["until_ms"]) + 1_000 < u(&second["until_ms"]));
+    assert_eq!(third["written_ms"], second["until_ms"]);
+    assert_eq!(second["written_ms"], first["until_ms"]);
+    assert!(third.get("written_approx").is_none() && second.get("written_approx").is_none());
+    assert_eq!(first["written_approx"], true);
+    assert!(u(&first["written_ms"]) + 1_000 < u(&first["until_ms"]));
+    assert!(u(&first["written_ms"]) > u(&listed["from_ms"]));
+
+    // Every version is a file like any other: `stat` by its id, then the bytes by the opaque
+    // id that gives.
+    let hash = |bytes: &[u8]| format!("\"{}\"", blake3::hash(bytes).to_hex());
+    let mut ids = Vec::new();
+    for (row, bytes) in rows.iter().zip([THIRD, SECOND, FIRST]) {
+        let version = row["v"].as_str().expect("v");
+        assert_eq!(version.len(), 12, "{version}");
+        let stat = v.json(&format!("/api/stat?path=docs/notes.md&v={version}"));
+        assert_eq!(stat["v"], version);
+        assert_eq!(
+            (u(&stat["size"]), &stat["kind"]),
+            (bytes.len() as u64, &"text".into())
+        );
+        match row.get("current") {
+            Some(_) => assert!(stat.get("since").is_none(), "{stat}"),
+            None => assert_eq!(stat["since"], "changed"),
+        }
+        let id = stat["id"].as_str().expect("an id").to_owned();
+        let res = v.get(&format!("/file?id={id}"));
+        assert_eq!((res.status, res.body.as_slice()), (200, bytes));
+        res.has("etag", &hash(bytes));
+        ids.push(id);
+    }
+    // The ids are opaque, each its own, and none is the id of the file as it is now — even
+    // the one that names the version that is current.
+    let current = v.json("/api/stat?path=docs/notes.md");
+    assert!(current.get("v").is_none() && current.get("since").is_none());
+    let current_id = current["id"].as_str().expect("an id").to_owned();
+    let mut distinct: Vec<&String> = ids.iter().chain([&current_id]).collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 4);
+    for id in &ids {
+        assert!(id.len() > 60 && !id.contains("notes"), "{id}");
+    }
+    // A version id is not a file id, and the other way round.
+    let version = second["v"].as_str().expect("v");
+    assert_eq!(v.get(&format!("/file?id={version}")).status, 400);
+    assert_eq!(
+        v.get(&format!("/api/stat?path=docs/notes.md&v={current_id}"))
+            .status,
+        400
+    );
+
+    // An earlier version is served exactly as a current file is: ranges, conditionals, and
+    // the headers of untrusted content, from the name alone.
+    let old = format!("/file?id={}", ids[1]);
+    let now = format!("/file?id={current_id}");
+    let (was, is) = (v.get(&old), v.get(&now));
+    for name in [
+        "content-type",
+        "content-security-policy",
+        "content-disposition",
+        "accept-ranges",
+        "cache-control",
+        "x-content-type-options",
+        "cross-origin-resource-policy",
+        "referrer-policy",
+    ] {
+        assert_eq!(was.header(name), is.header(name), "{name}");
+        assert!(was.header(name).is_some(), "{name}");
+    }
+    was.has("content-type", "text/plain; charset=utf-8");
+    let tag = hash(SECOND);
+    let part = v.with("GET", &old, &[("Range", "bytes=7-13")]);
+    assert_eq!((part.status, part.body.as_slice()), (206, &b"version"[..]));
+    part.has("content-range", "bytes 7-13/15").has("etag", &tag);
+    assert_eq!(v.with("GET", &old, &[("If-None-Match", &tag)]).status, 304);
+    let other = v.with(
+        "GET",
+        &old,
+        &[("Range", "bytes=0-0"), ("If-Range", &hash(THIRD))],
+    );
+    assert_eq!((other.status, other.body.as_slice()), (200, SECOND));
+    assert_eq!(v.with("GET", &old, &[("Range", "bytes=99-")]).status, 416);
+    let head = v.with("HEAD", &format!("{old}&dl=1"), &[]);
+    head.has("content-length", "15");
+    let disposition = head.header("content-disposition").expect("a disposition");
+    assert!(
+        disposition.starts_with("attachment; ") && disposition.contains("notes.md"),
+        "{disposition}"
+    );
+
+    // What is asked for wrongly, and what is not there.
+    for (bad, status) in [
+        ("/api/versions", 400),
+        ("/api/versions?path=", 400),
+        ("/api/versions?path=/abs", 400),
+        ("/api/versions?path=docs/notes.md&at=yesterday", 400),
+        ("/api/stat?path=docs/notes.md&v=xyz", 400),
+        ("/api/stat?path=docs/notes.md&v=0123456789AB", 400),
+        ("/api/stat?path=docs/notes.md&v=0123456789abc", 400),
+        ("/api/stat?path=docs/notes.md&v=", 400),
+        ("/api/stat?path=docs/notes.md&v=0123456789ab", 404),
+        ("/api/stat?path=docs/a.txt&v=0123456789ab", 404),
+    ] {
+        let res = v.get(bad);
+        assert_eq!(res.status, status, "{bad}: {}", res.text());
+    }
+    let both = format!("/api/stat?path=docs/notes.md&v={version}&at=1");
+    let res = v.get(&both);
+    assert_eq!((res.status, res.text().trim()), (400, "at or v, not both"));
+    assert_eq!(
+        v.get("/api/stat?path=docs/notes.md&v=0123456789ab")
+            .text()
+            .trim(),
+        "This version is no longer kept."
+    );
+    // An id names its path: the same id under another path is nothing.
+    assert_eq!(
+        v.get(&format!("/api/stat?path=docs/a.txt&v={version}"))
+            .status,
+        404
+    );
+    // A file without history, a folder, a path nobody wrote: the current version, or none.
+    let plain = v.json("/api/versions?path=docs/a.txt");
+    assert_eq!(plain["versions"].as_array().expect("versions").len(), 1);
+    for nothing in ["docs", "no/such/file"] {
+        let empty = v.json(&format!("/api/versions?path={nothing}"));
+        assert_eq!(empty["deleted"], true, "{nothing}");
+        assert!(empty["versions"].as_array().expect("versions").is_empty());
+    }
+    // The odd name: its command is quoted for a shell.
+    let odd = v.json(&format!("/api/versions?path={}", enc(ODD)));
+    assert_eq!(
+        odd["versions"][1]["restore"],
+        format!(
+            "gclone restore ':docs/odd name'\\''s #1 %.txt' --version @{}",
+            odd["versions"][1]["v"].as_str().expect("v")
+        )
+    );
+
+    // The viewer wrote nothing: the replica is what it was, table by table.
+    assert_eq!(replica_dump(&a), before);
+
+    // Another gclone changes the file while the viewer runs: the list follows without a
+    // refresh, and every id handed out before still names its bytes — the id that named the
+    // current version now names an earlier one.
+    pause();
+    let src = lab.path("src");
+    write(&src.join("docs/notes.md"), b"a fourth\n");
+    a.ok(&["copy", &s(&src), ":"]);
+    let listed = v.json("/api/versions?path=docs/notes.md");
+    let rows = listed["versions"].as_array().expect("versions");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[1]["v"], third["v"]);
+    assert_eq!(rows[1]["written_ms"], second["until_ms"]);
+    for (id, bytes) in ids.iter().zip([THIRD, SECOND, FIRST]) {
+        assert_eq!(v.get(&format!("/file?id={id}")).body, bytes);
+    }
+    assert_eq!(v.get(&now).body, b"a fourth\n");
+    // The file is removed: its current id names nothing, its versions are all still there.
+    a.ok(&["rm", ":docs/notes.md"]);
+    assert_eq!(v.get(&now).status, 404);
+    let listed = v.json("/api/versions?path=docs/notes.md");
+    assert_eq!(listed["deleted"], true);
+    let rows = listed["versions"].as_array().expect("versions");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["why"], "deleted");
+    assert!(rows.iter().all(|r| r.get("current").is_none()));
+    assert_eq!(v.get(&format!("/file?id={}", ids[0])).body, THIRD);
+
+    // A blob that sits in the store's trash: the version is served or refused in words, and
+    // the viewer does not take it out of the trash — the store is what it was.
+    {
+        use gclone::backend::{Backend as _, DirBackend};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let name = second_blob
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("name");
+        runtime.block_on(async {
+            let backend = DirBackend::open(&lab.path("vault")).expect("vault");
+            let found = backend.find_by_name(name).await.expect("find");
+            assert_eq!(found.len(), 1);
+            backend.trash(&found[0].handle).await.expect("trash");
+        });
+        assert!(!second_blob.exists());
+        let trashed = store_files(&lab);
+        let res = v.get(&old);
+        match res.status {
+            200 => assert_eq!(res.body, SECOND),
+            502 => assert!(
+                res.text()
+                    .starts_with("The file could not be read from the vault: "),
+                "{}",
+                res.text()
+            ),
+            other => panic!("{other}: {}", res.text()),
+        }
+        assert_eq!(
+            store_files(&lab),
+            trashed,
+            "nothing was taken out of the trash"
+        );
+        // Purged: the sentence the command line would print. HEAD asks the index only.
+        let in_trash = trashed
+            .iter()
+            .find(|(path, _)| path.file_name() == second_blob.file_name())
+            .expect("the trashed blob");
+        std::fs::remove_file(&in_trash.0).expect("purge");
+        let res = v.get(&old);
+        assert_eq!(res.status, 502, "{}", res.text());
+        let text = res.text();
+        assert!(
+            text.starts_with("The file could not be read from the vault: blob ")
+                && text.trim_end().ends_with("is missing"),
+            "{text}"
+        );
+        assert_eq!(v.with("HEAD", &old, &[]).status, 200);
+    }
+
+    // The window: a version removed more than 25 days ago is neither listed nor served,
+    // whoever still holds its id. (Another process writes the replica: here, the test.)
+    {
+        let db = rusqlite::Connection::open(a.vault_state().join("state.db")).expect("state.db");
+        let moved = db
+            .execute(
+                "UPDATE removed SET removed_ms = removed_ms - ?1 \
+                 WHERE path = 'docs/notes.md' AND size IN (?2, ?3)",
+                rusqlite::params![
+                    (WINDOW_MS + 60_000) as i64,
+                    FIRST.len() as i64,
+                    THIRD.len() as i64
+                ],
+            )
+            .expect("update");
+        assert_eq!(moved, 2);
+    }
+    let listed = v.json("/api/versions?path=docs/notes.md");
+    let sizes: Vec<u64> = listed["versions"]
+        .as_array()
+        .expect("versions")
+        .iter()
+        .map(|r| u(&r["size"]))
+        .collect();
+    assert_eq!(sizes, [9, SECOND.len() as u64]);
+    for gone in [&ids[0], &ids[2]] {
+        let res = v.get(&format!("/file?id={gone}"));
+        assert_eq!(res.status, 404, "{}", res.text());
+        assert_eq!(res.text().trim(), "This version is no longer kept.");
+    }
+    let stat = v.get(&format!(
+        "/api/stat?path=docs/notes.md&v={}",
+        first["v"].as_str().expect("v")
+    ));
+    assert_eq!(stat.status, 404);
+    assert!(!v.log().contains("panicked"));
+}
+
+/// What the index has no time for (§7.4). A folder made with `mkdir` brings no upload: it is
+/// shown from the last its device did before, and says that it may have come later — until
+/// the device's next recorded change. A file put over another one with `copy --force`, from
+/// bytes the vault holds already, supersedes nothing and uploads nothing: it is there from
+/// when the old version went (not from that earlier moment, in the old content's place),
+/// and the old version reads "overwritten".
+#[test]
+fn entries_without_a_time_are_marked_and_a_forced_copy_does_not_hide_what_was_there() {
+    let WithHistory { lab, a, .. } = vault_with_history();
+    pause();
+    a.ok(&["mkdir", ":plans"]);
+    pause();
+    // The bytes of `late.txt`, from a directory that never was in sync with the vault.
+    let other = lab.path("other");
+    write(&other.join("docs/notes.md"), b"late\n");
+    let out = a.ok(&["copy", "--force", &s(&other), ":"]);
+    assert!(out.contains("reused"), "{out}");
+    let v = Viewer::start(&a, &lab);
+    let versions = v.json("/api/versions?path=docs/notes.md");
+    let rows = versions["versions"].as_array().expect("versions");
+    assert_eq!(u(&rows[0]["size"]), 5, "{versions}");
+    let replaced = u(&rows[1]["until_ms"]);
+    assert_eq!(
+        (&rows[1]["why"], u(&rows[1]["size"])),
+        (&"overwritten".into(), THIRD.len() as u64),
+        "{versions}"
+    );
+    assert_eq!(u(&rows[0]["written_ms"]), replaced, "{versions}");
+    // Until then the old content, with nothing to doubt; from then on the new one.
+    let before = v.json(&format!("/api/stat?path=docs/notes.md&at={}", replaced - 1));
+    assert_eq!(u(&before["size"]), THIRD.len() as u64, "{before}");
+    assert!(before.get("approx").is_none(), "{before}");
+    let old = v.get(&format!(
+        "/file?id={}",
+        before["id"].as_str().expect("an id")
+    ));
+    assert_eq!((old.status, old.body.as_slice()), (200, THIRD));
+    let after = v.json(&format!("/api/stat?path=docs/notes.md&at={replaced}"));
+    assert_eq!(u(&after["size"]), 5, "{after}");
+    assert!(after.get("approx").is_none(), "{after}");
+
+    // The folder: listed with the mark before the device's next recorded change — here the
+    // op that removed the old notes — and without it from then on.
+    for (at, approx) in [(replaced - 1, true), (replaced, false)] {
+        let root = by_name(&v.json(&format!("/api/list?at={at}"))["entries"]);
+        let plans = &root["plans"];
+        assert_eq!(plans["dir"], true);
+        assert_eq!(plans.get("approx").is_some(), approx, "at {at}: {plans}");
+        let stat = v.json(&format!("/api/stat?path=plans&at={at}"));
+        assert_eq!(stat.get("approx").is_some(), approx, "at {at}: {stat}");
+        let found = v.json(&format!("/api/search?q=plans&at={at}"));
+        assert_eq!(
+            found["hits"][0].get("approx").is_some(),
+            approx,
+            "at {at}: {found}"
+        );
+        assert!(root["docs"].get("approx").is_none());
+    }
+    // The present has no such mark.
+    let now = by_name(&v.json("/api/list")["entries"]);
+    assert!(now["plans"].get("approx").is_none());
+}
+
+#[test]
+fn the_vault_at_an_earlier_moment_and_what_was_deleted() {
+    let WithHistory { lab, a, .. } = vault_with_history();
+    let v = Viewer::start(&a, &lab);
+    let before = replica_dump(&a);
+    let store = store_files(&lab);
+    let versions = v.json("/api/versions?path=docs/notes.md");
+    // When the first version gave way to the second, and the second to the third.
+    let second_came = u(&versions["versions"][2]["until_ms"]);
+    let third_came = u(&versions["versions"][1]["until_ms"]);
+
+    // The timeline: the moments inside the window, by time; the exact ones are the times the
+    // versions list shows, and the uploads that replaced nothing are estimates.
+    let timeline = v.json("/api/timeline");
+    assert_eq!(u(&timeline["now_ms"]) - u(&timeline["from_ms"]), WINDOW_MS);
+    assert_eq!(timeline["devices"], serde_json::json!(["a"]));
+    let moments: Vec<(u64, u64, u64, u64)> = timeline["moments"]
+        .as_array()
+        .expect("moments")
+        .iter()
+        .map(|m| (u(&m[0]), u(&m[1]), u(&m[2]), u(&m[3])))
+        .collect();
+    assert!(moments.windows(2).all(|w| w[0].0 <= w[1].0), "{moments:?}");
+    assert!(
+        moments
+            .iter()
+            .all(|m| m.2 == 0 && m.0 > u(&timeline["from_ms"]))
+    );
+    assert!(moments.contains(&(second_came, 1, 0, 0)), "{moments:?}");
+    assert!(moments.contains(&(third_came, 2, 0, 0)), "{moments:?}");
+    let (first, last) = (moments[0], moments[moments.len() - 1]);
+    // The first upload: every file with content. The last: one late file.
+    assert_eq!((first.1, first.3), (9, 1), "{moments:?}");
+    assert_eq!((last.1, last.3), (1, 1), "{moments:?}");
+    assert!(first.0 < second_came && last.0 > third_came);
+    // The removals: one file, the folder's two, the move.
+    let exact: Vec<u64> = moments.iter().filter(|m| m.3 == 0).map(|m| m.1).collect();
+    assert_eq!(exact, [1, 2, 1, 2, 1], "{moments:?}");
+
+    // Just before the second version came: the first is there, and says what became of it.
+    let then = second_came - 1;
+    let docs = v.json(&format!("/api/list?path=docs&at={then}"));
+    assert_eq!(u(&docs["at"]), then);
+    assert_eq!(
+        (&docs["path"], &docs["sort"], &docs["order"]),
+        (&"docs".into(), &"name".into(), &"asc".into())
+    );
+    let rows = by_name(&docs["entries"]);
+    assert_eq!(u(&rows["notes.md"]["size"]), FIRST.len() as u64);
+    assert_eq!(rows["notes.md"]["since"], "changed");
+    assert_eq!(rows[&ODD["docs/".len()..]]["since"], "changed");
+    assert!(rows["a.txt"].get("since").is_none(), "the same today");
+    assert!(
+        rows["sub"].get("since").is_none(),
+        "a folder that is still there"
+    );
+    assert!(!rows.contains_key("moved-here.txt"));
+    // Rows carry neither an id nor a version: `stat` hands those out.
+    assert!(
+        rows.values()
+            .all(|r| r.get("id").is_none() && r.get("v").is_none())
+    );
+    // At the moment itself the second version is there; later the third, as today.
+    let at = |t: u64| by_name(&v.json(&format!("/api/list?path=docs&at={t}"))["entries"]);
+    assert_eq!(u(&at(second_came)["notes.md"]["size"]), SECOND.len() as u64);
+    assert_eq!(
+        u(&at(third_came - 1)["notes.md"]["size"]),
+        SECOND.len() as u64
+    );
+    let third = at(third_came);
+    assert_eq!(u(&third["notes.md"]["size"]), THIRD.len() as u64);
+    assert!(third["notes.md"].get("since").is_none());
+    assert!(third["sub"].get("since").is_none());
+
+    // The root then: the folder that was deleted since and the file that was moved away are
+    // there and say so; the file that came late is not.
+    let root = by_name(&v.json(&format!("/api/list?at={then}"))["entries"]);
+    let names: Vec<&str> = root.keys().map(String::as_str).collect();
+    assert_eq!(names, ["docs", "hollow", "moved.txt", "old"]);
+    assert_eq!(root["old"]["since"], "deleted");
+    assert_eq!(
+        (&root["old"]["dir"], &root["old"]["kind"]),
+        (&true.into(), &"folder".into())
+    );
+    assert_eq!(root["moved.txt"]["since"], "deleted");
+    assert!(root["docs"].get("since").is_none() && root["hollow"].get("since").is_none());
+    let sub = by_name(&v.json(&format!("/api/list?path=docs/sub&at={then}"))["entries"]);
+    assert_eq!(sub["b.txt"]["since"], "deleted");
+    let old = v.json(&format!(
+        "/api/list?path=old&at={then}&sort=size&order=desc"
+    ));
+    assert_eq!(old["total"], 2);
+    assert_eq!(old["entries"][0]["name"], "deep");
+    assert_eq!(old["entries"][1]["name"], "x.txt");
+    // Pages, as in the present.
+    let page = v.json(&format!("/api/list?at={then}&offset=1&limit=2"));
+    assert_eq!((&page["total"], &page["offset"]), (&4.into(), &1.into()));
+    let names: Vec<&str> = page["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["hollow", "old"], "folders first");
+
+    // `stat` then: the version that was there, by an id of its own — which still gives
+    // those bytes.
+    let stat = v.json(&format!("/api/stat?path=docs/notes.md&at={then}"));
+    assert_eq!(stat["v"], versions["versions"][2]["v"]);
+    assert_eq!(
+        (&stat["since"], &stat["path"]),
+        (&"changed".into(), &"docs/notes.md".into())
+    );
+    let id = stat["id"].as_str().expect("an id");
+    assert_eq!(v.get(&format!("/file?id={id}")).body, FIRST);
+    // Also for a file that is the same today: the id pins the version shown.
+    let same = v.json(&format!("/api/stat?path=docs/a.txt&at={then}"));
+    assert!(same.get("since").is_none());
+    let pinned = same["id"].as_str().expect("an id");
+    assert_ne!(pinned, v.json("/api/stat?path=docs/a.txt")["id"]);
+    assert_eq!(v.get(&format!("/file?id={pinned}")).body, b"alpha\n");
+    let gone = v.json(&format!("/api/stat?path=old/deep/y.txt&at={then}"));
+    assert_eq!(gone["since"], "deleted");
+    assert_eq!(
+        v.get(&format!("/file?id={}", gone["id"].as_str().expect("an id")))
+            .body,
+        b"y\n"
+    );
+    let folder = v.json(&format!("/api/stat?path=old&at={then}"));
+    assert_eq!(
+        (&folder["dir"], &folder["since"]),
+        (&true.into(), &"deleted".into())
+    );
+    assert!(folder.get("id").is_none() && folder.get("v").is_none());
+    for nothing in ["late.txt", "docs/moved-here.txt", "nope"] {
+        let res = v.get(&format!("/api/stat?path={nothing}&at={then}"));
+        assert_eq!(res.status, 404, "{nothing}");
+        assert_eq!(
+            res.text().trim(),
+            format!("There was nothing at {nothing:?} in the vault at that time.")
+        );
+    }
+
+    // A search then finds what was there then, by the rule of the present.
+    let found = v.json(&format!("/api/search?q=txt&at={then}"));
+    assert_eq!(u(&found["at"]), then);
+    let hits: Vec<(&str, Option<&str>)> = found["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|h| (h["path"].as_str().expect("path"), h["since"].as_str()))
+        .collect();
+    assert_eq!(
+        hits,
+        [
+            ("docs/a.txt", None),
+            ("docs/sub/b.txt", Some("deleted")),
+            ("moved.txt", Some("deleted")),
+            (ODD, Some("changed")),
+            ("old/x.txt", Some("deleted")),
+            ("old/deep/y.txt", Some("deleted")),
+        ]
+    );
+    let folders = v.json(&format!("/api/search?q=old&at={then}"));
+    assert_eq!(folders["hits"][0]["path"], "old");
+    assert_eq!(folders["hits"][0]["since"], "deleted");
+    assert!(
+        v.json("/api/search?q=old")["hits"]
+            .as_array()
+            .expect("hits")
+            .is_empty()
+    );
+
+    // A folder that was not there then: no error — the place stays — and the nearest folder
+    // that was.
+    for (path, t, nearest) in [
+        ("old/deep/nothing/at/all", then, "old/deep"),
+        ("old/deep", u(&timeline["now_ms"]) + 5_000, ""),
+        ("docs/a.txt", then, "docs"),
+    ] {
+        let absent = v.json(&format!("/api/list?path={path}&at={t}"));
+        assert_eq!(absent["absent"], true, "{path}");
+        assert_eq!(absent["nearest"], nearest, "{path}");
+        assert_eq!(
+            (&absent["total"], absent["entries"].as_array().map(Vec::len)),
+            (&0.into(), Some(0))
+        );
+    }
+    assert_eq!(
+        v.get("/api/list?path=old").status,
+        404,
+        "without a time: no such folder"
+    );
+
+    // `at` is a time in milliseconds, moved into the window and echoed.
+    for bad in ["", "abc", "-1", "1.5", "+5", "12345678901234567", "1e5"] {
+        for route in [
+            "/api/list?",
+            "/api/search?q=a&",
+            "/api/stat?path=docs&",
+            "/api/versions?path=docs&",
+        ] {
+            let res = v.get(&format!("{route}at={bad}"));
+            assert_eq!(res.status, 400, "{route}at={bad}");
+            assert_eq!(
+                res.text().trim(),
+                "at is a time in milliseconds: up to 16 digits"
+            );
+        }
+    }
+    let (from, now) = (u(&timeline["from_ms"]), u(&timeline["now_ms"]));
+    let early = u(&v.json("/api/list?at=0")["at"]);
+    assert!(
+        (from..from + 60_000).contains(&early),
+        "{early} against {from}"
+    );
+    let late = v.json("/api/list?at=9999999999999999");
+    assert!((now..now + 60_000).contains(&u(&late["at"])));
+    // "Now", asked for as a time, is the present: the same entries, without a mark.
+    let mut present = v.json("/api/list");
+    present["at"] = late["at"].clone();
+    assert_eq!(late, present);
+    let mut hits = v.json("/api/search?q=a");
+    let then_hits = v.json("/api/search?q=a&at=9999999999999999");
+    hits["at"] = then_hits["at"].clone();
+    assert_eq!(then_hits, hits);
+
+    // The versions list marks what was there at the moment the page shows.
+    let marked = v.json(&format!("/api/versions?path=docs/notes.md&at={then}"));
+    let shown: Vec<bool> = marked["versions"]
+        .as_array()
+        .expect("versions")
+        .iter()
+        .map(|r| r.get("shown").is_some())
+        .collect();
+    assert_eq!(shown, [false, false, true]);
+
+    // What was deleted from a folder and is kept: a file with its last version …
+    let deleted = v.json("/api/deleted?path=docs/sub");
+    assert_eq!(
+        (&deleted["path"], &deleted["gone"], &deleted["total"]),
+        (&"docs/sub".into(), &false.into(), &1.into())
+    );
+    assert!(deleted.get("restore").is_none() && deleted.get("as_it_was_ms").is_none());
+    let row = &deleted["entries"][0];
+    assert_eq!(
+        (&row["name"], &row["kind"], u(&row["size"])),
+        (&"b.txt".into(), &"text".into(), 6)
+    );
+    assert_eq!(
+        (&row["gone"]["by"], &row["gone"]["why"]),
+        (&"a".into(), &"deleted".into())
+    );
+    assert!(u(&row["gone"]["ms"]) > third_came);
+    let version = row["v"].as_str().expect("v");
+    let stat = v.json(&format!("/api/stat?path=docs/sub/b.txt&v={version}"));
+    assert_eq!(stat["since"], "deleted");
+    assert_eq!(
+        v.get(&format!("/file?id={}", stat["id"].as_str().expect("an id")))
+            .body,
+        b"bravo\n"
+    );
+    // … a folder with the number of files kept under it, a file that was moved away …
+    let root = v.json("/api/deleted");
+    let rows = by_name(&root["entries"]);
+    let names: Vec<&str> = root["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["old", "moved.txt"], "folders first");
+    assert_eq!(
+        (&rows["old"]["dir"], &rows["old"]["files"]),
+        (&true.into(), &2.into())
+    );
+    assert!(rows["old"].get("gone").is_none() && rows["old"].get("files_more").is_none());
+    assert_eq!(rows["moved.txt"]["gone"]["why"], "deleted");
+    // … in the order and the pages of a listing.
+    let page = v.json("/api/deleted?sort=name&order=desc&offset=1&limit=1");
+    assert_eq!(
+        (&page["total"], &page["entries"][0]["name"]),
+        (&2.into(), &"moved.txt".into())
+    );
+    // A folder that is gone: its content, the command, and the moment to see it at.
+    let gone = v.json("/api/deleted?path=old");
+    assert_eq!(gone["gone"], true);
+    assert_eq!(gone["restore"], "gclone restore -r :old");
+    let names: Vec<&str> = gone["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["deep", "x.txt"]);
+    let as_it_was = u(&gone["as_it_was_ms"]);
+    let was = by_name(&v.json(&format!("/api/list?path=old&at={as_it_was}"))["entries"]);
+    assert_eq!(was.len(), 2);
+    assert_eq!(
+        v.json(&format!("/api/list?path=old&at={}", as_it_was + 1))["absent"],
+        true
+    );
+    // Nothing deleted, no such folder, a file, a wrong question.
+    assert_eq!(v.json("/api/deleted?path=docs")["total"], 0);
+    for (bad, status) in [
+        ("/api/deleted?path=nope", 404),
+        ("/api/deleted?path=docs/a.txt", 404),
+        ("/api/deleted?path=/abs", 400),
+        ("/api/deleted?limit=0", 400),
+        ("/api/deleted?sort=date", 400),
+        ("/api/deleted?offset=x", 400),
+    ] {
+        assert_eq!(v.get(bad).status, status, "{bad}");
+    }
+
+    // Nothing of all this wrote anything: not to the replica (the download ledger aside),
+    // not to the store.
+    assert_eq!(replica_dump(&a), before);
+    assert_eq!(store_files(&lab), store);
+    // The log shows routes, never a path, a time or a version.
+    let log = v.log();
+    assert!(log.contains("GET /api/versions") && log.contains("GET /api/deleted"));
+    assert!(log.contains("GET /api/timeline"));
+    for leak in ["notes.md", "at=", "v=", version] {
+        assert!(!log.contains(leak), "{leak}");
+    }
+    assert!(!log.contains("panicked"));
 }

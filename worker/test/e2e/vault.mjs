@@ -245,6 +245,74 @@ export function buildVault(work, options = {}) {
   return { vaultDir, device, files, src, bin };
 }
 
+/** Waits, without a timer: the runs of gclone that make history must be at different times. */
+function pause(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * History for the time machine, on a vault of `buildVault`: runs of the native binary more
+ * than a second apart — two more versions of `docs/notes.txt` (and one of a file with an odd
+ * name), a deleted file, a deleted folder, a moved file, a new folder and a late upload.
+ * `vault.files` follows. Returns what the viewer has to show:
+ *
+ *   stages    [{ label, tree, files }]: `gclone tree` and the files after each run, oldest first
+ *   notes     the versions of `docs/notes.txt`, oldest first (Buffers)
+ *   odd       the path of the file with the odd name that has two versions, and both
+ */
+export function addHistory(vault, gapMs = 1100) {
+  const { device, src, files } = vault;
+  const put = (rel, content) => {
+    const bytes = Buffer.from(content);
+    files.set(rel, bytes);
+    fs.mkdirSync(path.dirname(path.join(src, rel)), { recursive: true });
+    fs.writeFileSync(path.join(src, rel), bytes);
+    return bytes;
+  };
+  const drop = (rel) => {
+    for (const name of [...files.keys()]) if (name === rel || name.startsWith(`${rel}/`)) files.delete(name);
+    fs.rmSync(path.join(src, rel), { recursive: true, force: true });
+  };
+  const stages = [];
+  const stage = (label) => stages.push({ label, tree: device.lines('tree'), files: new Map(files) });
+  const odd = `names/${ODD_NAMES[1]}`;
+  const notes = [files.get('docs/notes.txt')];
+  const odds = [files.get(odd)];
+  stage('as built');
+
+  pause(gapMs);
+  notes.push(put('docs/notes.txt', 'These are the notes, in their second version.\nThe umlaut stayed: Grüße.\n'));
+  device.run('copy', src, ':');
+  stage('the notes changed');
+
+  pause(gapMs);
+  notes.push(put('docs/notes.txt', 'The notes as they are now: the third version.\n'));
+  odds.push(put(odd, 'the odd name, written again\n'));
+  device.run('copy', src, ':');
+  stage('the notes and an odd name changed');
+
+  pause(gapMs);
+  device.run('rm', ':docs/long.txt');
+  drop('docs/long.txt');
+  device.run('rm', '-r', ':deep');
+  drop('deep');
+  stage('a file and a folder deleted');
+
+  pause(gapMs);
+  device.run('mv', ':README.md', ':docs/README.md');
+  const readme = files.get('README.md');
+  drop('README.md');
+  put('docs/README.md', readme);
+  stage('a file moved');
+
+  pause(gapMs);
+  device.run('mkdir', ':plans');
+  put('plans/2027.txt', 'next year\n');
+  device.run('copy', src, ':');
+  stage('a late upload');
+  return { stages, notes, odd: { path: odd, versions: odds } };
+}
+
 /** `gclone tree`: the drawing and the counts, from `[{ path, dir }]` (as the CLI draws it). */
 export function tree(rows) {
   const utf8 = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));

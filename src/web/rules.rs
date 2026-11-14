@@ -4,9 +4,9 @@
 //!
 //! Pure code — no server, no database, no clock. The local viewer (`gclone web`, `super`)
 //! feeds it rows of the SQL replica; the hosted viewer's core (`web-core/`, which compiles this
-//! file and `mime.rs` a second time, by path) feeds it rows of its in-memory index. One copy,
-//! so the two cannot drift apart. This file may use `crate::path`, `crate::types`, `super::mime`
-//! and nothing else of the crate.
+//! file, `past.rs` and `mime.rs` a second time, by path) feeds it rows of its in-memory index.
+//! One copy, so the two cannot drift apart. This file may use `crate::path`, `crate::types`,
+//! `super::mime` and nothing else of the crate.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -54,6 +54,41 @@ pub struct EntryJson {
     /// Files only.
     pub size: Option<u64>,
     pub mtime_ms: Option<i64>,
+    /// The id of the version shown (`past::version_id`): `stat` of an earlier moment or of a
+    /// version, and the rows of deleted files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v: Option<String>,
+    /// A row of an earlier moment against the present: `"changed"` (other content now) or
+    /// `"deleted"` (nothing is at that path now). Absent: the same today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<&'static str>,
+    /// A row of an earlier moment that may not have been there yet: nothing in the index
+    /// says when it came but what its device did before (a folder, an empty file, a restore,
+    /// a copy of stored bytes — §7.4).
+    #[serde(skip_serializing_if = "is_false")]
+    pub approx: bool,
+    /// A deleted file: when it was removed, by which device, and how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gone: Option<GoneJson>,
+    /// A deleted folder: the kept files under it that were counted, and whether there are more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<u64>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub files_more: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+/// How a version stopped being the current one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GoneJson {
+    pub ms: u64,
+    /// The name of the device that removed it.
+    pub by: String,
+    /// `"overwritten"` or `"deleted"`.
+    pub why: &'static str,
 }
 
 impl EntryJson {
@@ -70,6 +105,29 @@ impl EntryJson {
             },
             size: file.map(|h| h.entry.size),
             mtime_ms: file.map(|h| h.entry.mtime_ns.div_euclid(1_000_000)),
+            v: None,
+            since: None,
+            approx: false,
+            gone: None,
+            files: None,
+            files_more: false,
+        }
+    }
+
+    /// The entry of a row, with what a row of the past or a deleted row carries.
+    pub fn of_row<T: RowView>(row: &T, path: Option<String>) -> EntryJson {
+        let (files, files_more) = match row.files() {
+            Some((files, more)) => (Some(files), more),
+            None => (None, false),
+        };
+        EntryJson {
+            v: row.v().map(str::to_owned),
+            since: row.since(),
+            approx: row.approx(),
+            gone: row.gone_info().cloned(),
+            files,
+            files_more,
+            ..EntryJson::new(row.name(), path, row.is_dir(), row.head())
         }
     }
 }
@@ -83,6 +141,15 @@ pub struct ListJson {
     pub total: usize,
     pub offset: usize,
     pub entries: Vec<EntryJson>,
+    /// The moment the listing shows, when one was asked for: `at`, moved into the window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+    /// The folder did not exist at that moment; `nearest` is the closest folder above it that
+    /// did (`""`: the vault's root).
+    #[serde(skip_serializing_if = "is_false")]
+    pub absent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearest: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +160,82 @@ pub struct SearchJson {
     pub hits: Vec<EntryJson>,
     /// There are more matches than `hits` holds.
     pub more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+}
+
+/// One row of `versions`: a version of a file that is kept.
+#[derive(Debug, Serialize)]
+pub struct VersionJson {
+    pub v: String,
+    /// The file as it is now.
+    #[serde(skip_serializing_if = "is_false")]
+    pub current: bool,
+    /// The version that was there at the moment asked for (`at`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub shown: bool,
+    pub size: u64,
+    pub mtime_ms: i64,
+    /// When the version came into the vault; absent when that was before the window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written_ms: Option<u64>,
+    /// `written_ms` is an estimate (§7.4: the index records removals, not arrivals).
+    #[serde(skip_serializing_if = "is_false")]
+    pub written_approx: bool,
+    pub written_by: String,
+    /// When it stopped being current, which device did that, and how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<&'static str>,
+    /// The command that brings this version back; absent for the current one and for a name
+    /// no command line can carry safely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VersionsJson {
+    pub path: String,
+    pub now_ms: u64,
+    /// The start of the window: nothing removed before it is offered.
+    pub from_ms: u64,
+    /// There is no file at the path now.
+    pub deleted: bool,
+    /// There are more versions than `versions` holds.
+    pub more: bool,
+    pub versions: Vec<VersionJson>,
+}
+
+/// The answer to `deleted`: what was removed from a folder and is still kept.
+#[derive(Debug, Serialize)]
+pub struct DeletedJson {
+    pub path: String,
+    /// The folder itself does not exist any more.
+    pub gone: bool,
+    pub sort: &'static str,
+    pub order: &'static str,
+    pub total: usize,
+    pub offset: usize,
+    pub entries: Vec<EntryJson>,
+    /// `gone` only: the command that brings the folder's files back, and the last moment at
+    /// which the folder still held something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_it_was_ms: Option<u64>,
+}
+
+/// The answer to `timeline`: the moments inside the window at which the vault changed, as
+/// `[ms, files, index into devices, 1 if the time is an estimate]`, by rising time.
+#[derive(Debug, Serialize)]
+pub struct TimelineJson {
+    pub now_ms: u64,
+    pub from_ms: u64,
+    pub devices: Vec<String>,
+    pub moments: Vec<(u64, u64, usize, u8)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +272,35 @@ pub fn no_file(path: &str) -> String {
 /// A numeric parameter that is no number, or too large.
 pub fn not_a_number(name: &str, max: usize) -> String {
     format!("{name} is a number up to {max}")
+}
+
+/// `stat` or a listing of an earlier moment at which nothing was at the path.
+pub fn not_then(path: &str) -> String {
+    format!("There was nothing at {path:?} in the vault at that time.")
+}
+
+/// A version that was asked for by its id and is not (or no longer) offered.
+pub const NOT_KEPT: &str = "This version is no longer kept.";
+pub const BAD_TIME: &str = "at is a time in milliseconds: up to 16 digits";
+pub const BAD_VERSION: &str = "v is a version id: 12 hexadecimal digits";
+pub const AT_OR_V: &str = "at or v, not both";
+
+/// `at` of a call: a moment in milliseconds since 1970, decimal digits only.
+pub fn parse_at(text: &str) -> Result<u64, &'static str> {
+    if text.is_empty() || text.len() > 16 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(BAD_TIME);
+    }
+    text.parse().map_err(|_| BAD_TIME)
+}
+
+/// `v` of a call: a version id as `past::version_id` makes it.
+pub fn parse_v(text: &str) -> Result<&str, &'static str> {
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if text.len() == 12 && text.bytes().all(hex) {
+        Ok(text)
+    } else {
+        Err(BAD_VERSION)
+    }
 }
 
 pub const LIMIT_IS_ZERO: &str = "limit is at least 1";
@@ -206,6 +378,23 @@ pub trait RowView {
     /// The winner at the entry's path; `None` for a directory that exists only through what
     /// is under it (and, in a search, for every directory).
     fn head(&self) -> Option<&Head>;
+    /// What only a row of an earlier moment or a deleted row has (`EntryJson`).
+    fn v(&self) -> Option<&str> {
+        None
+    }
+    fn since(&self) -> Option<&'static str> {
+        None
+    }
+    fn approx(&self) -> bool {
+        false
+    }
+    fn gone_info(&self) -> Option<&GoneJson> {
+        None
+    }
+    /// A deleted folder: `(files counted, there are more)`.
+    fn files(&self) -> Option<(u64, bool)> {
+        None
+    }
 }
 
 /// The order of a listing — a directory's and a search's alike. Directories come first,
@@ -213,37 +402,62 @@ pub trait RowView {
 /// `sort=size|mtime`: files by that key, reversed under `desc`, equal keys by name ascending;
 /// directories, which have neither a size nor a time, by name ascending in both orders.
 pub fn sort_rows<T: RowView>(rows: &mut [T], key: SortKey, descending: bool) {
+    // `rows[i]` becomes what was at `order[i]`: where that is a place already filled, its
+    // old content has moved on — to the place that was filled from it.
+    let order = listing_order(rows, key, descending);
+    for i in 0..rows.len() {
+        let mut from = order[i];
+        while from < i {
+            from = order[from];
+        }
+        rows.swap(i, from);
+    }
+}
+
+fn compare_rows<T: RowView>(a: &T, b: &T, key: SortKey, descending: bool) -> Ordering {
     let value = |row: &T| match key {
         SortKey::Name => 0,
         SortKey::Size => row.head().map_or(0, |h| i128::from(h.entry.size)),
         SortKey::Mtime => row.head().map_or(0, |h| i128::from(h.entry.mtime_ns)),
     };
     let flip = |o: Ordering| if descending { o.reverse() } else { o };
-    rows.sort_by(|a, b| {
-        let by_name = || natural_cmp(a.name(), b.name()).then_with(|| a.tie().cmp(b.tie()));
-        b.is_dir().cmp(&a.is_dir()).then_with(|| match key {
-            SortKey::Name => flip(by_name()),
-            _ if a.is_dir() => by_name(),
-            _ => flip(value(a).cmp(&value(b))).then_with(by_name),
-        })
+    let by_name = || natural_cmp(a.name(), b.name()).then_with(|| a.tie().cmp(b.tie()));
+    b.is_dir().cmp(&a.is_dir()).then_with(|| match key {
+        SortKey::Name => flip(by_name()),
+        _ if a.is_dir() => by_name(),
+        _ => flip(value(a).cmp(&value(b))).then_with(by_name),
+    })
+}
+
+/// The indices of `rows` in the order of a listing ([`sort_rows`]). Every kind of row is
+/// ordered through this one sort of indices — not through a sort of its own type, which the
+/// hosted viewer's module would carry once per kind (it has a size limit, §7.5).
+pub fn listing_order<T: RowView>(rows: &[T], key: SortKey, descending: bool) -> Vec<usize> {
+    #[inline(never)]
+    fn sort(order: &mut [usize], compare: &mut dyn FnMut(usize, usize) -> Ordering) {
+        order.sort_by(|a, b| compare(*a, *b));
+    }
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    sort(&mut order, &mut |a, b| {
+        compare_rows(&rows[a], &rows[b], key, descending)
     });
+    order
 }
 
 /// The answer to `list`: the directory's entries (`rows`, in any order) sorted, and the page
 /// of them that starts at `offset`.
 pub fn list_json<T: RowView>(
     path: String,
-    mut rows: Vec<T>,
+    rows: Vec<T>,
     by: SortOrder,
     offset: usize,
     limit: usize,
 ) -> ListJson {
-    sort_rows(&mut rows, by.key, by.descending);
-    let entries = rows
-        .iter()
+    let entries = listing_order(&rows, by.key, by.descending)
+        .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|row| EntryJson::new(row.name(), None, row.is_dir(), row.head()))
+        .map(|i| EntryJson::of_row(&rows[i], None))
         .collect();
     ListJson {
         path,
@@ -252,28 +466,18 @@ pub fn list_json<T: RowView>(
         total: rows.len(),
         offset,
         entries,
+        at: None,
+        absent: false,
+        nearest: None,
     }
 }
 
 /// The answer to `search`: the matches the cap let through (`hits`, whose [`RowView::tie`] is
 /// the path), in the order a folder would show them.
-pub fn search_json<T: RowView>(
-    q: String,
-    mut hits: Vec<T>,
-    more: bool,
-    by: SortOrder,
-) -> SearchJson {
-    sort_rows(&mut hits, by.key, by.descending);
-    let hits = hits
-        .iter()
-        .map(|hit| {
-            EntryJson::new(
-                hit.name(),
-                Some(hit.tie().to_owned()),
-                hit.is_dir(),
-                hit.head(),
-            )
-        })
+pub fn search_json<T: RowView>(q: String, hits: Vec<T>, more: bool, by: SortOrder) -> SearchJson {
+    let hits = listing_order(&hits, by.key, by.descending)
+        .into_iter()
+        .map(|i| EntryJson::of_row(&hits[i], Some(hits[i].tie().to_owned())))
         .collect();
     SearchJson {
         q,
@@ -281,6 +485,7 @@ pub fn search_json<T: RowView>(
         order: by.order,
         hits,
         more,
+        at: None,
     }
 }
 
@@ -347,47 +552,87 @@ pub fn search_paths<P: AsRef<str>, E>(
     needle: &str,
     limit: usize,
 ) -> Result<(Vec<(String, bool)>, bool), E> {
-    let needle = fold_name(needle);
-    if needle.is_empty() || limit == 0 {
-        return Ok((Vec::new(), false));
+    let mut search = NameSearch::new(needle, limit);
+    if search.idle() {
+        return Ok(search.finish());
     }
-    let mut found: Vec<(String, bool)> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    // The directory of the previous row: its components have been looked at.
-    let mut parent = String::new();
     for row in rows {
         let (path, is_dir) = row?;
-        let path = path.as_ref();
+        if !search.feed(path.as_ref(), is_dir) {
+            break;
+        }
+    }
+    Ok(search.finish())
+}
+
+/// The loop of [`search_paths`], for a caller that is handed its rows one at a time (a walk
+/// through the past, `past::search_at`): the same rows give the same matches.
+pub struct NameSearch {
+    needle: String,
+    limit: usize,
+    found: Vec<(String, bool)>,
+    seen: HashSet<String>,
+    /// The directory of the previous row: its components have been looked at.
+    parent: String,
+    more: bool,
+}
+
+impl NameSearch {
+    pub fn new(needle: &str, limit: usize) -> NameSearch {
+        NameSearch {
+            needle: fold_name(needle),
+            limit,
+            found: Vec::new(),
+            seen: HashSet::new(),
+            parent: String::new(),
+            more: false,
+        }
+    }
+
+    /// Nothing can be found: an empty needle, or a `limit` of 0. No row needs to be read.
+    pub fn idle(&self) -> bool {
+        self.needle.is_empty() || self.limit == 0
+    }
+
+    /// The next row, in path order. `false`: a match beyond the limit was seen — there are
+    /// more, and no further row is needed.
+    pub fn feed(&mut self, path: &str, is_dir: bool) -> bool {
         let (dir, name) = match path.rfind('/') {
             Some(i) => (&path[..i], &path[i + 1..]),
             None => ("", path),
         };
         let mut hits: Vec<(&str, bool)> = Vec::new();
-        if dir != parent {
+        if dir != self.parent {
             let ends = dir.match_indices('/').map(|(i, _)| i);
             for end in ends.chain([dir.len()]).filter(|end| *end > 0) {
                 let above = &dir[..end];
-                if fold_name(crate::path::file_name(above)).contains(&needle) {
+                if fold_name(crate::path::file_name(above)).contains(&self.needle) {
                     hits.push((above, true));
                 }
             }
-            parent = dir.to_owned();
+            dir.clone_into(&mut self.parent);
         }
-        if fold_name(name).contains(&needle) {
+        if fold_name(name).contains(&self.needle) {
             hits.push((path, is_dir));
         }
         for (hit, is_dir) in hits {
-            if seen.contains(hit) {
+            if self.seen.contains(hit) {
                 continue;
             }
-            if found.len() == limit {
-                return Ok((found, true));
+            if self.found.len() == self.limit {
+                self.more = true;
+                return false;
             }
-            seen.insert(hit.to_owned());
-            found.push((hit.to_owned(), is_dir));
+            self.seen.insert(hit.to_owned());
+            self.found.push((hit.to_owned(), is_dir));
         }
+        true
     }
-    Ok((found, false))
+
+    /// `(matches in the order found, there are more)`.
+    pub fn finish(self) -> (Vec<(String, bool)>, bool) {
+        (self.found, self.more)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

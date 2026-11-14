@@ -161,6 +161,15 @@ Every command and option is described in [docs/USAGE.md](docs/USAGE.md#commands)
     <img src="docs/images/viewer-video-light.png" width="880" alt="A video preview: a fjord time-lapse paused at 0:06 of 0:10, with the player controls">
   </picture>
 
+- **A time machine.** Both viewers show every kept version of a file, what was deleted from
+  a folder, and the whole vault as it was at an earlier moment, for 25 days. Looking is all
+  they do: the page shows the `gclone restore` command to copy.
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/viewer-timemachine-dark.png">
+    <img src="docs/images/viewer-timemachine-light.png" width="880" alt="The viewer showing the vault as it was before its last five changes: a bar with a slider over the last 25 days and a 'Back to now' button, and rows marked 'changed since' and 'deleted since'">
+  </picture>
+
 - **A backend for restic.** `gclone serve restic` lets restic keep a repository on your
   Drive, beside the vault. restic does its own encrypting and deduplicating; gclone adds the
   Google sign-in and its Drive client. restic starts gclone by itself:

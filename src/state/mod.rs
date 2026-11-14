@@ -115,6 +115,21 @@ impl Db {
         f(&self.conn())
     }
 
+    /// Runs `f` inside one deferred read transaction: every statement of `f` sees the same
+    /// state of the database, whatever other processes commit meanwhile. For SELECTs only — it
+    /// takes no write lock, so it is what a process without the state lock may use.
+    pub(crate) fn read_snapshot<T, E: From<StateError>>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let conn = self.conn();
+        // Deferred; rolled back when dropped (there is nothing to roll back).
+        let tx = conn.unchecked_transaction().map_err(StateError::from)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(StateError::from)?;
+        Ok(out)
+    }
+
     /// Runs `f` in one transaction: committed when `f` returns `Ok`, rolled back otherwise.
     pub(crate) fn txn<T, E: From<StateError>>(
         &self,

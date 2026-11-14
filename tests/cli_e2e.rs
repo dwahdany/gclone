@@ -4933,3 +4933,137 @@ async fn gc_does_not_follow_a_store_clock_that_is_far_from_the_devices() {
         .ok()
         .stdout_has("Trashed 0 dead blobs");
 }
+
+/// A file replaced with `copy --force` from a directory that was never in sync with it: the
+/// new version supersedes nothing, and the old one goes with the op that resolves the two.
+/// `restore --list` says "overwritten" for it — the path never was empty — as the viewer does
+/// (`past::why`).
+#[test]
+fn a_version_replaced_with_force_is_listed_as_overwritten() {
+    let w = world();
+    let a = &w.a;
+    let one = w.lab.path("forced-one");
+    write(&one.join("f.txt"), b"first\n");
+    a.run(&["copy", &s(&one), ":forced"]).ok();
+    let two = w.lab.path("forced-two");
+    write(&two.join("f.txt"), b"the second one\n");
+    a.run(&["copy", "--force", &s(&two), ":forced"]).ok();
+    assert_eq!(
+        a.run(&["cat", ":forced/f.txt"]).ok().stdout,
+        "the second one\n"
+    );
+    let listed = a.run(&["restore", "--list", ":forced/f.txt"]).ok().stdout;
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 2, "{listed}");
+    assert!(lines[1].contains("(overwritten)"), "{listed}");
+    // A deleted file still says so.
+    a.run(&["rm", ":forced/f.txt"]).ok();
+    let listed = a.run(&["restore", "--list", ":forced/f.txt"]).ok().stdout;
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 3, "{listed}");
+    assert!(lines[1].contains("(deleted)"), "{listed}");
+    assert!(lines[2].contains("(overwritten)"), "{listed}");
+}
+
+/// `restore --list` names every version by an id, and `--version @ID` restores exactly that
+/// version — also after a newer version has appeared, which moves every position K by one
+/// (§5.5.4). The id is the one the viewer's "Versions" panel puts into the command it shows.
+#[test]
+fn restore_takes_the_id_of_a_version() {
+    let w = world();
+    let a = &w.a;
+    let dir = w.lab.path("editions");
+    for text in ["first\n", "the second\n", "and the third one\n"] {
+        write(&dir.join("f.txt"), text.as_bytes());
+        a.run(&["copy", &s(&dir), ":ed"]).ok();
+    }
+    let listed = a.run(&["restore", "--list", ":ed/f.txt"]).ok().stdout;
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 3, "{listed}");
+    // The header, and per version: K, removed, size, by, why, id.
+    let header: Vec<&str> = lines[0].split_whitespace().collect();
+    assert_eq!(header, ["K", "removed", "size", "by", "id"]);
+    let id_of = |line: &str| {
+        let id = line.split_whitespace().last().expect("an id column");
+        assert!(line.contains("(overwritten)"), "{line}");
+        assert!(id.len() == 13 && id.starts_with('@'), "{line}");
+        assert!(
+            id[1..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{line}"
+        );
+        id.to_owned()
+    };
+    // The columns line up: the id starts where the header says.
+    let at = lines[0].find("id").expect("the id column");
+    assert!(
+        lines[1..].iter().all(|l| l.find('@') == Some(at)),
+        "{listed}"
+    );
+    // Newest first: K = 1 is "the second", K = 2 is "first".
+    let (second, first) = (id_of(lines[1]), id_of(lines[2]));
+    assert!(lines[1].trim_start().starts_with("1 ") && lines[1].contains("11 B"));
+    assert!(lines[2].trim_start().starts_with("2 ") && lines[2].contains("6 B"));
+    assert_ne!(first, second);
+
+    // A newer version appears: every K moves, no id does.
+    write(&dir.join("f.txt"), b"a fourth, to move the numbers\n");
+    a.run(&["copy", &s(&dir), ":ed"]).ok();
+    let listed = a.run(&["restore", "--list", ":ed/f.txt"]).ok().stdout;
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 4, "{listed}");
+    assert_eq!(
+        (id_of(lines[2]), id_of(lines[3])),
+        (second.clone(), first.clone())
+    );
+    // The id restores the version it named before; the old position would not.
+    a.run(&["restore", ":ed/f.txt", "--version", &first])
+        .ok()
+        .stdout_has("Restored :ed/f.txt (6 B");
+    assert_eq!(a.bytes(&["cat", ":ed/f.txt"]), b"first\n");
+    a.run(&["restore", ":ed/f.txt", "--version", &second]).ok();
+    assert_eq!(a.bytes(&["cat", ":ed/f.txt"]), b"the second\n");
+    // A position still works as it did.
+    a.run(&["restore", ":ed/f.txt", "--version", "1"]).ok();
+    assert_eq!(a.bytes(&["cat", ":ed/f.txt"]), b"first\n");
+
+    // An id no version has, and one of another file: the error that names --list.
+    let other = a.run(&["restore", "--list", ":docs/big.bin"]).ok().stdout;
+    assert!(other.contains("No restorable version"), "{other}");
+    for unknown in ["@0123456789ab", "@ffffffffffff"] {
+        a.run(&["restore", ":ed/f.txt", "--version", unknown])
+            .code(1)
+            .stderr_has(&format!("there is no version {unknown}"))
+            .stderr_has("gclone restore --list :ed/f.txt");
+    }
+    a.run(&["restore", ":docs/a.txt", "--version", &first])
+        .code(1)
+        .stderr_has("no restorable version");
+    // What is no id and no position is a usage error, before anything is opened.
+    for bad in [
+        "@",
+        "@123",
+        "@0123456789AB",
+        "@0123456789abc",
+        "@zzzzzzzzzzzz",
+        "0",
+        "-1",
+        "x",
+    ] {
+        let out = a
+            .run(&["restore", ":ed/f.txt", &format!("--version={bad}")])
+            .code(2);
+        assert!(
+            out.stderr.contains("--list") || out.stderr.contains("12 hexadecimal digits"),
+            "{bad}: {}",
+            out.stderr
+        );
+    }
+    // As before: one file, and not together with --list.
+    a.run(&["restore", ":ed/f.txt", ":docs/a.txt", "--version", &first])
+        .code(2);
+    a.run(&["restore", "--list", ":ed/f.txt", "--version", &first])
+        .code(2);
+    assert_eq!(a.bytes(&["cat", ":ed/f.txt"]), b"first\n");
+}
