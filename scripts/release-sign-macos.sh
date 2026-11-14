@@ -184,7 +184,7 @@ verify_signed() {
         say "   (self-test: ad hoc signature — no timestamp, no Developer ID, no team to check)"
         return 0
     fi
-    codesign -dvv "$bin" 2>&1 | grep -q '^Timestamp=' ||
+    codesign -dvv "$bin" 2>&1 | grep '^Timestamp=' >/dev/null ||
         die "$what: the signature has no secure timestamp"
     codesign --verify -R="$DEVELOPER_ID_REQUIREMENT" "$bin" 2>/dev/null ||
         die "$what: the signature is not from an Apple-issued Developer ID Application certificate"
