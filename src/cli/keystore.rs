@@ -1,5 +1,7 @@
 //! `gclone keystore` (SPEC §7.1, §8.2): where this device keeps its secrets, the Secure
-//! Enclave trial, and the two moves between the plain file and the sealed store.
+//! Enclave trial, and the two moves between the plain file and the sealed store — the one
+//! into the sealed store is also made by gclone itself (§17.30); here it is the owner's
+//! command, at once.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -10,14 +12,14 @@ use super::{
     GlobalOpts, LockMode, OpenOpts, RefreshPolicy, blocking, explained, login, note, note_config,
     open_ctx, ui_for, usage,
 };
-use crate::config::{Config, Paths};
+use crate::config::{Config, Paths, SecretStore as _};
 use crate::consts::TRANSFERS_DEFAULT;
 use crate::crypto::Keyring;
 use crate::error::ConfigError;
 use crate::keystore::seal::{self, Sealer};
 use crate::keystore::trial::{self, Moment};
 use crate::keystore::{
-    self, Choice, LayeredStore, MoveError, Report, Source, ToFile, Where, move_to_enclave,
+    self, Choice, LayeredStore, MoveBy, MoveError, Report, Source, ToFile, Where, move_to_enclave,
     move_to_file,
 };
 use crate::ui::Ui;
@@ -40,6 +42,10 @@ pub enum KeystoreCommand {
     Check(CheckArgs),
     /// Move this device's login and key: into this Mac's Secure Enclave, or back to the file
     ///
+    /// On a Mac gclone keeps them sealed by itself: a login seals them from the start, and
+    /// a device that is on the plain file is moved once the Secure Enclave has passed
+    /// gclone's test there. This command is for moving at once, and for saying no.
+    ///
     /// `enclave`: the secrets leave the plain file secrets.json and are kept in
     /// secrets.sealed, encrypted to a key that only this Mac's Secure Enclave can use: a copy
     /// of the file — from a backup, a synced folder, a disk image — is worth nothing anywhere
@@ -47,7 +53,9 @@ pub enum KeystoreCommand {
     /// proves this device's key against the vault and checks that your passphrase opens a
     /// keyfile: if this Mac is erased or repaired, the passphrase is the only way back.
     ///
-    /// `file`: back to the plain file (mode 0600), which is what gclone 0.4.0 and older read.
+    /// `file`: back to the plain file (mode 0600), which is what gclone 0.4.0 and older
+    /// read — and it stays there: nothing is moved by itself afterwards, not after a later
+    /// login either, until `gclone keystore use enclave` says otherwise.
     Use(UseArgs),
 }
 
@@ -135,9 +143,23 @@ fn show(g: &GlobalOpts) -> anyhow::Result<i32> {
     line(
         "Choice",
         match &report.choice {
-            Choice::Unset => "none made (`gclone keystore use enclave` or `gclone keystore use \
-                              file`)"
+            Choice::Unset => match (&report.sealer, report.trial_off) {
+                (Ok(_), _) if report.trial_off_marked => {
+                    "none made; a run with GCLONE_KEYSTORE_TRIAL=0 uses this device: nothing is \
+                     tested, sealed or moved by itself until `gclone keystore use enclave` or \
+                     `gclone keystore check --new-trial`"
+                        .to_string()
+                }
+                (Ok(_), false) => "none made: the sealed store wherever this Mac's Secure \
+                                   Enclave can be used (`gclone keystore use file` keeps the \
+                                   plain file)"
+                    .to_string(),
+                (Ok(_), true) => "none made; GCLONE_KEYSTORE_TRIAL=0 is set here: nothing is \
+                                  sealed or moved unless `gclone keystore use enclave` asks for \
+                                  it"
                 .to_string(),
+                (Err(_), _) => "none made".to_string(),
+            },
             Choice::File => "the plain file (`gclone keystore use file`)".to_string(),
             Choice::Enclave => "the Secure Enclave (`gclone keystore use enclave`)".to_string(),
             Choice::Unreadable(why) => format!("keystore.json cannot be used: {why}"),
@@ -147,8 +169,22 @@ fn show(g: &GlobalOpts) -> anyhow::Result<i32> {
         (Err(why), _) => line("Sealed store", format!("not available: {}", why.text())),
         (Ok(_), None) => line(
             "Trial",
-            match report.choice {
-                Choice::File => "not running (the plain file was chosen)".to_string(),
+            match (&report.store, &report.choice) {
+                (Where::Sealed | Where::Merged | Where::SealedUnusable(_), _) => {
+                    "none: the secrets were sealed at a login, or by `gclone keystore use \
+                     enclave`"
+                        .to_string()
+                }
+                (_, Choice::File) => "not running (the plain file was chosen)".to_string(),
+                _ if report.trial_off_marked => {
+                    "not running (a run with GCLONE_KEYSTORE_TRIAL=0 uses this device)".to_string()
+                }
+                _ if report.blocked_by_sealed => {
+                    "not running (secrets.sealed lies beside secrets.json)".to_string()
+                }
+                _ if report.trial_off => {
+                    "not running (GCLONE_KEYSTORE_TRIAL=0 is set here)".to_string()
+                }
                 _ => "not started yet".to_string(),
             },
         ),
@@ -172,7 +208,10 @@ fn show(g: &GlobalOpts) -> anyhow::Result<i32> {
                         }
                     ),
                 );
-            } else if t.moved && !t.running {
+            } else if (t.moved && !t.running)
+                || (report.trial_key_holds_secrets == Some(true)
+                    && matches!(report.store, Where::Sealed | Where::Merged))
+            {
                 let evidence = format!(
                     "{} days, {}",
                     t.days,
@@ -186,11 +225,15 @@ fn show(g: &GlobalOpts) -> anyhow::Result<i32> {
                     "Trial",
                     match report.trial_key_holds_secrets {
                         Some(true) => format!("ended: its key holds the secrets ({evidence})"),
-                        // `choose_key` could not use the trial's key at the move.
-                        Some(false) => format!(
+                        // The trial's key could not be used at the move (`pick_key`).
+                        Some(false) if report.trial_evidence_is_for_another_key() => format!(
                             "ended at the move — the secrets were sealed to a NEW key made \
                              then; the trial's evidence ({evidence}) belongs to another key"
                         ),
+                        // A trial that had only begun: there is no evidence to speak of.
+                        Some(false) => "none for the key that holds the secrets (a trial that \
+                                        had only begun ended when they were sealed)"
+                            .to_string(),
                         None => format!("ended at a move into the sealed store ({evidence})"),
                     },
                 );
@@ -198,7 +241,8 @@ fn show(g: &GlobalOpts) -> anyhow::Result<i32> {
                 line(
                     "Trial",
                     format!(
-                        "the test value opened on {} day(s) (complete with {}); {}; {} failure(s)",
+                        "the test value opened on {} day(s) (complete with {} that are 48 hours \
+                         apart); {}; {} failure(s)",
                         t.days,
                         trial::DAYS_NEEDED,
                         if t.restart {
@@ -238,20 +282,55 @@ fn show(g: &GlobalOpts) -> anyhow::Result<i32> {
                     ),
                 );
             }
-            if t.complete {
+            if t.complete && report.store == Where::Plain {
                 line(
                     "",
-                    "complete: `gclone keystore use enclave` moves this device's key and login \
-                     out of the plain file"
-                        .to_string(),
+                    match (&report.choice, report.trial_off) {
+                        (Choice::File, _) => {
+                            "complete; the plain file is kept by choice".to_string()
+                        }
+                        _ if report.trial_off_marked => {
+                            "complete; a run with GCLONE_KEYSTORE_TRIAL=0 uses this device: \
+                             nothing is moved"
+                                .to_string()
+                        }
+                        (_, true) => "complete; GCLONE_KEYSTORE_TRIAL=0 is set here: nothing is \
+                                      moved"
+                            .to_string(),
+                        // Every run refuses that move; the warning says what settles it.
+                        _ if report.blocked_by_sealed => {
+                            "complete, but nothing is moved while secrets.sealed lies beside \
+                             secrets.json"
+                                .to_string()
+                        }
+                        _ => "complete: the next gclone run that can open the test value moves \
+                              this device's key and login out of the plain file (`gclone \
+                              keystore use file` keeps the plain file)"
+                            .to_string(),
+                    },
                 );
-            } else if t.failures > 0 {
+            } else if t.failures > 0 && t.running {
                 line(
                     "",
-                    "a failure never clears by itself: `gclone keystore check --new-trial` \
-                     starts a new key and record"
+                    "a failure never clears by itself, and nothing is moved while one is on \
+                     record: `gclone keystore check --new-trial` starts a new key and record"
                         .to_string(),
                 );
+            }
+            // A trial that is on record and not going on.
+            if t.running && !t.complete && report.store == Where::Plain {
+                if report.trial_off_marked && report.choice != Choice::File {
+                    line(
+                        "",
+                        "not continued: a run with GCLONE_KEYSTORE_TRIAL=0 uses this device"
+                            .to_string(),
+                    );
+                } else if report.blocked_by_sealed && report.choice != Choice::File {
+                    line(
+                        "",
+                        "not continued while secrets.sealed lies beside secrets.json".to_string(),
+                    );
+                }
             }
         }
     }
@@ -323,14 +402,38 @@ fn check(g: &GlobalOpts, args: CheckArgs) -> anyhow::Result<i32> {
         }
     }
     if args.new_trial {
-        match trial::restart(&paths, sealer.as_ref()) {
-            Ok(()) => line(
-                "Trial",
-                "a new key and a new record were started".to_string(),
-            ),
-            Err(e) => {
+        // The owner asks for a new trial: a marker that a run with GCLONE_KEYSTORE_TRIAL=0
+        // left goes (such a run puts it back).
+        keystore::clear_trial_off(&paths);
+        let sealed_alone = std::fs::symlink_metadata(paths.secrets_file()).is_err()
+            && std::fs::symlink_metadata(paths.sealed_file()).is_ok();
+        if sealed_alone {
+            // The secrets are sealed: there is nothing to try, and a new record would be the
+            // record of a key that holds nothing.
+            if trial::forget(&paths) {
+                line(
+                    "Trial",
+                    "the trial's record was discarded (this device's secrets are sealed: \
+                     nothing is left to try)"
+                        .to_string(),
+                );
+            } else {
                 usable = false;
-                line("Trial", format!("a new trial could not be started: {e}"));
+                line(
+                    "Trial",
+                    "the trial's record could not be written".to_string(),
+                );
+            }
+        } else {
+            match trial::restart(&paths, sealer.as_ref()) {
+                Ok(()) => line(
+                    "Trial",
+                    "a new key and a new record were started".to_string(),
+                ),
+                Err(e) => {
+                    usable = false;
+                    line("Trial", format!("a new trial could not be started: {e}"));
+                }
             }
         }
     } else {
@@ -416,36 +519,20 @@ fn other_binaries() -> Vec<PathBuf> {
     found
 }
 
-/// The key the secrets will be sealed to: the trial's own key if its test value opens right
-/// now — then the trial's record belongs to the very key the device will depend on — else a
-/// new key, made and tried here.
+/// The key the secrets will be sealed to (`keystore::pick_key`): the trial's own key if its
+/// test value opens right now, else a new key, made and tried here.
 fn choose_key(
     paths: &Paths,
     sealer: &dyn Sealer,
 ) -> anyhow::Result<(zeroize::Zeroizing<Vec<u8>>, Vec<u8>, bool)> {
-    if let trial::Stored::Record(record) = trial::load(paths)
-        && record.open_canary(sealer).is_ok()
-        && let Some((blob, public)) = record.key_for_secrets()
-    {
-        return Ok((blob, public, true));
-    }
-    let unusable = |e: seal::SealError| {
+    let key = keystore::pick_key(paths, sealer).map_err(|e| {
         refused(format!(
             "No {} key can be made and used in this session ({e}). Nothing was changed. \
              `gclone keystore check` shows what this session can do.",
             sealer.name()
         ))
-    };
-    let (blob, public) = sealer.create().map_err(unusable)?;
-    let value: [u8; 16] = util::random();
-    let sealed = sealer.seal(&public, &value).map_err(unusable)?;
-    let back = sealer.open(&blob, &public, &sealed).map_err(unusable)?;
-    if back.as_slice() != value {
-        return Err(unusable(seal::SealError(
-            "a value sealed to the new key did not open to itself".into(),
-        )));
-    }
-    Ok((blob, public, false))
+    })?;
+    Ok((key.blob, key.public, key.from_trial))
 }
 
 fn same_keyring(a: &Keyring, b: &Keyring) -> bool {
@@ -570,11 +657,17 @@ async fn already_sealed(
              left in the state folder."
         ));
     }
-    if choice != Choice::Enclave {
-        ui.out(
-            "keystore.json now records the sealed store as this device's choice (it did not: \
-             an interrupted `gclone keystore use file`).",
-        );
+    match choice {
+        Choice::Enclave => {}
+        // What an interrupted `gclone keystore use file` leaves beside a sealed store.
+        Choice::File => ui.out(
+            "keystore.json now records the sealed store as this device's choice (it said the \
+             plain file: an interrupted `gclone keystore use file`).",
+        ),
+        // Sealed by a login or by gclone itself: no choice was on file.
+        Choice::Unset | Choice::Unreadable(_) => {
+            ui.out("keystore.json now records the sealed store as this device's choice.")
+        }
     }
     Ok(0)
 }
@@ -596,6 +689,21 @@ async fn use_enclave(g: &GlobalOpts, args: UseArgs) -> anyhow::Result<i32> {
     // A device that is not connected has nothing to move.
     let config = Config::load(&paths)?;
     note_config(&paths, &config);
+    // The trial's step of this run, before the key is picked — and nothing more. Without it
+    // this command picked a new key, the load it makes of the secrets further down started a
+    // trial with ANOTHER key, and the move then closed that trial's record: "the secrets are
+    // sealed to a key that was made at the move … the trial's evidence belongs to another
+    // key", for good, about a trial that had no evidence (§17.30).
+    //
+    // Not the automatic move that an ordinary load makes when the trial has passed: on such
+    // a device this command then found the secrets sealed already, said "nothing was moved"
+    // and exited 0 — with a wrong passphrase too, having checked neither the key against the
+    // vault nor the way back. The move here is this command's own, after its checks. What
+    // the load returns is not used: the files are looked at below.
+    {
+        let store = LayeredStore::new(&paths).without_unasked_move();
+        let _ = blocking(move || Ok(store.load())).await?;
+    }
     // Where the secrets are — looked at again if the plain file is gone by the time it is
     // read (another `gclone keystore use enclave` finished in between).
     let mut before = None;
@@ -720,7 +828,16 @@ async fn use_enclave(g: &GlobalOpts, args: UseArgs) -> anyhow::Result<i32> {
     }
 
     // Step 5
-    let moved = blocking(move || Ok(move_to_enclave(&store, &before, &blob, &public))).await?;
+    let moved = blocking(move || {
+        Ok(move_to_enclave(
+            &store,
+            &before,
+            &blob,
+            &public,
+            MoveBy::Command,
+        ))
+    })
+    .await?;
     match moved {
         Ok(()) => {}
         Err(MoveError::Changed) => {
@@ -809,7 +926,10 @@ async fn use_file(g: &GlobalOpts, args: UseArgs) -> anyhow::Result<i32> {
                 .to_string()
         }
     });
-    ui.out("The plain file is kept from now on: no Secure Enclave trial, no hint.");
+    ui.out(
+        "The plain file is kept from now on: no Secure Enclave trial, and nothing is moved by \
+         itself — not after a later login either. `gclone keystore use enclave` changes that.",
+    );
     Ok(0)
 }
 

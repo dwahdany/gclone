@@ -1,9 +1,11 @@
-//! The Secure Enclave trial (SPEC §8.2): before a device depends on the enclave, gclone keeps
-//! an enclave key that seals a random test value — never the secrets — and opens it in every
-//! run, in whatever session that run is. `keystore-trial.json` records what was seen: on how
-//! many days it worked, whether it worked after a restart, in which sessions, and every
-//! failure. The record decides nothing: it is what `gclone status` shows, and what `gclone
-//! keystore use enclave` tells the owner before the plain file is removed.
+//! The Secure Enclave trial (SPEC §8.2): before a device that is on the plain file depends on
+//! the enclave, gclone keeps an enclave key that seals a random test value — never the
+//! secrets — and opens it in every run, in whatever session that run is.
+//! `keystore-trial.json` records what was seen: on how many days it worked, whether it worked
+//! after a restart, in which sessions, and every failure. The record is the test that the
+//! automatic move waits for (`super::automatic_move`, §17.30): once it is complete, a run that
+//! opens the test value itself moves the secrets to the trial's own key. It is also what
+//! `gclone status` shows, and what `gclone keystore use enclave` tells the owner.
 
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -27,6 +29,11 @@ pub(crate) const FAILURES_KEPT: usize = 5;
 /// Days with a success that make the trial complete (together with a restart and no failure).
 pub(crate) const DAYS_NEEDED: usize = 3;
 const DAY_MS: u64 = 86_400_000;
+/// The least time between the trial's first success and its newest one for the trial to be
+/// complete (§17.30): three calendar days can be little more than 24 hours — 23:59, the next
+/// day, 00:01 — and in 24 hours a daily job comes around once at best. In 48 hours it comes
+/// around twice.
+pub(crate) const MIN_AGE_MS: u64 = 2 * DAY_MS;
 /// A machine that could not make a key is asked again after this long (or after a restart or
 /// a system update).
 const UNAVAILABLE_RETRY_MS: u64 = 7 * DAY_MS;
@@ -88,10 +95,12 @@ impl Unavailable {
     }
 }
 
-/// Notes that are shown once.
+/// Notes that were shown once.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Notes {
-    /// "The trial is complete" was shown.
+    /// gclone 0.5.0 showed "the trial is complete: `gclone keystore use enclave`" once and
+    /// wrote the moment down here. Nothing writes it any more (§17.30: a complete trial is
+    /// followed by the move, which has a note of its own); a record that has it keeps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_ms: Option<u64>,
 }
@@ -116,6 +125,10 @@ pub(crate) struct Record {
     pub created_boot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// The moment of the newest success that was written down (0.5.1): with `created_ms`, the
+    /// trial's age. A record of 0.5.0 gets it at the first step of this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ok: Vec<OkEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -124,9 +137,10 @@ pub(crate) struct Record {
     pub failure_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<Unavailable>,
-    /// When `gclone keystore use enclave` moved the secrets and ended this trial. Whether it
-    /// was the trial's key that took them is not recorded here but read off the files: the
-    /// record keeps `public`, and `secrets.sealed` names the key it is sealed to.
+    /// When the secrets went into the sealed store — by the automatic move, at a login or
+    /// with `gclone keystore use enclave` — and this trial ended. Whether it was the trial's
+    /// key that took them is not recorded here but read off the files: the record keeps
+    /// `public`, and `secrets.sealed` names the key it is sealed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved_ms: Option<u64>,
     #[serde(default)]
@@ -169,9 +183,7 @@ impl Moment {
         let (boot, session, os): (Option<String>, Option<String>, Option<String>) =
             (None, None, None);
         Moment {
-            ms: test("GCLONE_TEST_NOW_MS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(util::now_ms),
+            ms: clock_ms(),
             boot: test("GCLONE_TEST_BOOT")
                 .or(boot)
                 .unwrap_or_else(|| "unknown".into()),
@@ -185,6 +197,15 @@ impl Moment {
     fn day(&self) -> u64 {
         self.ms / DAY_MS
     }
+}
+
+/// The clock of the trial's record: every moment in it — a success, a failure, the move — is
+/// read here, so that they can be compared with each other. Debug builds honour
+/// `GCLONE_TEST_NOW_MS`.
+pub(crate) fn clock_ms() -> u64 {
+    crate::cli::test_env("GCLONE_TEST_NOW_MS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(util::now_ms)
 }
 
 /// "with graphic access" / "without graphic access", from a session word.
@@ -212,11 +233,14 @@ pub(crate) struct Summary {
     pub sessions: Vec<String>,
     pub failures: u64,
     pub last_failures: Vec<Failure>,
-    /// At least `DAYS_NEEDED` days, a restart survived, and no failure.
+    /// The newest success is at least `MIN_AGE_MS` after the first one.
+    pub aged: bool,
+    /// At least `DAYS_NEEDED` days that span at least `MIN_AGE_MS`, a restart survived, and
+    /// no failure.
     pub complete: bool,
     /// No key could be made: when, in which session, and the error.
     pub unavailable: Option<Unavailable>,
-    /// `gclone keystore use enclave` ended the trial (whose key took the secrets, or not:
+    /// A move into the sealed store ended the trial (whose key took the secrets, or not:
     /// `public` against the sealed file's).
     pub moved: bool,
     /// The public half of the trial's key, as recorded.
@@ -236,6 +260,7 @@ impl Record {
             None => false,
         };
         let running = self.key.is_some() && self.canary.is_some();
+        let aged = self.old_enough(self.last_ok_ms);
         Summary {
             running,
             days: days.len(),
@@ -243,30 +268,51 @@ impl Record {
             sessions,
             failures: self.failure_count,
             last_failures: self.failures.clone(),
-            complete: running && days.len() >= DAYS_NEEDED && restart && self.failure_count == 0,
+            aged,
+            complete: running
+                && days.len() >= DAYS_NEEDED
+                && aged
+                && restart
+                && self.failure_count == 0,
             unavailable: self.unavailable.clone(),
             moved: self.moved_ms.is_some(),
             public: self.public.clone(),
         }
     }
 
-    /// A success now. `true` = the record changed (this day, boot and session were not seen
-    /// together before).
+    /// A success at `ms` is at least `MIN_AGE_MS` after the trial began.
+    fn old_enough(&self, ms: Option<u64>) -> bool {
+        match (self.created_ms, ms) {
+            (Some(created), Some(ms)) => ms.saturating_sub(created) >= MIN_AGE_MS,
+            _ => false,
+        }
+    }
+
+    /// A success now. `true` = the record changed: this day, boot and session were not seen
+    /// together before, or this success is the one that makes the trial old enough
+    /// (`last_ok_ms` is written with a new entry and that one time more — most runs still
+    /// write nothing).
     pub(crate) fn note_ok(&mut self, at: &Moment) -> bool {
         let entry = OkEntry {
             day: at.day(),
             boot: at.boot.clone(),
             session: at.session.clone(),
         };
-        if self.ok.contains(&entry) {
-            return false;
+        let new_entry = !self.ok.contains(&entry);
+        if new_entry {
+            self.ok.push(entry);
+            if self.ok.len() > OK_MAX {
+                let extra = self.ok.len() - OK_MAX;
+                self.ok.drain(..extra);
+            }
         }
-        self.ok.push(entry);
-        if self.ok.len() > OK_MAX {
-            let extra = self.ok.len() - OK_MAX;
-            self.ok.drain(..extra);
+        let stamp = new_entry
+            || self.last_ok_ms.is_none()
+            || (!self.old_enough(self.last_ok_ms) && self.old_enough(Some(at.ms)));
+        if stamp {
+            self.last_ok_ms = Some(at.ms);
         }
-        true
+        stamp
     }
 
     pub(crate) fn note_failure(&mut self, at: &Moment, fresh_key_ok: bool, error: &SealError) {
@@ -282,8 +328,8 @@ impl Record {
         self.trim_failures();
     }
 
-    /// The step of `at` did not come back within `STEP_WAIT`.
-    fn note_timeout(&mut self, at: &Moment) {
+    /// A call into the Secure Enclave made at `at` did not come back within `wait`.
+    fn note_timeout(&mut self, at: &Moment, wait: Duration) {
         self.failure_count = self.failure_count.saturating_add(1);
         self.failures.push(Failure {
             ms: at.ms,
@@ -292,7 +338,7 @@ impl Record {
             fresh_key_ok: false,
             error: format!(
                 "the call into the Secure Enclave did not return within {} s",
-                STEP_WAIT.as_secs()
+                wait.as_secs()
             ),
             timed_out: true,
         });
@@ -341,9 +387,72 @@ impl Record {
         }
     }
 
-    /// The trial's key for the secrets (`gclone keystore use enclave`): `(blob, public)`.
+    /// The trial's key for the secrets (`super::pick_key`): `(blob, public)`.
     pub(crate) fn key_for_secrets(&self) -> Option<(Zeroizing<Vec<u8>>, Vec<u8>)> {
         self.key_parts().map(|key| (key.blob, key.public))
+    }
+
+    /// The record speaks against sealing this device's secrets without being asked: a
+    /// failure is on it, or a session that could not make a key — for a trial that ended
+    /// with a move, what was recorded since. Neither clears by itself (`gclone keystore check
+    /// --new-trial` starts a new record).
+    pub(crate) fn speaks_against(&self) -> bool {
+        self.carried().1 > 0
+    }
+
+    /// What this record says about this Mac's sessions beyond the trial it holds — and what
+    /// a trial that starts now therefore begins with — as failures and their count:
+    ///
+    /// - a record that never ended with a move: every failure on it (the steps that did not
+    ///   come back before a key could be made, among them);
+    /// - a record whose trial ended with a move: the failures recorded since — what the old
+    ///   key failed at stays with the old key;
+    /// - `unavailable`, the session that could not make a key. On a record whose trial ended
+    ///   with a move it was written afterwards, by a login that could not seal
+    ///   ([`note_cannot_seal`]): the device had been broken by a session the trial never saw
+    ///   and was repaired with a login to the plain file. Forgetting that started a clean
+    ///   trial, which passed in the sessions that work and broke the same session again.
+    fn carried(&self) -> (Vec<Failure>, u64) {
+        let (mut failures, mut count) = match self.moved_ms {
+            Some(moved) => {
+                let since: Vec<Failure> = self
+                    .failures
+                    .iter()
+                    .filter(|f| f.ms >= moved)
+                    .cloned()
+                    .collect();
+                let count = since.len() as u64;
+                (since, count)
+            }
+            None => (self.failures.clone(), self.failure_count),
+        };
+        if let Some(u) = &self.unavailable {
+            count = count.saturating_add(1);
+            failures.push(Failure {
+                ms: u.ms,
+                boot: u.boot.clone(),
+                session: u.session.clone(),
+                fresh_key_ok: false,
+                error: format!("no key could be made: {}", u.error),
+                timed_out: false,
+            });
+        }
+        (failures, count)
+    }
+
+    /// Nothing but the version and the notes: no trial was ever recorded, or the record was
+    /// forgotten.
+    pub(crate) fn is_blank(&self) -> bool {
+        *self == Record::blank(self)
+    }
+
+    /// An empty record that keeps the version and the notes of `old`.
+    fn blank(old: &Record) -> Record {
+        Record {
+            version: VERSION,
+            notes: old.notes.clone(),
+            ..Record::default()
+        }
     }
 
     /// A new key and test value in place of whatever the record held; the notes stay.
@@ -354,30 +463,15 @@ impl Record {
         Ok(())
     }
 
-    /// The record of a trial that starts now with `key`. The notes stay. What a record that
-    /// never held a key says about this device stays too, as failures of the new trial: the
-    /// session that could not make a key (`unavailable`) and the steps that did not come
-    /// back. A trial that began with "no key can be made in session 0x2" is not complete
-    /// before somebody looked at that (`gclone keystore check --new-trial` clears it).
+    /// The record of a trial that starts now with `key`. The notes stay. What the old record
+    /// says about this Mac's sessions stays too, as failures of the new trial
+    /// ([`Record::carried`]): the session that could not make a key (`unavailable`), the
+    /// steps that did not come back, and whatever was recorded after a move had ended the
+    /// trial before. A trial that began with "no key can be made in session 0x2" is not
+    /// complete before somebody looked at that (`gclone keystore check --new-trial` clears
+    /// it).
     fn begin(&mut self, key: NewKey, at: &Moment) {
-        let never_had_a_key = self.public.is_none();
-        let mut failures = Vec::new();
-        let mut failure_count = 0;
-        if never_had_a_key {
-            failures.clone_from(&self.failures);
-            failure_count = self.failure_count;
-            if let Some(u) = &self.unavailable {
-                failure_count += 1;
-                failures.push(Failure {
-                    ms: u.ms,
-                    boot: u.boot.clone(),
-                    session: u.session.clone(),
-                    fresh_key_ok: false,
-                    error: format!("no key could be made: {}", u.error),
-                    timed_out: false,
-                });
-            }
-        }
+        let (failures, failure_count) = self.carried();
         *self = Record {
             version: VERSION,
             public: Some(util::b64url(&key.public)),
@@ -396,7 +490,7 @@ impl Record {
         self.note_ok(at);
     }
 
-    /// The record after `gclone keystore use enclave`: the trial is over, its evidence stays
+    /// The record after a move into the sealed store: the trial is over, its evidence stays
     /// (with `public`, which says whose evidence it is), its key goes.
     pub(crate) fn moved(mut self, at_ms: u64) -> Record {
         self.key = None;
@@ -556,15 +650,6 @@ pub(crate) fn disabled_by_env() -> bool {
     std::env::var("GCLONE_KEYSTORE_TRIAL").is_ok_and(|v| v.trim() == "0")
 }
 
-fn ready_note(days: usize) -> String {
-    format!(
-        "note: this Mac's Secure Enclave has opened gclone's test value on {days} days, across a \
-         restart, in every session gclone ran in. `gclone keystore use enclave` moves this \
-         device's key and login out of the plain file; it checks your passphrase first. `gclone \
-         keystore use file` keeps the plain file and silences this note."
-    )
-}
-
 /// What one step found, about the key whose public half is `about` (`None`: there was none).
 enum Outcome {
     Started(NewKey),
@@ -618,7 +703,7 @@ pub(crate) fn step(paths: &Paths, sealer: &dyn Sealer) {
     };
     update(paths, |record| {
         let same_key = record.key_parts().map(|_| record.public.clone()) == about;
-        let mut changed = match outcome {
+        match outcome {
             // Another process started a trial in the meantime: its key stays, this one is
             // dropped (and with it the handle of an enclave key nothing refers to).
             Outcome::Started(_) | Outcome::Unavailable(_) if !same_key => false,
@@ -645,14 +730,7 @@ pub(crate) fn step(paths: &Paths, sealer: &dyn Sealer) {
                 record.note_failure(&at, fresh_key_ok, &error);
                 true
             }
-        };
-        let summary = record.summary();
-        if summary.complete && record.notes.ready_ms.is_none() && super::can_show_notes() {
-            eprintln!("{}", ready_note(summary.days));
-            record.notes.ready_ms = Some(at.ms);
-            changed = true;
         }
-        changed
     });
 }
 
@@ -661,31 +739,74 @@ pub(crate) fn step(paths: &Paths, sealer: &dyn Sealer) {
 /// runs in — a scheduler's, an ssh login's, before the first unlock — and a call that does
 /// not return must not hold up a device that never asked for the sealed store. When the wait
 /// runs out the command goes on, the record gets a failure ("did not return"), and this boot
-/// and session are left alone for a day; the thread ends with the process.
-pub(crate) fn step_bounded(paths: &Paths, sealer: Arc<dyn Sealer>) {
-    step_within(paths, sealer, STEP_WAIT);
+/// and session are left alone for a day; the thread ends with the process. `true`: the step
+/// came back in time.
+pub(crate) fn step_bounded(paths: &Paths, sealer: Arc<dyn Sealer>) -> bool {
+    step_within(paths, sealer, STEP_WAIT)
 }
 
-fn step_within(paths: &Paths, sealer: Arc<dyn Sealer>, wait: Duration) {
-    let at = Moment::now();
-    let (done, finished) = std::sync::mpsc::channel::<()>();
+fn step_within(paths: &Paths, sealer: Arc<dyn Sealer>, wait: Duration) -> bool {
     let for_thread = paths.clone();
+    within(paths, wait, move || step(&for_thread, sealer.as_ref())).is_some()
+}
+
+/// Runs `work` — which calls into the Secure Enclave — on a thread of its own and waits for
+/// it for at most `wait`. `None`: it did not come back in time (or no thread could be
+/// started); the command goes on, a timeout is written into the record as a failure of this
+/// boot and session, and the thread ends with the process.
+pub(crate) fn within<T: Send + 'static>(
+    paths: &Paths,
+    wait: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let at = Moment::now();
+    let (done, finished) = std::sync::mpsc::channel::<T>();
     let spawned = std::thread::Builder::new()
         .name("keystore-trial".into())
         .spawn(move || {
-            step(&for_thread, sealer.as_ref());
-            let _ = done.send(());
+            let _ = done.send(work());
         });
     if spawned.is_err() {
-        return;
+        return None;
     }
-    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(wait) {
-        tracing::debug!("Secure Enclave trial: the step did not return in time; going on");
-        update(paths, |record| {
-            record.note_timeout(&at);
-            true
-        });
+    match finished.recv_timeout(wait) {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::debug!("Secure Enclave: a call did not return in time; going on");
+            // (`GCLONE_KEYSTORE_TRIAL=0`: no trial file is written by this process.)
+            if !disabled_by_env() {
+                update(paths, |record| {
+                    record.note_timeout(&at, wait);
+                    true
+                });
+            }
+            None
+        }
+        // The thread ended without an answer (it panicked): nothing is known.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
     }
+}
+
+/// A login could not put its secrets into the sealed store and went to the plain file
+/// (`super::LayeredStore::save_with`, §17.30): the reason, for `gclone status` and `gclone
+/// keystore`. A record without a key gets it as "no key could be made in this session"; one
+/// with a key as a failure of that key.
+pub(crate) fn note_cannot_seal(paths: &Paths, error: &SealError) {
+    let at = Moment::now();
+    update(paths, |record| {
+        if record.key_parts().is_some() {
+            record.note_failure(&at, false, error);
+        } else {
+            record.unavailable = Some(Unavailable {
+                ms: at.ms,
+                boot: at.boot.clone(),
+                os: at.os.clone(),
+                session: at.session.clone(),
+                error: error.0.clone(),
+            });
+        }
+        true
+    });
 }
 
 /// `gclone keystore check --new-trial`: forget the record (the notes stay) and start a new
@@ -695,11 +816,7 @@ pub(crate) fn restart(paths: &Paths, sealer: &dyn Sealer) -> Result<(), SealErro
     let made = NewKey::make(sealer);
     let mut started = Ok(());
     let written = update(paths, |record| {
-        let mut fresh = Record {
-            version: VERSION,
-            notes: record.notes.clone(),
-            ..Record::default()
-        };
+        let mut fresh = Record::blank(record);
         match made {
             Ok(key) => fresh.begin(key, &at),
             Err(e) => {
@@ -722,12 +839,70 @@ pub(crate) fn restart(paths: &Paths, sealer: &dyn Sealer) -> Result<(), SealErro
     started
 }
 
-/// `gclone keystore use enclave` moved the secrets: the trial is over.
-pub(crate) fn end_at_move(paths: &Paths, at_ms: u64) {
-    update(paths, |record| {
-        *record = std::mem::take(record).moved(at_ms);
-        true
-    });
+/// The secrets were just sealed to the key whose public half is `public` (base64url) — by a
+/// move or by a login that began a sealed store. What that means for the record, if there is
+/// one (a device that never had a trial gets no record from this):
+///
+/// - **a trial is running**: it is over. The record stays as the evidence, with the public
+///   half of the trial's key — whether that is the key the secrets were sealed to is read off
+///   the two files by whoever reports, never claimed here;
+/// - **the trial ended at an earlier sealing**, and this key is another one (a login after a
+///   `logout`; a login on a Mac whose sealed key had died; `keystore use enclave` after
+///   `keystore use file`): the record is evidence for a key that holds nothing any more, and
+///   it is forgotten ([`forget`]). Left in place it made `gclone status` warn for good that
+///   "the secrets are sealed to a key that was made at the move, not to the trial's" — about
+///   a key that never was this trial's business (§17.30).
+pub(crate) fn note_sealed(paths: &Paths, public: &str) {
+    if std::fs::symlink_metadata(paths.trial_file()).is_err() {
+        return;
+    }
+    let at_ms = clock_ms();
+    let Some(_lock) = lock_record(paths) else {
+        tracing::debug!("Secure Enclave trial: the record is busy; it is not ended now");
+        return;
+    };
+    let record = load_or_new(paths);
+    if record.key.is_some() {
+        if let Err(e) = save(paths, &record.moved(at_ms)) {
+            tracing::debug!("Secure Enclave trial: cannot write the record: {e}");
+        }
+    } else if !record.is_blank() && record.public.as_deref() != Some(public) {
+        forget_locked(paths, &record);
+    }
+}
+
+/// Forgets the record without starting a key: `gclone keystore check --new-trial` on a device
+/// whose secrets are sealed, where there is nothing to try. `false`: it could not be done.
+pub(crate) fn forget(paths: &Paths) -> bool {
+    if std::fs::symlink_metadata(paths.trial_file()).is_err() {
+        return true;
+    }
+    let Some(_lock) = lock_record(paths) else {
+        return false;
+    };
+    forget_locked(paths, &load_or_new(paths))
+}
+
+/// The record goes: its file is removed — or, where it holds a note that gclone 0.5.0 wrote
+/// down as shown, rewritten with the version and the notes alone. (Removed rather than left
+/// empty: gclone 0.5.0 on the same Mac reads an empty record as "a trial of 0 days".) The
+/// caller holds the record's lock.
+fn forget_locked(paths: &Paths, record: &Record) -> bool {
+    let done = if record.notes == Notes::default() {
+        match std::fs::remove_file(paths.trial_file()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        save(paths, &Record::blank(record))
+    };
+    match done {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("Secure Enclave trial: cannot forget the record: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1043,7 +1218,8 @@ mod tests {
         // plain file: the failures of the old key are not the new one's.
         let mut moved = started(&sealer, &at(1, "boot-a", "0x2030"));
         moved.note_failure(&at(2, "boot-a", "0x2"), true, &SealError("e".into()));
-        let mut moved = moved.moved(9);
+        let mut moved = moved.moved(at(2, "boot-a", "0x2").ms + 1);
+        assert!(!moved.speaks_against());
         moved.start(&sealer, &at(3, "boot-a", "0x2030")).unwrap();
         assert_eq!(moved.summary().failures, 0);
     }
@@ -1154,12 +1330,213 @@ mod tests {
         assert!(update(&p, |_| false));
         assert_eq!(std::fs::read(p.trial_file()).unwrap(), bytes);
 
-        // The end of a trial at the move keeps the evidence and whose it is.
-        end_at_move(&p, 99);
+        // The end of a trial at a sealing keeps the evidence and whose it is — whatever key
+        // the secrets were sealed to.
+        note_sealed(&p, "the public half of some key");
         let moved = load_or_new(&p);
-        assert_eq!(moved.moved_ms, Some(99));
+        assert!(moved.moved_ms.is_some());
         assert_eq!(moved.public, fresh.public);
         assert!(moved.key.is_none() && moved.summary().moved);
+        assert!(!moved.is_blank());
+    }
+
+    /// The record of a trial that ended at one sealing says nothing about the key of a later
+    /// one (a login after a logout, a login after the sealed key died, `use enclave` after
+    /// `use file`): it is forgotten, the notes stay. It used to stay, and `gclone status`
+    /// warned for good that the secrets were sealed "to a key that was made at the move, not
+    /// to the trial's".
+    #[test]
+    fn a_later_sealing_forgets_the_record_of_a_trial_that_ended_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let sealer = FakeSealer::new("mac", None);
+        // No record: none is made.
+        note_sealed(&p, "k1");
+        assert!(matches!(load(&p), Stored::Absent));
+        assert!(forget(&p));
+        assert!(matches!(load(&p), Stored::Absent));
+
+        step(&p, &sealer);
+        update(&p, |record| {
+            record.notes.ready_ms = Some(5);
+            true
+        });
+        let trial_key = load_or_new(&p).public.clone().unwrap();
+        // The trial's own key took the secrets: the record ends and stays …
+        note_sealed(&p, &trial_key);
+        let ended = load_or_new(&p);
+        assert!(ended.summary().moved && ended.public.as_deref() == Some(trial_key.as_str()));
+        // … also when the same key is sealed to again,
+        let bytes = std::fs::read(p.trial_file()).unwrap();
+        note_sealed(&p, &trial_key);
+        assert_eq!(std::fs::read(p.trial_file()).unwrap(), bytes);
+        // and goes when another key takes them.
+        note_sealed(&p, "another key");
+        let after = load_or_new(&p);
+        assert!(after.is_blank(), "{after:?}");
+        assert_eq!(after.notes.ready_ms, Some(5));
+        assert!(after.public.is_none() && after.moved_ms.is_none());
+        // A blank record is left alone, and a new trial starts from it as from nothing.
+        let bytes = std::fs::read(p.trial_file()).unwrap();
+        note_sealed(&p, "a third key");
+        assert_eq!(std::fs::read(p.trial_file()).unwrap(), bytes);
+        step(&p, &sealer);
+        let r = load_or_new(&p);
+        assert!(r.summary().running);
+        assert_eq!((r.failure_count, r.notes.ready_ms), (0, Some(5)));
+
+        // `forget`: whatever is there goes, the notes stay.
+        assert!(forget(&p));
+        let r = load_or_new(&p);
+        assert!(r.is_blank() && r.notes.ready_ms == Some(5));
+
+        // A record without notes leaves no file at all (gclone 0.5.0 shows an empty record
+        // as a trial of zero days).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        step(&p, &sealer);
+        let trial_key = load_or_new(&p).public.clone().unwrap();
+        note_sealed(&p, &trial_key);
+        assert!(p.trial_file().exists());
+        note_sealed(&p, "another key");
+        assert!(!p.trial_file().exists());
+        step(&p, &sealer);
+        assert!(forget(&p));
+        assert!(!p.trial_file().exists());
+        std::fs::write(p.trial_file(), b"not a record").unwrap();
+        assert!(forget(&p));
+        assert!(!p.trial_file().exists());
+    }
+
+    /// Three calendar days are not three days: 23:59, the next day, and 00:01 of the day
+    /// after are 24 hours and two minutes. The trial is complete when its newest success is
+    /// 48 hours after its first.
+    #[test]
+    fn complete_needs_the_days_to_be_48_hours_apart() {
+        let sealer = FakeSealer::new("mac", None);
+        let minute = 60_000;
+        let moment = |ms: u64, boot: &str| Moment {
+            ms,
+            boot: boot.into(),
+            session: "0x2030".into(),
+            os: "27.2".into(),
+        };
+        let day0_late = 100 * DAY_MS + DAY_MS - minute;
+        let mut r = started(&sealer, &moment(day0_late, "boot-a"));
+        assert_eq!(r.last_ok_ms, Some(day0_late));
+        assert!(r.note_ok(&moment(101 * DAY_MS + 3_600_000, "boot-b")));
+        let day2_early = 102 * DAY_MS + minute;
+        assert!(r.note_ok(&moment(day2_early, "boot-b")));
+        let s = r.summary();
+        assert_eq!(s.days, 3);
+        assert!(s.restart && s.failures == 0);
+        assert!(!s.aged && !s.complete, "24 hours and two minutes");
+        // Later on the third day, still short of 48 hours: nothing new, nothing written.
+        assert!(!r.note_ok(&moment(day2_early + 3_600_000, "boot-b")));
+        assert!(!r.summary().complete);
+        // The first success that is 48 hours after the first one is written down — once —
+        // although this day, boot and session were seen before: it completes the trial.
+        let aged = day0_late + MIN_AGE_MS;
+        assert!(r.note_ok(&moment(aged, "boot-b")));
+        assert_eq!(r.last_ok_ms, Some(aged));
+        let s = r.summary();
+        assert!(s.aged && s.complete);
+        assert!(!r.note_ok(&moment(aged + 1_000, "boot-b")), "written once");
+
+        // A record that gclone 0.5.0 wrote has no `last_ok_ms`: the first success of this
+        // version writes it, and a trial that was complete by 0.5.0's count and is old
+        // enough is complete at once.
+        let mut old = started(&sealer, &moment(100 * DAY_MS, "boot-a"));
+        old.note_ok(&moment(101 * DAY_MS, "boot-b"));
+        old.note_ok(&moment(102 * DAY_MS, "boot-b"));
+        old.last_ok_ms = None;
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("last_ok_ms"));
+        let mut old: Record = serde_json::from_str(&json).unwrap();
+        assert!(!old.summary().complete, "its age is not known yet");
+        assert!(old.note_ok(&moment(102 * DAY_MS + minute, "boot-b")));
+        assert!(old.summary().complete);
+    }
+
+    /// What was recorded after a trial had ended with a move is about this Mac's sessions,
+    /// and the next trial starts with it: a login that could not seal (the device had been
+    /// broken by a session the trial never saw, and was repaired with a login to the plain
+    /// file), a call that did not come back. It used to be dropped — the record still held
+    /// the old key's public half — and the new trial passed in the sessions that work and
+    /// broke the same session a second time.
+    #[test]
+    fn a_new_trial_keeps_what_was_recorded_after_the_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let sealer = FakeSealer::new("mac", None);
+        step(&p, &sealer);
+        // The old key failed once before its move (the owner moved all the same).
+        update(&p, |record| {
+            let mut before = Moment::now();
+            before.ms -= 10_000;
+            record.note_failure(&before, true, &SealError("before the move".into()));
+            true
+        });
+        let trial_key = load_or_new(&p).public.clone().unwrap();
+        note_sealed(&p, &trial_key);
+        let ended = load_or_new(&p);
+        assert!(
+            !ended.speaks_against(),
+            "what the old key failed at is its own"
+        );
+
+        // A login in a session that cannot use the enclave falls back to the plain file.
+        note_cannot_seal(
+            &p,
+            &SealError("this session cannot use the key store".into()),
+        );
+        let noted = load_or_new(&p);
+        assert!(noted.key.is_none() && noted.public.is_some() && noted.moved_ms.is_some());
+        assert!(noted.unavailable.is_some());
+        assert!(noted.speaks_against());
+
+        // The next step, in a session that works, starts a new trial — with that failure.
+        let mut elsewhere = Moment::now();
+        elsewhere.session = "0x777".into();
+        let mut record = noted.clone();
+        record.start(&sealer, &elsewhere).unwrap();
+        let s = record.summary();
+        assert!(s.running && s.unavailable.is_none());
+        assert_eq!(s.failures, 1, "{:?}", s.last_failures);
+        assert!(s.last_failures[0].error.contains("no key could be made"));
+        assert!(!s.last_failures[0].error.contains("before the move"));
+        assert!(record.speaks_against());
+        for day in 1..5 {
+            let mut later = at(elsewhere.ms / DAY_MS + day, "boot-z", "0x777");
+            later.ms = elsewhere.ms + day * DAY_MS;
+            record.note_ok(&later);
+        }
+        assert!(
+            !record.summary().complete,
+            "not before somebody looked at it"
+        );
+
+        // Through `step`, as a command does it (the session of this test process differs
+        // from the one that failed, so it is asked at once).
+        update(&p, |record| {
+            if let Some(u) = &mut record.unavailable {
+                u.session = "0x2".into();
+            }
+            true
+        });
+        step(&p, &sealer);
+        let r = load_or_new(&p);
+        assert!(r.summary().running);
+        assert_eq!(r.failure_count, 1);
+        assert_eq!(r.failures[0].session, "0x2");
+
+        // A step that did not come back after the move counts on as well.
+        let mut moved = started(&sealer, &at(1, "boot-a", "0x2030")).moved(2 * DAY_MS);
+        moved.note_timeout(&at(3, "boot-b", "0x2"), STEP_WAIT);
+        assert!(moved.speaks_against());
+        moved.start(&sealer, &at(4, "boot-b", "0x2030")).unwrap();
+        assert_eq!(moved.failure_count, 1);
+        assert!(moved.failures[0].timed_out);
     }
 
     #[test]

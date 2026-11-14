@@ -30,7 +30,8 @@ For the wire-level details (routes, parameters, error codes) see [`SPEC.md`](SPE
 |---|---|---|
 | **Auth Worker** (Worker secrets) | the device client's ID and secret; the allowed Google account(s); for the hosted viewer: the "Web application" client's ID and secret, and `SEAL_KEY`, the key that seals browser sessions | refresh tokens, device codes, file data, the passphrase, the vault key |
 | **Auth Worker** (static files, part of the deployment) | the hosted viewer's page, scripts and WebAssembly — the same bytes for everyone | anything of a user |
-| **Each device** (owner-only files) | its own refresh token, a cached access token (about 1 hour), the unlocked vault key — in the plain file `secrets.json`, or, on a Mac after `gclone keystore use enclave`, in `secrets.sealed`, encrypted to a key that only that Mac's Secure Enclave can use | the Google client secret |
+| **Each device** (owner-only files) | its own refresh token, a cached access token (about 1 hour), the unlocked vault key. The refresh token and the key are one document: on Linux the plain file `secrets.json`; **on a Mac `secrets.sealed`**, encrypted to a key that only that Mac's Secure Enclave can use — from the login on (a Mac that was not connected), or, on a Mac that was on the plain file, once gclone has tested the Secure Enclave there (three days at least 48 hours apart, a restart, no failure); `gclone keystore use file` — or `GCLONE_KEYSTORE_TRIAL=0` in a run that uses the plain file — keeps the plain file instead | the Google client secret |
+| **A Mac's Secure Enclave** | the private key that `secrets.sealed` is encrypted to; it never leaves the chip, and gclone holds only an opaque handle to it, in the same file | the vault key or the token themselves; anything that could be copied to another machine |
 | **A browser signed in to the hosted viewer** | a cookie with that browser's refresh token **sealed under `SEAL_KEY`** (scripts cannot read it; the browser cannot open it); in the tab's memory, while it is open: an access token, and after the passphrase the vault's keys | the refresh token in the clear, the client secret; on disk: no key, nothing derived from the passphrase, no file name |
 | **Google** (during a login) | the pending login: device code, user code, whether the code was entered | — |
 | **Google Drive** (the vault folder) | encrypted blobs, the encrypted index, the vault key wrapped by the passphrase | the passphrase, any plaintext |
@@ -270,21 +271,53 @@ The threat model with all rows: [`SPEC.md`](SPEC.md) §1.3; the viewer itself: �
 
 ### Where the refresh token lives on a device
 
-The refresh token and the unlocked vault key are one small document. By default it is the file
-`secrets.json` in gclone's state folder (`~/.local/state/gclone`), readable by its owner only and
-refused by gclone when anyone else can read it. A copy of that file is the login and the vault
-key — so gclone keeps the folder out of Time Machine backups and marks it for other backup tools
-(README, "Local files").
+The refresh token and the unlocked vault key are one small document in gclone's state folder
+(`~/.local/state/gclone`), readable by its owner only and refused by gclone when anyone else
+can read it.
 
-On a Mac with a Secure Enclave, `gclone keystore use enclave` moves the document into
-`secrets.sealed`: the same content, encrypted to a key that never leaves that Mac's Secure
-Enclave. A copy of `secrets.sealed` — from a backup, a synced folder, a disk image — opens
-nowhere else. It is not a wall between programs: anything that runs as you on that Mac can ask
-the Secure Enclave the way gclone does. The command first checks that your passphrase opens the
-vault, because after it the passphrase is the only way back for that device if the Mac is erased
-or repaired. `gclone keystore use file` moves everything back. The cached access token
-(`token.json`, good for about an hour) stays a plain file in both cases. Nothing about this
-reaches the Worker or Google: it is only where the device keeps what it already had.
+**On Linux** it is the plain file `secrets.json`. A copy of that file is the login and the
+vault key — so gclone marks the folder for backup tools (README, "Local files"), and the file
+is never to be copied anywhere.
+
+**On a Mac with a Secure Enclave** it is `secrets.sealed`: the same content, encrypted to a
+key that never leaves that Mac's Secure Enclave. Nobody has to ask for that (since 0.5.1): a
+`gclone login` on a Mac that is not connected writes the sealed file from the start, and a
+Mac that was connected earlier keeps its plain file only until gclone's own test of the
+Secure Enclave has passed there — it opened a test value on three different days at least 48
+hours apart, after a restart, without a failure in any session gclone ran in — and is then
+moved by the next run. A login does not cut that test short: signing in again on a Mac that
+works from the plain file, with or without a `gclone logout` first, leaves the secrets where
+they are until the test has passed. `gclone keystore use file` says no and is remembered;
+`GCLONE_KEYSTORE_TRIAL=0` in the environment of any run that uses the plain file says no for
+the whole Mac (the run leaves a marker, and `gclone status` names it) until
+`gclone keystore use enclave` or `gclone keystore check --new-trial`; a Mac whose Secure
+Enclave cannot be used stays on the plain file, and `gclone status` says why.
+
+What the seal is worth, exactly:
+
+- **It stops a copy from being usable anywhere else.** A `secrets.sealed` from a backup, a
+  synced folder, a disk image or the Mac's disk in another machine opens nowhere: neither the
+  refresh token nor the vault key can be taken out of it without that Mac's Secure Enclave.
+- **It does not stop a program that runs as you on that Mac.** There is no Touch ID or
+  password check on the key — by choice, because gclone runs unattended — so anything running
+  as you can ask the Secure Enclave the way gclone does, or simply run gclone. Malware on the
+  unlocked Mac is the same threat as before.
+- **It makes the passphrase the recovery path for the device.** The sealed file is useless on
+  every other machine, the owner's next Mac included: after an erase, a repair with a new
+  logic board, a migration or a restore from a backup, gclone says that this Mac's Secure
+  Enclave cannot open the sealed key, and `gclone login` — the Google sign-in above, then the
+  passphrase — connects the device again, as if it were new. The move gclone makes by itself
+  does not ask for the passphrase and so does not check that it is still known;
+  `gclone keystore use enclave`, the same move as a command, does — always, also on a Mac
+  whose test has just passed.
+- **It never leaves a command waiting for the chip.** Every call into the Secure Enclave is
+  given ten seconds; a session in which it does not answer gets "The Secure Enclave cannot
+  be used in this session", exit 4, and is told not to sign in again — the key is intact, and
+  `gclone keystore use file` from a session where it works brings the plain file back.
+
+The cached access token (`token.json`, good for about an hour) stays a plain file in both
+cases. Nothing about this reaches the Worker or Google: it is only where the device keeps what
+it already had.
 
 ## Everyday use (every sync)
 

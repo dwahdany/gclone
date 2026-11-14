@@ -599,7 +599,8 @@ mod tests {
         for _ in 0..3 {
             let document = std::fs::read(paths.secrets_file()).unwrap();
             let (blob, public) = sealer.create().unwrap();
-            keystore::move_to_enclave(&store, &document, &blob, &public).unwrap();
+            keystore::move_to_enclave(&store, &document, &blob, &public, keystore::MoveBy::Command)
+                .unwrap();
             assert!(!paths.secrets_file().exists() && paths.sealed_file().exists());
             assert_eq!(guard.check(), Ok(()), "moved into the sealed store");
             assert_eq!(guard.check(), Ok(()));
@@ -611,7 +612,8 @@ mod tests {
         // Sealed, and the file cannot be read right now: look again, do not stop.
         let document = std::fs::read(paths.secrets_file()).unwrap();
         let (blob, public) = sealer.create().unwrap();
-        keystore::move_to_enclave(&store, &document, &blob, &public).unwrap();
+        keystore::move_to_enclave(&store, &document, &blob, &public, keystore::MoveBy::Command)
+            .unwrap();
         assert_eq!(guard.check(), Ok(()));
         let good = std::fs::read(paths.sealed_file()).unwrap();
         std::fs::write(paths.sealed_file(), b"{ damaged").unwrap();

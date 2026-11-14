@@ -99,6 +99,21 @@ impl Paths {
         self.state_root.join("backup-note.due")
     }
 
+    /// `<state root>/keystore-note.due` — an empty marker: the secrets were moved into the
+    /// sealed store by themselves in a run without a terminal, and the note about it is still
+    /// owed (§8.2, §17.30).
+    pub fn move_note_file(&self) -> PathBuf {
+        self.state_root.join("keystore-note.due")
+    }
+
+    /// `<state root>/keystore-trial.off` — an empty marker: a run with `GCLONE_KEYSTORE_TRIAL=0`
+    /// used this device's plain `secrets.json`, so nothing is tested, sealed or moved here by
+    /// itself until `gclone keystore use enclave` or `gclone keystore check --new-trial`
+    /// (§8.2, §17.30).
+    pub fn trial_off_file(&self) -> PathBuf {
+        self.state_root.join("keystore-trial.off")
+    }
+
     /// `<state root>/secrets.lock` — the kernel lock of whoever writes or moves secrets (§8.3).
     pub fn secrets_lock(&self) -> PathBuf {
         self.state_root.join("secrets.lock")
