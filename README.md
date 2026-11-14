@@ -229,11 +229,6 @@ works too. To have your URL built in, build from source with `GCLONE_DEFAULT_AUT
 
 ## Limitations
 
-- **Young software with one user so far.** The maintainer runs it daily against Google Drive
-  on a Mac and a Linux machine, and the automated tests run against a fake Drive and a fake
-  Worker. The viewer for any browser has not been run on a phone yet. Work through the
-  [day-0 checklist](docs/SETUP.md#day-0-checklist-before-the-first-real-use) before you
-  trust it with data, and keep an independent backup.
 - macOS and Linux only. No mount, no shared drives, no sharing between users. The viewers
   are read-only.
 - `copy` and `sync` work on directories, in one direction per run; there is no two-way sync.
