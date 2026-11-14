@@ -441,7 +441,7 @@ start_server() {
     tries=0
     while [ ! -s "$work/ports" ]; do
         tries=$((tries + 1))
-        [ "$tries" -lt 100 ] || {
+        [ "$tries" -lt 600 ] || {
             echo "the fake GitHub did not start" >&2
             exit 1
         }

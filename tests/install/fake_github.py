@@ -141,8 +141,18 @@ class Storage(Handler):
     role = "storage"
 
 
-main = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-storage = ThreadingHTTPServer(("127.0.0.1", 0), Storage)
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind also looks up the host's name (socket.getfqdn), which takes many
+        # seconds on some machines (hosted macOS runners); nothing here uses the name.
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
+
+main = Server(("127.0.0.1", 0), Handler)
+storage = Server(("127.0.0.1", 0), Storage)
 ports["main"] = main.server_address[1]
 ports["storage"] = storage.server_address[1]
 threading.Thread(target=storage.serve_forever, daemon=True).start()
