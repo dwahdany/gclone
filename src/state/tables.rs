@@ -196,7 +196,7 @@ pub(crate) fn removed_insert(
 }
 
 /// `(version, removed_ms, by)` of the `removed` row with this exact key.
-fn removed_get(
+pub(crate) fn removed_get(
     c: &Connection,
     path: &str,
     stamp: &Stamp,

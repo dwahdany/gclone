@@ -1,21 +1,26 @@
 // Screenshots of the hosted viewer, for looking at: sign-in, unlock, the list, previews and
 // the other screens, in a desktop and a phone-sized window, light and dark.
 //
-//   node worker/test/e2e/shots.mjs <output directory> [chrome|webkit|firefox]
+//   node worker/test/e2e/shots.mjs <output directory> [chrome|webkit|firefox] [time|screens]
 //
-// The same fixture, fake Drive and fake Worker routes as the browser suite (run.mjs).
+// The third argument limits the run: `time` shoots only the time machine, `screens` all but it.
+//
+// The same fixture, fake Drive and fake Worker routes as the browser suite (run.mjs). The
+// time machine's states (7-…) are shot over a second vault, which has history.
 import fs from 'node:fs';
 import path from 'node:path';
-import { ENGINES, loadPlaywright, startStack } from './harness.mjs';
-import { BIDI_NAME, PASS, foreignKeyfile } from './vault.mjs';
+import { ENGINES, britishChrome, loadPlaywright, startStack } from './harness.mjs';
+import { BIDI_NAME, PASS, addHistory, foreignKeyfile } from './vault.mjs';
 
 const out = path.resolve(process.argv[2] || 'shots');
 const engine = process.argv[3] || 'chrome';
+const only = process.argv[4] || '';
 fs.mkdirSync(out, { recursive: true });
 
 const stack = await startStack({});
 const playwright = await loadPlaywright();
-const browser = await ENGINES[engine](playwright);
+// (Chrome's own date field follows the browser's language, not the page's locale.)
+const browser = engine === 'chrome' ? await britishChrome(playwright) : await ENGINES[engine](playwright);
 const SIZES = { desktop: { width: 1280, height: 800 }, phone: { width: 390, height: 844 } };
 
 async function listed(page, dir) {
@@ -27,7 +32,7 @@ async function listed(page, dir) {
 }
 
 async function clickRow(page, name) {
-  const row = await page.evaluateHandle((wanted) => [...document.querySelectorAll('#rows .row')].find((r) => r.querySelector('.name').title === wanted), name);
+  const row = await page.evaluateHandle((wanted) => [...document.querySelectorAll('#rows .row:not(.sep)')].find((r) => r.querySelector('.name').title === wanted), name);
   await row.asElement().click();
 }
 
@@ -42,7 +47,7 @@ const showScreen = (page, name) => page.evaluate((wanted) => {
 const foreign = foreignKeyfile(stack.work);
 
 try {
-  for (const [size, viewport] of Object.entries(SIZES)) {
+  for (const [size, viewport] of only === 'time' ? [] : Object.entries(SIZES)) {
     for (const scheme of ['light', 'dark']) {
       const context = await browser.newContext({ viewport, colorScheme: scheme, deviceScaleFactor: 2, isMobile: size === 'phone' && engine !== 'firefox', hasTouch: size === 'phone' });
       const page = await context.newPage();
@@ -222,6 +227,130 @@ try {
         stack.drive.planted.length = 0;
       }
     }
+  }
+
+  // ---- the time machine: versions, deleted files, the vault at an earlier moment -------------
+  const storied = await startStack({ many: 12 });
+  try {
+    addHistory(storied.vault);
+    const idle = async (page) => {
+      await page.waitForFunction(() => !document.body.classList.contains('busy') && /\S/.test(document.getElementById('count').textContent));
+      await page.waitForTimeout(350);
+    };
+    for (const [size, viewport] of only === 'screens' ? [] : Object.entries(SIZES)) {
+      for (const scheme of ['light', 'dark']) {
+        const context = await browser.newContext({ viewport, colorScheme: scheme, deviceScaleFactor: 2, isMobile: size === 'phone' && engine !== 'firefox', hasTouch: size === 'phone', locale: 'en-GB' });
+        await context.addCookies([{ ...storied.server.signIn(), url: storied.origin, httpOnly: true, sameSite: 'Strict' }]);
+        const page = await context.newPage();
+        const shot = (name) => page.screenshot({ path: path.join(out, `${name}-${size}-${scheme}.png`) });
+        await page.goto(`${storied.origin}/`);
+        await page.waitForSelector('#shell[data-screen="unlock"]:not([hidden])');
+        await page.fill('#unlock-pass', PASS);
+        await page.click('#unlock-go');
+        await page.waitForSelector('#rows .row');
+        await idle(page);
+
+        // The bar at now, then the past.
+        await page.click('#time-btn');
+        await page.waitForFunction(() => !document.getElementById('time-prev').disabled);
+        await page.waitForTimeout(200);
+        await shot('7-time-now');
+        // Five changes back: before the notes got their third version, a file and a folder
+        // were deleted and a file was moved.
+        for (let i = 0; i < 5; i += 1) {
+          await page.click('#time-prev');
+          await idle(page);
+          // One change back: the folder that `mkdir` made has no time of its own, and says so.
+          if (i === 0) await shot('7-time-approx');
+        }
+        await page.waitForSelector('html.past');
+        await shot('7-time-past');
+        // A low window (a phone on its side): the bar keeps short.
+        await page.setViewportSize({ width: 844, height: 390 });
+        await idle(page);
+        await shot('7-time-low');
+        await page.setViewportSize(viewport);
+        await idle(page);
+        await clickRow(page, 'docs');
+        await idle(page);
+        await shot('7-time-past-folder');
+        // A file as it was then, and its versions.
+        await clickRow(page, 'notes.txt');
+        await page.waitForSelector('#viewer-body pre');
+        await page.click('#viewer-versions');
+        await page.waitForSelector('#versions-list button');
+        await page.waitForTimeout(200);
+        await shot('7-time-past-file');
+        await page.click('#versions-close');
+        await page.click('#viewer-close');
+        await idle(page);
+        // A search in the past.
+        await page.fill('#search', 'leaf');
+        await page.waitForFunction(() => /match/.test(document.getElementById('count').textContent));
+        await page.waitForTimeout(250);
+        await shot('7-time-past-search');
+        await page.fill('#search', '');
+        await idle(page);
+
+        // Back to now; what was deleted from a folder.
+        await page.click('#time-now');
+        await page.waitForSelector('html:not(.past)');
+        await idle(page);
+        await page.click('#time-close');
+        await page.click('#gone-btn');
+        await page.waitForSelector('#rows .row.sep');
+        await page.waitForTimeout(250);
+        await shot('7-deleted');
+        // A deleted file: its last version, the versions beside it, the command.
+        await clickRow(page, 'long.txt');
+        await page.waitForSelector('#viewer-body pre');
+        await page.waitForSelector('#versions-list button');
+        await page.waitForTimeout(250);
+        await shot('7-deleted-file');
+        await page.click('#viewer-close');
+        await idle(page);
+        // A deleted folder.
+        await page.click('#brand');
+        await idle(page);
+        await page.waitForSelector('#rows .row.sep');
+        await clickRow(page, 'deep');
+        await page.waitForSelector('#gone-note:not([hidden])');
+        await idle(page);
+        await shot('7-deleted-folder');
+        // … as it was, and a moment at which it was not there any more.
+        await page.click('#gone-then');
+        await page.waitForSelector('html.past');
+        await idle(page);
+        await shot('7-deleted-folder-then');
+        await page.click('#time-next');
+        await page.waitForSelector('#empty:not([hidden])');
+        await page.waitForTimeout(250);
+        await shot('7-time-absent');
+        await page.click('#time-now');
+        await page.waitForSelector('html:not(.past)');
+        await idle(page);
+
+        // The versions of a file, an earlier one chosen.
+        await page.click('#brand');
+        await idle(page);
+        await clickRow(page, 'docs');
+        await idle(page);
+        await clickRow(page, 'notes.txt');
+        await page.waitForSelector('#viewer-body pre');
+        if (await page.getAttribute('#viewer-versions', 'aria-expanded') !== 'true') await page.click('#viewer-versions');
+        await page.waitForSelector('#versions-list button');
+        await page.waitForTimeout(200);
+        await shot('7-versions');
+        await page.locator('#versions-list button').nth(1).click();
+        await page.waitForFunction(() => /second version/.test(document.querySelector('#viewer-body pre')?.textContent || ''));
+        await page.waitForSelector('#versions-restore:not([hidden])');
+        await page.waitForTimeout(200);
+        await shot('7-versions-earlier');
+        await context.close();
+      }
+    }
+  } finally {
+    await storied.close();
   }
   console.log(`screenshots in ${out}`);
 } finally {

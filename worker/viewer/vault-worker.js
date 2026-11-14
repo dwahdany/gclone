@@ -1,5 +1,5 @@
 // gclone viewer — the vault worker. It holds the keyring and the decrypted index for as long
-// as the vault is unlocked, reads the index from Drive, answers the page's five API calls and
+// as the vault is unlocked, reads the index from Drive, answers the page's eight API calls and
 // issues per-file tickets to the Service Worker.
 //
 // Nothing that leaves this worker after the unlock holds a key that the page — or a script in
@@ -139,7 +139,23 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
     return info();
   }
 
-  /** The five calls of the viewer's API (`src/web/rules.rs` decides every answer). */
+  /**
+   * A moment the page asks about (`at`): a number, or the digits of one — as the local
+   * viewer's query string carries it. Anything else is no time, and the core says so.
+   */
+  const time = (value) => {
+    if (value == null) return undefined;
+    if (typeof value === 'number') return value;
+    return /^[0-9]{1,16}$/.test(String(value)) ? Number(value) : NaN;
+  };
+  const text = (value) => (value == null ? undefined : String(value));
+
+  /**
+   * The eight calls of the viewer's API: `info`, `list`, `stat`, `search`, `refresh` — and,
+   * for the time machine, `versions`, `deleted`, `timeline`, and `at` (a moment) on `list`,
+   * `stat`, `search`, `v` (a version id) on `stat`. `src/web/rules.rs` and `src/web/past.rs`
+   * decide every answer. The core reads no clock: "now" is this worker's.
+   */
   async function api(name, params) {
     need(vault && index, 'The vault is locked.');
     if (name === 'refresh' && phase === 'broken') {
@@ -151,11 +167,15 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
     if (phase !== 'ready') throw new Refusal('unusable', why);
     if (name === 'refresh') return refresh();
     const p = params || {};
+    const now = Date.now();
     switch (name) {
       case 'info': return info();
-      case 'list': return JSON.parse(vault.list(p.path || '', p.sort, p.order, p.offset, p.limit));
-      case 'stat': return JSON.parse(vault.stat(String(p.path || '')));
-      case 'search': return JSON.parse(vault.search(String(p.q || ''), p.limit, p.sort, p.order));
+      case 'list': return JSON.parse(vault.list(p.path || '', p.sort, p.order, p.offset, p.limit, time(p.at), now));
+      case 'stat': return JSON.parse(vault.stat(String(p.path || ''), time(p.at), text(p.v), now));
+      case 'search': return JSON.parse(vault.search(String(p.q || ''), p.limit, p.sort, p.order, time(p.at), now));
+      case 'versions': return JSON.parse(vault.versions(String(p.path || ''), time(p.at), now));
+      case 'deleted': return JSON.parse(vault.deleted(p.path || '', p.sort, p.order, p.offset, p.limit, now));
+      case 'timeline': return JSON.parse(vault.timeline(now));
       default: throw new Refusal('bad-input', 'There is no such call.');
     }
   }
@@ -201,11 +221,13 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
   /**
    * A ticket for one file, to the Service Worker — sealed, so that it is a ticket to the
    * Service Worker only: the page that hands the port out, and anyone it hands it to, reads
-   * the id and nothing else.
+   * the id and nothing else. `v`: the id of one version of the file (the time machine), or
+   * `null` for the file as it is now; the core mints both by the same checks, and an earlier
+   * version only while `gclone restore` would still offer it.
    */
-  async function issue(id, path) {
+  async function issue(id, path, v) {
     if (!ticketPort) {
-      waitingIssues.push([id, path]);
+      waitingIssues.push([id, path, v]);
       return;
     }
     // The ticket is sealed for, and posted on, the channel that is current when it is ready —
@@ -228,7 +250,8 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
         if (replaced() || (mine !== channel && round < 16)) continue;
         need(vault && phase === 'ready', why);
         const current = token.peek();
-        const text = JSON.stringify({ ticket: vault.ticket(path), token: current ? current.token : null, exp: current ? current.exp : 0 });
+        const minted = v == null ? vault.ticket(path) : vault.ticket(path, v, Date.now());
+        const text = JSON.stringify({ ticket: minted, token: current ? current.token : null, exp: current ? current.exp : 0 });
         const sealed = await seal.close(key, id, text).catch(() => { throw new Refusal('no-service-worker', NO_SEAL); });
         if (replaced()) continue;
         message = { type: 'ticket', id, sealed: { to, from, iv: sealed.iv, data: sealed.data }, build: BUILD };
@@ -321,11 +344,11 @@ importScripts(scriptUrl(`${BASE}core.js`), scriptUrl(`${BASE}token.js`), scriptU
         channel = null;
       }
       ticketPort = port;
-      for (const [id, path] of waitingIssues.splice(0)) issue(id, path);
+      for (const [id, path, v] of waitingIssues.splice(0)) issue(id, path, v);
     },
     issue(args) {
       // Not waited for: the answer goes to the Service Worker, and `issue` never throws.
-      issue(String(args.id), String(args.path));
+      issue(String(args.id), String(args.path), args.v == null ? null : String(args.v));
     },
   };
 

@@ -106,6 +106,23 @@ so.)
   `web-core/build.sh` fails when the two lockfiles disagree.
 - The viewer's browser tests use `playwright-core`, pinned in `worker/test/e2e/package.json`
   — kept out of `worker/package.json`, which is the Worker's deploy toolchain.
+- The time machine of the viewers (SPEC §7.4) is one pure file, `src/web/past.rs`, compiled
+  into both crates like `rules.rs`. It reads no clock and no database: each caller gives it a
+  `Source`. There are three: `index::SqlSource` (the SQL replica, `src/index/history.rs`),
+  `past::MemSource` (the in-memory index: the hosted core, and the tests), and a plain vector
+  in `src/web/past_tests.rs`. Change an answer there and `web-core/tests/parity.rs` compares
+  both viewers again, byte for byte.
+- A vault with history for a test: the binary has no clock to set, so history is made by real
+  runs a little over a second apart, and the moments to ask about are taken from what the API
+  reports. `tests/web.rs` has `vault_with_history()`; the browser suites use `addHistory()` of
+  `worker/test/e2e/vault.mjs`, which also records `gclone tree` after each run — what the
+  viewers' answers for those moments are compared with, folders included.
+  `worker/test/e2e/timemachine.mjs` holds the checks that both viewers get: `run.mjs` runs
+  them as its step `timemachine` (`GCLONE_E2E_ONLY=timemachine` for that step alone),
+  `local.mjs` after its own. `shots.mjs <dir> chrome time` shoots only the time machine.
+- The hosted core has a size limit (`WASM_MAX` in `web-core/test/check-module.mjs`), and
+  `build.sh` fails above it. Generic code that is instantiated once more per type — a sort, a
+  map — is what grows it: see `rules::listing_order` and `past::order_by` before adding one.
 
 ## CI
 
@@ -133,6 +150,10 @@ real file, name or account:
 - `viewer.mjs <out> [<content dir>]` builds a vault from that tree with the native binary,
   serves it through the browser suite's fake Drive and fake Worker routes, and shoots
   `viewer-*.png` in the installed Google Chrome.
+- `timemachine.mjs <out>` makes a vault from the demo's documents (no ffmpeg), gives it some
+  history — edits, a deleted file, a deleted folder, a move — and shoots
+  `viewer-timemachine-*.png`: the vault before those changes. The binary has no clock to
+  set, so the changes in that picture are a minute old.
 - `terminal.mjs <out> [<content dir>]` runs gclone in a temporary lab with two devices
   (`laptop`, `desktop`) over a directory vault, prints each scene's text and renders
   `terminal-*.png` with the same Chrome. The text is what the binary printed, with three
@@ -152,6 +173,7 @@ export GCLONE_PLAYWRIGHT_CORE=$PWD/worker/test/e2e/node_modules/playwright-core
 # content, viewer shots, terminal pictures
 nix-shell -p ffmpeg nodejs --run "node worker/test/e2e/readme/content.mjs $T/demo"
 node worker/test/e2e/readme/viewer.mjs   docs/images $T/demo
+node worker/test/e2e/readme/timemachine.mjs docs/images
 node worker/test/e2e/readme/terminal.mjs docs/images $T/demo
 # optimise
 (cd docs/images && nix-shell -p pngquant oxipng --run \
@@ -164,6 +186,9 @@ node worker/test/e2e/readme/terminal.mjs docs/images $T/demo
   of `target/release/gclone` and `web-core/pkg`.
 - Every gclone run of the scripts has a temporary home and `GCLONE_KEYSTORE_TRIAL=0`: they
   touch no real login, no vault of yours and no Secure Enclave.
+- The date field in the time machine's bar is the browser's own control. The scripts start
+  Chrome with `--lang=en-GB`, which sets its format on Linux; on a Mac Chrome takes it from
+  the system's region, so there the field is written the way that region writes dates.
 - The image and video previews are shot at 1.375x (1760 pixels wide, twice the README's
   880), the rest at 2x; the dates in the terminal pictures are the day of the run.
 - Look at every picture before committing it. The repository is public: no real name,
@@ -198,7 +223,7 @@ checkout that has the tag:
 
 ```sh
 git fetch --tags
-scripts/release-sign-macos.sh v0.5.1
+scripts/release-sign-macos.sh v0.6.0
 ```
 
 It verifies every file of the draft against its attestation and `SHA256SUMS`, signs a copy of
@@ -209,7 +234,7 @@ with that Mac's Secure Enclave as every Mac's first login does since 0.5.1, then
 a read from the sealed store, and `gclone keystore check` —, adds
 `gclone-aarch64-apple-darwin-signed.tar.gz` and its line in `SHA256SUMS`,
 downloads the whole draft again and checks it once more, and publishes after you type
-`publish v0.5.1`. Then it verifies the published release (`gh release verify`,
+`publish v0.6.0`. Then it verifies the published release (`gh release verify`,
 `gh release verify-asset`, `install.sh --require-attestation`). It refuses to go on as soon as
 anything does not verify, and until it publishes it can simply be run again — also after an
 upload that was cut off (the draft may then be without `SHA256SUMS` or without the signed
@@ -221,7 +246,7 @@ network error, a rate limit, an attestation that is not served yet). That is not
 run
 
 ```sh
-scripts/release-sign-macos.sh --verify-published v0.5.1
+scripts/release-sign-macos.sh --verify-published v0.6.0
 ```
 
 which needs no draft and no signing identity, changes nothing, and can be repeated: it
@@ -275,9 +300,9 @@ before the first signed release:
 **Order on a release day** — the tag first, `main` last:
 
 ```sh
-git push origin v0.5.1                 # the tag ALONE: it carries the commit and starts release.yml
+git push origin v0.6.0                 # the tag ALONE: it carries the commit and starts release.yml
 #   … wait for the workflow: a draft release
-scripts/release-sign-macos.sh v0.5.1   # verify, sign, publish
+scripts/release-sign-macos.sh v0.6.0   # verify, sign, publish
 #   … deploy the viewer (worker/README.md)
 git push origin main                   # only now
 ```
@@ -333,7 +358,8 @@ src/state/, src/index/      SQLite replica; journal, merge, refresh, commit, rep
 src/transfer/               upload pipeline (packing), downloads, ranged reads
 src/sync/                   scan, planner, executor, remote-only commands, gc, check
 src/web/                    `gclone web`: the loopback HTTP server, and its page in assets/ (no build step);
-                            rules.rs: what both viewers answer identically (order, search, JSON shapes, ranges)
+                            rules.rs: what both viewers answer identically (order, search, JSON shapes, ranges);
+                            past.rs: the vault as it was (versions, deleted entries, a view at a moment)
 src/restic/                 `gclone serve restic`: restic's REST protocol in front of Drive — the wire grammar,
                             the folder tree, the store (cache, listings, uploads, deletes), HTTP, stdio
 web-core/                   the read path for the hosted viewer: a crate of its own that includes src/ files by

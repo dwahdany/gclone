@@ -625,3 +625,85 @@ describe('ten thousand files', () => {
     mine.vault.free();
   });
 });
+
+describe('a vault with history (the time machine)', () => {
+  let v;
+  let vault;
+  const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  before(async () => {
+    // A snapshot, then history after it: an overwrite, a deleted file, a deleted folder —
+    // runs of the native binary more than a second apart.
+    v = await makeVault({ 'docs/notes.txt': 'one\n', 'docs/gone.txt': 'going\n', 'old/a.txt': 'a\n', 'old/deep/b.txt': 'b\n' }, { repair: true });
+    pause(1100);
+    v.write({ 'docs/notes.txt': 'two, and longer\n' });
+    pause(1100);
+    v.device.run('rm', ':docs/gone.txt');
+    v.device.run('rm', '-r', ':old');
+    const mine = await unlock(v.viewerDrive);
+    vault = mine.vault;
+    await loader.createIndex({ core, drive: v.viewerDrive, vault, folder: mine.opened.index }).load();
+  });
+  after(async () => {
+    vault.free();
+    await v.close();
+  });
+
+  /** The plaintext a ticket opens: the blob from the fake Drive, through the core's reader. */
+  async function read(ticketJson) {
+    const ticket = JSON.parse(ticketJson);
+    const blob = await v.viewerDrive.get(ticket.file_id, 64 * MIB);
+    const reader = new core.FileReader(ticketJson, 0, ticket.size);
+    const plain = Buffer.from(reader.push(blob.subarray(reader.cipher_start(), reader.cipher_end())));
+    assert.equal(reader.remaining(), 0);
+    reader.free();
+    return plain.toString();
+  }
+
+  test('the core answers versions, deleted and timeline from the index the loader loaded', () => {
+    const now = Date.now();
+    const timeline = JSON.parse(vault.timeline(now));
+    assert.equal(timeline.now_ms - timeline.from_ms, 25 * 86400000);
+    assert.deepEqual(timeline.devices, ['laptop']);
+    // The overwrite, the file, the folder's two files — recorded times, in order.
+    assert.deepEqual(timeline.moments.filter((m) => m[3] === 0).map((m) => m[1]), [1, 1, 2]);
+    const versions = JSON.parse(vault.versions('docs/notes.txt', undefined, now));
+    // (The new content came from another source directory: whether the old version counts
+    // as overwritten or as deleted is the command line's rule, and not looked at here.)
+    assert.deepEqual(versions.versions.map((r) => [r.size, !!r.current, typeof r.why]), [[16, true, 'undefined'], [4, false, 'string']]);
+    assert.match(versions.versions[1].restore, /^gclone restore :docs\/notes\.txt --version @[0-9a-f]{12}$/);
+    const docs = JSON.parse(vault.deleted('docs', undefined, undefined, undefined, undefined, now));
+    assert.deepEqual(docs.entries.map((e) => [e.name, e.gone.why, e.gone.by]), [['gone.txt', 'deleted', 'laptop']]);
+    const root = JSON.parse(vault.deleted('', undefined, undefined, undefined, undefined, now));
+    assert.deepEqual(root.entries.map((e) => [e.name, e.dir, e.files]), [['old', true, 2]]);
+    const gone = JSON.parse(vault.deleted('old', undefined, undefined, undefined, undefined, now));
+    assert.deepEqual([gone.gone, gone.restore], [true, 'gclone restore -r :old']);
+    // The folder just before it went, and the notes just before they changed.
+    const was = JSON.parse(vault.list('old', undefined, undefined, undefined, undefined, gone.as_it_was_ms, now));
+    assert.deepEqual(was.entries.map((e) => e.name), ['deep', 'a.txt']);
+    // (Before the new content arrived — not before the old one was removed: the copy came
+    // from another source directory, so for a moment the path had both, and the newer won.)
+    const then = versions.versions[0].written_ms - 1;
+    const listed = JSON.parse(vault.list('docs', undefined, undefined, undefined, undefined, then, now));
+    assert.deepEqual(listed.entries.map((e) => [e.name, e.size, e.since || null]), [['gone.txt', 6, 'deleted'], ['notes.txt', 4, 'changed']]);
+    assert.equal(listed.at, then);
+    // The tree of now is untouched by all of it.
+    assert.deepEqual(lsRecursive(vault), v.device.lines('ls', '-R', ':'));
+  });
+
+  test('a ticket by version id opens that version; the file as it is has its own', async () => {
+    const now = Date.now();
+    const versions = JSON.parse(vault.versions('docs/notes.txt', undefined, now)).versions;
+    assert.equal(await read(vault.ticket('docs/notes.txt')), 'two, and longer\n');
+    assert.equal(await read(vault.ticket('docs/notes.txt', versions[1].v, now)), 'one\n');
+    assert.equal(vault.ticket('docs/notes.txt', versions[0].v, now), vault.ticket('docs/notes.txt'), 'the current version by its id: the same ticket');
+    // A deleted file has no ticket as a current file, and one for its kept version.
+    const gone = JSON.parse(vault.deleted('docs', undefined, undefined, undefined, undefined, now)).entries[0];
+    assert.equal(loader.codeOf((() => { try { vault.ticket('docs/gone.txt'); } catch (error) { return error; } return null; })()), 'not-found');
+    assert.equal(await read(vault.ticket('docs/gone.txt', gone.v, now)), 'going\n');
+    // The module reads no clock: with a "now" 26 days on, the version is outside the window.
+    const code = (fn) => { try { fn(); } catch (error) { return loader.codeOf(error); } return null; };
+    assert.equal(code(() => vault.ticket('docs/gone.txt', gone.v, now + 26 * 86400000)), 'not-found');
+    assert.equal(code(() => vault.ticket('docs/gone.txt', gone.v)), 'bad-input');
+    assert.equal(code(() => vault.ticket('docs/gone.txt', 'not-an-id', now)), 'bad-input');
+  });
+});

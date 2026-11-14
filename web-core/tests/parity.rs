@@ -294,7 +294,33 @@ fn dir(path: &str) -> OpDraft {
     }
 }
 
-/// Two devices, a snapshot, segments after it, and everything a listing can trip over.
+/// `ops` with every put based on the head that is at its path: overwrites, not blind puts.
+fn over(v: &V, mut ops: Vec<OpDraft>) -> Vec<OpDraft> {
+    for op in &mut ops {
+        if let OpDraft::Put { path, base, .. } = op {
+            *base = v.head(path).unwrap().map(|h| h.stamp);
+        }
+    }
+    ops
+}
+
+/// The newest removed version of `path` put back: what `gclone restore` commits.
+fn restore(v: &V, path: &str) -> OpDraft {
+    let removed = v.removed_versions(path).unwrap();
+    let version = removed.first().expect("a removed version");
+    OpDraft::Put {
+        path: path.into(),
+        entry: version.entry.clone(),
+        base: None,
+        origin: Some(version.stamp),
+        effect: None,
+    }
+}
+
+/// Two devices, a snapshot, segments after it, and everything a listing can trip over — and,
+/// for the time machine, history on both sides of the snapshot: a file with three versions,
+/// a version that changed nothing but the modification time, a deleted folder, a deleted file
+/// that was restored, a move. The store's clock advances a minute between the steps.
 async fn busy_vault() -> (World, V, V) {
     let (mut w, a) = World::new().await;
     let first = w.pack(&[
@@ -336,12 +362,33 @@ async fn busy_vault() -> (World, V, V) {
     a.commit_ops(vec![dir("empty-dir"), dir("docs/empty")])
         .await
         .unwrap();
+    let storied = w.pack(&[
+        ("notes/plan.md", 50, 1_700_000_000_000_000_000),
+        ("notes/kept.md", 60, 1_700_000_000_000_000_000),
+        ("notes/brought-back.md", 70, 1_700_000_000_000_000_000),
+        ("attic/one.txt", 80, 1_700_000_000_000_000_000),
+        ("attic/deep/two.txt", 90, 1_700_000_000_000_000_000),
+        ("trail/moved.txt", 100, 1_700_000_000_000_000_000),
+    ]);
+    a.commit_ops(storied).await.unwrap();
+    w.tick();
+    // The second version of the plan.
+    let plan = w.pack(&[("notes/plan.md", 51, 1_700_500_000_000_000_000)]);
+    a.commit_ops(over(&a, plan)).await.unwrap();
     w.tick();
 
     // A second device joins, renames, deletes and adds.
     let b = w.join("phone \u{1f4f1}", 2).await;
     let mut ops = mv(&b, "to-rename.pdf", "docs/renamed.pdf");
     ops.push(del(&b, "to-delete.bin"));
+    // A folder goes, with everything in it, and so does a file that will come back.
+    for gone in [
+        "attic/one.txt",
+        "attic/deep/two.txt",
+        "notes/brought-back.md",
+    ] {
+        ops.push(del(&b, gone));
+    }
     ops.extend(w.pack(&[
         ("from-phone/IMG_0001.HEIC", 5_000, 1_702_000_000_000_000_000),
         ("from-phone/notes", 44, 1_702_000_000_000_000_000),
@@ -363,8 +410,30 @@ async fn busy_vault() -> (World, V, V) {
     ]);
     a.commit_ops(after_a).await.unwrap();
     w.tick();
+    // After the snapshot as well: the third version of the plan, a move, a restore.
+    let mut storied = over(
+        &a,
+        w.pack(&[("notes/plan.md", 52, 1_700_900_000_000_000_000)]),
+    );
+    storied.extend(mv(&a, "trail/moved.txt", "trail/there.txt"));
+    storied.push(restore(&a, "notes/brought-back.md"));
+    a.commit_ops(storied).await.unwrap();
+    w.tick();
     b.refresh().await.unwrap();
     let mut after_b = vec![del(&b, "top")];
+    // The same bytes again, with another modification time: a version of its own in the
+    // index, none in the viewer's list.
+    let kept = b.head("notes/kept.md").unwrap().expect("a head");
+    after_b.push(OpDraft::Put {
+        path: kept.path.clone(),
+        entry: Entry {
+            mtime_ns: kept.entry.mtime_ns + 5_000_000_000,
+            ..kept.entry.clone()
+        },
+        base: Some(kept.stamp),
+        origin: None,
+        effect: None,
+    });
     after_b.extend(w.pack(&[("media/song.mp3", 70_000, 1_704_000_000_000_000_000)]));
     b.commit_ops(after_b).await.unwrap();
     w.tick();
@@ -590,6 +659,526 @@ fn assert_same_view(c: &V, reader: &Reader, report: &Report) {
         head: Some(c.head_fingerprint().unwrap()),
     };
     assert_eq!(json(&info), json(&native));
+}
+
+/// One call of the wasm API and what the native side answers: `{fn, args, ok | err}`.
+type Calls = Vec<serde_json::Value>;
+
+fn native_or<T>(found: Result<T, IndexError>) -> T {
+    found.unwrap()
+}
+
+/// The time machine, compared between the SQL replica (through `gclone::index::HistoryDb` and
+/// `gclone::web::past`, as `gclone web` asks) and a reader: the timeline, every listing, `stat`
+/// and search at every moment worth asking about, the versions of every path, what was deleted
+/// from every folder — as JSON, byte for byte. Returns the moments, and records every call
+/// for the wasm suite.
+fn assert_same_past(c: &V, reader: &mut Reader, calls: &mut Calls) -> Vec<u64> {
+    use gclone::index::HistoryDb;
+    use gclone::web::past as native_past;
+    let history = HistoryDb::new(c.db().clone());
+    let now = c.backend().now_ms();
+    let nowf = now as f64;
+    let by = |sort: Option<&str>, order: Option<&str>| {
+        native_rules::SortOrder::parse(sort, order).unwrap()
+    };
+
+    // The timeline, and from it the moments: just before each change, at it, the ends of the
+    // window and beyond them.
+    let timeline = native_or(history.read(now, |src, h| Ok(native_past::timeline(src, h, now))));
+    assert_eq!(json(&reader.timeline(Some(nowf)).unwrap()), json(&timeline));
+    calls.push(serde_json::json!({ "fn": "timeline", "args": [now], "ok": json(&timeline) }));
+    assert!(timeline.moments.len() >= 6, "{timeline:?}");
+    assert!(timeline.moments.iter().any(|m| m.3 == 1), "an estimate");
+    assert!(timeline.moments.iter().any(|m| m.3 == 0), "a recorded time");
+    assert_eq!(timeline.devices.len(), 2, "{timeline:?}");
+    let mut moments = vec![0, timeline.from_ms, now - 1, now, now + 1_000_000];
+    for (ms, ..) in &timeline.moments {
+        moments.extend([ms - 1, *ms]);
+    }
+    moments.sort_unstable();
+    moments.dedup();
+
+    // Every folder there is or was.
+    let mut dirs = directories(c);
+    dirs.extend(["attic", "attic/deep", "nowhere/at/all", "docs/a.txt"].map(String::from));
+    // Every path that has or had something.
+    let mut paths: Vec<String> = c.walk("").unwrap().into_iter().map(|h| h.path).collect();
+    paths.extend(c.removed_under("", 0).unwrap().into_iter().map(|v| v.path));
+    paths.extend(dirs.iter().filter(|d| !d.is_empty()).cloned());
+    paths.sort();
+    paths.dedup();
+
+    for at in &moments {
+        let t = native_past::moment(native_past::clamp_at(*at, now), now);
+        let echo = native_past::clamp_at(*at, now);
+        for dir in &dirs {
+            for (sort, order, offset, limit) in [
+                (None, None, None, None),
+                (Some("size"), Some("desc"), Some(1usize), Some(3usize)),
+            ] {
+                let listing =
+                    native_or(history.read(now, |src, h| native_past::list_at(src, h, dir, t)));
+                let native = native_past::list_answer(
+                    dir.clone(),
+                    listing,
+                    by(sort, order),
+                    offset.unwrap_or(0),
+                    limit.unwrap_or(native_rules::LIST_PAGE),
+                    echo,
+                );
+                let core = reader
+                    .list_at(
+                        dir,
+                        sort,
+                        order,
+                        offset.map(|n| n as f64),
+                        limit.map(|n| n as f64),
+                        *at as f64,
+                        Some(nowf),
+                    )
+                    .unwrap();
+                assert_eq!(json(&core), json(&native), "list {dir:?} at {at}");
+                calls.push(serde_json::json!({
+                    "fn": "list", "args": [dir, sort, order, offset, limit, at, now], "ok": json(&native),
+                }));
+            }
+        }
+        for path in &paths {
+            let native =
+                native_or(history.read(now, |src, h| native_past::stat_at(src, h, path, t)));
+            let core = reader.stat_at(path, Some(*at as f64), None, Some(nowf));
+            match native {
+                Some(row) => {
+                    let native = json(&row.json());
+                    assert_eq!(json(&core.unwrap()), native, "stat {path:?} at {at}");
+                    calls.push(serde_json::json!({ "fn": "stat", "args": [path, at, null, now], "ok": native }));
+                }
+                None => {
+                    let refused = core.unwrap_err();
+                    assert_eq!(refused.code, Code::NotFound);
+                    assert_eq!(refused.message, native_rules::not_then(path));
+                    calls.push(serde_json::json!({
+                        "fn": "stat", "args": [path, at, null, now],
+                        "err": format!("not-found: {}", native_rules::not_then(path)),
+                    }));
+                }
+            }
+        }
+        for word in ["a", "plan", "attic", "txt", "moved", "o", "zzz"] {
+            for limit in [2usize, 200] {
+                let (hits, more) = native_or(
+                    history.read(now, |src, h| native_past::search_at(src, h, word, limit, t)),
+                );
+                let native = native_past::search_answer(
+                    word.to_owned(),
+                    hits,
+                    more,
+                    by(Some("mtime"), None),
+                    echo,
+                );
+                let core = reader
+                    .search_at(
+                        word,
+                        Some(limit as f64),
+                        Some("mtime"),
+                        None,
+                        *at as f64,
+                        Some(nowf),
+                    )
+                    .unwrap();
+                assert_eq!(json(&core), json(&native), "search {word:?} at {at}");
+                calls.push(serde_json::json!({
+                    "fn": "search", "args": [word, limit, "mtime", null, at, now], "ok": json(&native),
+                }));
+            }
+        }
+    }
+
+    // The versions of every path — also marked for a moment — and `stat` of each.
+    let mut listed_any = 0;
+    for path in &paths {
+        for at in [None, Some(moments[moments.len() / 2])] {
+            let t = at.map(|at| native_past::moment(native_past::clamp_at(at, now), now));
+            let native =
+                native_or(history.read(now, |src, h| native_past::versions(src, h, path, t, now)));
+            let core = reader
+                .versions(path, at.map(|at| at as f64), Some(nowf))
+                .unwrap();
+            assert_eq!(json(&core), json(&native), "versions of {path:?}");
+            calls.push(serde_json::json!({ "fn": "versions", "args": [path, at, now], "ok": json(&native) }));
+            if at.is_some() {
+                continue;
+            }
+            listed_any += native.versions.iter().filter(|row| !row.current).count();
+            for row in &native.versions {
+                let stat = native_or(
+                    history.rows(|src| native_past::stat_version(src, path, &row.v, now)),
+                )
+                .expect("a version that is listed is one that is offered");
+                let core = reader
+                    .stat_at(path, None, Some(&row.v), Some(nowf))
+                    .unwrap();
+                assert_eq!(json(&core), json(&stat.json()), "{path:?} @{}", row.v);
+                calls.push(serde_json::json!({
+                    "fn": "stat", "args": [path, null, row.v, now], "ok": json(&stat.json()),
+                }));
+            }
+            // P9: what `gclone restore --list` offers, in its order (a version that changed
+            // only metadata is folded into the one that followed; blob presence aside).
+            let offered: Vec<String> = c
+                .removed_versions(path)
+                .unwrap()
+                .iter()
+                .filter(|v| {
+                    v.entry.kind == EntryKind::File
+                        && now - v.removed_ms < gclone::consts::RESTORE_WINDOW_MS
+                })
+                .map(|v| native_past::version_id(path, &v.stamp, &v.entry.hash))
+                .collect();
+            let shown: Vec<&str> = native
+                .versions
+                .iter()
+                .filter(|row| !row.current)
+                .map(|row| row.v.as_str())
+                .collect();
+            let mut rest = offered.iter();
+            for id in &shown {
+                assert!(rest.any(|o| o == id), "{path:?}: {shown:?} in {offered:?}");
+            }
+        }
+    }
+    assert!(listed_any >= 6, "{listed_any} earlier versions");
+    let unknown = reader
+        .stat_at("notes/plan.md", None, Some("0123456789ab"), Some(nowf))
+        .unwrap_err();
+    assert_eq!(
+        (unknown.code, unknown.message.as_str()),
+        (Code::NotFound, native_rules::NOT_KEPT)
+    );
+    calls.push(serde_json::json!({
+        "fn": "stat", "args": ["notes/plan.md", null, "0123456789ab", now],
+        "err": format!("not-found: {}", native_rules::NOT_KEPT),
+    }));
+
+    // What was deleted from every folder.
+    for dir in &dirs {
+        for (sort, order, offset, limit) in [
+            (None, None, None, None),
+            (Some("name"), Some("desc"), Some(1usize), Some(2usize)),
+        ] {
+            let native = native_or(history.rows(|src| native_past::deleted(src, dir, now)));
+            let core = reader.deleted(
+                dir,
+                sort,
+                order,
+                offset.map(|n| n as f64),
+                limit.map(|n| n as f64),
+                Some(nowf),
+            );
+            let args = serde_json::json!([dir, sort, order, offset, limit, now]);
+            match native {
+                Some(found) => {
+                    let native = native_past::deleted_json(
+                        dir.clone(),
+                        found,
+                        by(sort, order),
+                        offset.unwrap_or(0),
+                        limit.unwrap_or(native_rules::LIST_PAGE),
+                    );
+                    assert_eq!(json(&core.unwrap()), json(&native), "deleted from {dir:?}");
+                    calls.push(
+                        serde_json::json!({ "fn": "deleted", "args": args, "ok": json(&native) }),
+                    );
+                }
+                None => {
+                    let refused = core.unwrap_err();
+                    assert_eq!(refused.code, Code::NotFound);
+                    assert_eq!(refused.message, native_rules::no_folder(dir));
+                    calls.push(serde_json::json!({
+                        "fn": "deleted", "args": args,
+                        "err": format!("not-found: {}", native_rules::no_folder(dir)),
+                    }));
+                }
+            }
+        }
+    }
+
+    // What is asked for wrongly: the local viewer's sentences.
+    let bad = |refused: gclone_web_core::Error, sentence: &str| {
+        assert_eq!(
+            (refused.code, refused.message.as_str()),
+            (Code::BadInput, sentence)
+        );
+    };
+    bad(
+        reader
+            .list_at("", None, None, None, None, 1.5, Some(nowf))
+            .unwrap_err(),
+        native_rules::BAD_TIME,
+    );
+    bad(
+        reader
+            .list_at("", None, None, None, None, -1.0, Some(nowf))
+            .unwrap_err(),
+        native_rules::BAD_TIME,
+    );
+    bad(
+        reader
+            .list_at("", None, None, None, None, 5.0, None)
+            .unwrap_err(),
+        "now is missing",
+    );
+    bad(
+        reader
+            .stat_at("docs", Some(5.0), Some("0123456789ab"), Some(nowf))
+            .unwrap_err(),
+        native_rules::AT_OR_V,
+    );
+    bad(
+        reader
+            .stat_at("docs", None, Some("nope"), Some(nowf))
+            .unwrap_err(),
+        native_rules::BAD_VERSION,
+    );
+    bad(
+        reader.versions("", None, Some(nowf)).unwrap_err(),
+        native_rules::PATH_IS_MISSING,
+    );
+    bad(reader.timeline(None).unwrap_err(), "now is missing");
+    for (function, args, sentence) in [
+        (
+            "list",
+            serde_json::json!(["", null, null, null, null, 1.5, now]),
+            native_rules::BAD_TIME,
+        ),
+        (
+            "list",
+            serde_json::json!(["", null, null, null, null, 5, null]),
+            "now is missing",
+        ),
+        (
+            "stat",
+            serde_json::json!(["docs", 5, "0123456789ab", now]),
+            native_rules::AT_OR_V,
+        ),
+        (
+            "stat",
+            serde_json::json!(["docs", null, "nope", now]),
+            native_rules::BAD_VERSION,
+        ),
+        (
+            "search",
+            serde_json::json!(["a", null, null, null, -3, now]),
+            native_rules::BAD_TIME,
+        ),
+        (
+            "versions",
+            serde_json::json!(["", null, now]),
+            native_rules::PATH_IS_MISSING,
+        ),
+        (
+            "deleted",
+            serde_json::json!(["", null, null, null, 0, now]),
+            native_rules::LIMIT_IS_ZERO,
+        ),
+    ] {
+        calls.push(serde_json::json!({
+            "fn": function, "args": args, "err": format!("bad-input: {sentence}"),
+        }));
+    }
+    moments
+}
+
+/// Every version the viewer can name: `(path, id, content hash)` — the file heads and the
+/// removed versions inside the window.
+fn versions_of(c: &V, reader: &mut Reader) -> Vec<(String, String, [u8; 32])> {
+    use gclone::web::past as native_past;
+    let now = c.backend().now_ms();
+    let mut out = Vec::new();
+    let mut paths: Vec<String> = c.walk("").unwrap().into_iter().map(|h| h.path).collect();
+    paths.extend(c.removed_under("", 0).unwrap().into_iter().map(|v| v.path));
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let listed = reader.versions(&path, None, Some(now as f64)).unwrap();
+        for row in listed.versions {
+            let (head, _) = c
+                .version(&path, &row.v, now)
+                .unwrap()
+                .expect("the replica knows the version");
+            assert_eq!(
+                native_past::version_id(&path, &head.stamp, &head.entry.hash),
+                row.v
+            );
+            out.push((path.clone(), row.v, head.entry.hash));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn the_reader_and_the_sql_replica_tell_the_same_past() {
+    let (w, _a, _b) = busy_vault().await;
+    let c = w.join("fresh", 3).await;
+    let now = c.backend().now_ms() as f64;
+    let mut reader = Reader::new(core_keys());
+    w.load(&mut reader, true);
+    let mut calls = Calls::new();
+    let moments = assert_same_past(&c, &mut reader, &mut calls);
+    assert!(calls.len() > 1_000, "{}", calls.len());
+
+    // The fixture is what it is meant to be.
+    let plan = reader.versions("notes/plan.md", None, Some(now)).unwrap();
+    let sizes: Vec<u64> = plan.versions.iter().map(|v| v.size).collect();
+    assert_eq!(sizes, [52, 51, 50]);
+    assert!(
+        plan.versions[1]
+            .restore
+            .as_deref()
+            .is_some_and(|c| { c.starts_with("gclone restore :notes/plan.md --version @") })
+    );
+    // The version that changed only the modification time: one row, the current one.
+    let kept = reader.versions("notes/kept.md", None, Some(now)).unwrap();
+    assert_eq!(kept.versions.len(), 1);
+    assert!(kept.versions[0].current);
+    let attic = reader
+        .deleted("", None, None, None, None, Some(now))
+        .unwrap();
+    let names: Vec<&str> = attic.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["attic", "to-delete.bin", "to-rename.pdf", "top"]);
+    assert_eq!(attic.entries[0].files, Some(2));
+    let gone = reader
+        .deleted("attic", None, None, None, None, Some(now))
+        .unwrap();
+    assert!(gone.gone);
+    assert_eq!(gone.restore.as_deref(), Some("gclone restore -r :attic"));
+    let then = gone.as_it_was_ms.expect("a moment to see it at") as f64;
+    let was = reader
+        .list_at("attic", None, None, None, None, then, Some(now))
+        .unwrap();
+    assert_eq!((was.total, was.absent), (2, false));
+    let after = reader
+        .list_at("attic", None, None, None, None, then + 1.0, Some(now))
+        .unwrap();
+    assert!(after.absent && after.nearest.as_deref() == Some(""));
+
+    // P6: a reader that applied every segment itself, with no snapshot, tells the same past
+    // as the one that started from the snapshot.
+    let mut young = Reader::new(core_keys());
+    assert_eq!(w.load(&mut young, false).snapshot, None);
+    assert_eq!(
+        json(&young.timeline(Some(now)).unwrap()),
+        json(&reader.timeline(Some(now)).unwrap())
+    );
+    for at in &moments {
+        let at = *at as f64;
+        for dir in ["", "notes", "attic", "trail", "docs"] {
+            assert_eq!(
+                json(
+                    &young
+                        .list_at(dir, None, None, None, None, at, Some(now))
+                        .unwrap()
+                ),
+                json(
+                    &reader
+                        .list_at(dir, None, None, None, None, at, Some(now))
+                        .unwrap()
+                ),
+                "{dir:?} at {at}"
+            );
+        }
+        assert_eq!(
+            json(
+                &young
+                    .search_at("a", None, None, None, at, Some(now))
+                    .unwrap()
+            ),
+            json(
+                &reader
+                    .search_at("a", None, None, None, at, Some(now))
+                    .unwrap()
+            )
+        );
+    }
+    for path in ["notes/plan.md", "notes/brought-back.md", "attic/one.txt"] {
+        assert_eq!(
+            json(&young.versions(path, None, Some(now)).unwrap()),
+            json(&reader.versions(path, None, Some(now)).unwrap())
+        );
+    }
+
+    // P7: every id an answer carries opens exactly the bytes of its version.
+    let all = versions_of(&c, &mut reader);
+    assert!(all.len() > 30, "{}", all.len());
+    let mut earlier = 0;
+    for (path, v, hash) in &all {
+        let ticket = reader.ticket_of(path, Some(v), Some(now)).unwrap();
+        let plain = &w.plain[hash];
+        assert_eq!(ticket.size, plain.len() as u64, "{path}");
+        assert_eq!(ticket.name, gclone::path::file_name(path));
+        if ticket.size > 0 {
+            let read = read(&ticket, &w.blobs[&ticket.file_id], 0, ticket.size, 70_000);
+            assert_eq!(blake3::hash(&read).as_bytes(), hash, "{path} @{v}");
+        }
+        // P8: the ticket of a version is the ticket its entry gets as the current file.
+        match reader.head(path).filter(|h| h.entry.hash == *hash) {
+            Some(_) => assert!(reader.ticket(path).unwrap() == ticket, "{path}"),
+            None => earlier += 1,
+        }
+    }
+    assert!(earlier >= 6, "{earlier}");
+    // The restored file: its removed version and its head hold the same entry.
+    let back = reader
+        .versions("notes/brought-back.md", None, Some(now))
+        .unwrap();
+    assert_eq!(back.versions.len(), 2);
+    assert!(back.versions[0].current && back.versions[1].why == Some("deleted"));
+    let removed = reader
+        .ticket_of(
+            "notes/brought-back.md",
+            Some(&back.versions[1].v),
+            Some(now),
+        )
+        .unwrap();
+    assert!(removed == reader.ticket("notes/brought-back.md").unwrap());
+    // What names nothing: no ticket, and no word about why.
+    for (path, v) in [
+        ("notes/plan.md", "0123456789ab"),
+        ("docs/a.txt", all[0].1.as_str()),
+        ("docs", "0123456789ab"),
+    ] {
+        if all[0].0 == path {
+            continue;
+        }
+        let refused = reader
+            .ticket_of(path, Some(v), Some(now))
+            .err()
+            .expect("no ticket");
+        assert_eq!(
+            (refused.code, refused.message.as_str()),
+            (Code::NotFound, native_rules::NOT_KEPT),
+            "{path}"
+        );
+    }
+    let refused = reader
+        .ticket_of("docs/a.txt", Some("xyz"), Some(now))
+        .err()
+        .expect("no ticket");
+    assert_eq!(refused.code, Code::BadInput);
+    let refused = reader
+        .ticket_of("docs/a.txt", Some(&all[0].1), None)
+        .err()
+        .expect("no ticket");
+    assert_eq!(refused.message, "now is missing");
+    // Outside the window an id names nothing any more.
+    let later = now + 26.0 * 86_400_000.0;
+    let (path, v, _) = all
+        .iter()
+        .find(|(path, _, hash)| reader.head(path).is_none_or(|h| h.entry.hash != *hash))
+        .expect("an earlier version");
+    assert!(reader.ticket_of(path, Some(v), Some(now)).is_ok());
+    assert!(reader.ticket_of(path, Some(v), Some(later)).is_err());
 }
 
 #[tokio::test]
@@ -2059,6 +2648,359 @@ fn numbers_from_javascript_are_whole_and_exact() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The time machine at the size of a large vault (not part of an ordinary run)
+// ---------------------------------------------------------------------------------------------
+
+/// A vault of `GCLONE_SCALE_FILES` files (default 860,000) with history — a tenth of the
+/// files overwritten ten days ago, a folder of as many deleted five days ago, a third of the
+/// files uploaded two days ago — and how long the time machine's questions take on it: the
+/// SQL replica, and this crate's reader compiled natively. Of the young files, most lie in
+/// the two shapes that a listing of an earlier moment must not walk again and again:
+/// `photos/` with thousands of subfolders of 70 files beside two old entries, and `mixed/`
+/// with one old file that sorts after all the young ones. Prints the times; asserts that
+/// both give the same answers, and (in a release build) that a listing which was asked
+/// before takes at most 100 ms. With `GCLONE_WEB_CORE_SCALE=<dir>` the index objects and the
+/// key bundle are written there, for `node test/scale.mjs` to measure the wasm build.
+///
+///   cargo test --release --test parity -- --ignored --nocapture the_time_machine_at_scale
+#[tokio::test]
+#[ignore = "builds an index of 860,000 files"]
+async fn the_time_machine_at_scale() {
+    use gclone::index::HistoryDb;
+    use gclone::web::past as native_past;
+    use std::time::Instant;
+    const DAY: u64 = 86_400_000;
+    let total: usize = std::env::var("GCLONE_SCALE_FILES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(860_000);
+    // Per folder 1,000 files; of the heads: the old, the edited, the young.
+    let folders = |files: usize| files.div_ceil(1_000).max(1);
+    let (edited, deleted, young) = (total * 100 / 860, total * 100 / 860, total * 300 / 860);
+    // Three old entries stand in the two young shapes.
+    let old = total - edited - young - 3;
+    // Of the young files: seven tenths in `photos/<folder>/` (70 each), two tenths in `mixed/`.
+    let (photo_folders, mixed) = (young * 7 / 10 / 70, young * 2 / 10);
+    let young_rest = young - photo_folders * 70 - mixed;
+    let (w, a) = World::new().await;
+    let keys = native_keys();
+    let mut blobs = 0u32;
+    // `top/dNNN/fNNNN.bin`, a thousand files per folder.
+    let tree = |top: &str, files: usize| -> Vec<String> {
+        (0..files)
+            .map(|n| format!("{top}/d{:03}/f{:04}.bin", n / 1_000, n % 1_000))
+            .collect()
+    };
+    // The ops of new files at `paths`: one blob record per thousand, a put per file.
+    let mut upload = |w: &World, paths: Vec<String>, version: u8, v: Option<&V>| {
+        let mut ops = Vec::with_capacity(paths.len() + folders(paths.len()));
+        for group in paths.chunks(1_000) {
+            blobs += 1;
+            let mut id = [0u8; 16];
+            id[..4].copy_from_slice(&blobs.to_be_bytes());
+            ops.push(OpDraft::Blob(BlobRec {
+                id: BlobId(id),
+                file_id: format!("blob-{blobs}"),
+                clen: 1 << 30,
+                md5: [0; 16],
+                created_ms: w.mem.now_ms(),
+            }));
+            for (n, path) in group.iter().enumerate() {
+                let path = path.clone();
+                let size = 1_000 + u64::from(version);
+                ops.push(OpDraft::Put {
+                    entry: Entry {
+                        kind: EntryKind::File,
+                        size,
+                        mtime_ns: 1_700_000_000_000_000_000,
+                        exec: false,
+                        hash: *blake3::hash(format!("{path} {version}").as_bytes()).as_bytes(),
+                        loc: Some(Loc {
+                            blob: BlobId(id),
+                            off: n as u64 * 2_000,
+                            clen: gclone::crypto::ciphertext_len(size, 16),
+                            salt: [0; 16],
+                            chunk_log2: 16,
+                            epoch: keys.current_epoch(),
+                            suite: 1,
+                            flags: 0,
+                        }),
+                    },
+                    base: v.and_then(|v| v.head(&path).unwrap()).map(|h| h.stamp),
+                    path,
+                    origin: None,
+                    effect: None,
+                });
+            }
+        }
+        ops
+    };
+    let started = Instant::now();
+    let commit = async |ops: Vec<OpDraft>| {
+        for chunk in ops.chunks(50_000) {
+            a.commit_ops(chunk.to_vec()).await.unwrap();
+        }
+    };
+    // Thirty days ago: the old files, the ones that will be edited, the folder that will go.
+    let mut first = tree("old", old);
+    first.extend(["photos/old-a.bin", "photos/old-b.bin", "mixed/zz-old.bin"].map(String::from));
+    commit(upload(&w, first, 1, None)).await;
+    commit(upload(&w, tree("edit", edited), 1, None)).await;
+    commit(upload(&w, tree("gone", deleted), 1, None)).await;
+    w.mem.advance_ms(20 * DAY);
+    commit(upload(&w, tree("edit", edited), 2, Some(&a))).await;
+    w.mem.advance_ms(5 * DAY);
+    let gone: Vec<OpDraft> = a
+        .walk("gone")
+        .unwrap()
+        .into_iter()
+        .map(|h| OpDraft::Del {
+            path: h.path,
+            base: h.stamp,
+            effect: None,
+        })
+        .collect();
+    commit(gone).await;
+    let after_delete = w.mem.now_ms();
+    w.mem.advance_ms(3 * DAY);
+    let mut late = tree("young", young_rest);
+    late.extend(
+        (0..photo_folders * 70).map(|n| format!("photos/day-{:05}/{:02}.jpg", n / 70, n % 70)),
+    );
+    late.extend((0..mixed).map(|n| format!("mixed/f{n:06}.bin")));
+    commit(upload(&w, late, 1, None)).await;
+    w.mem.advance_ms(2 * DAY);
+    a.write_snapshot().await.unwrap();
+    eprintln!(
+        "built: {total} heads, {} removed versions, in {:.0?}",
+        edited + deleted,
+        started.elapsed()
+    );
+
+    let c = w.join("fresh", 3).await;
+    let now = c.backend().now_ms();
+    let nowf = now as f64;
+    // A day after the folder was deleted: the young files are not there yet.
+    let at = after_delete + DAY;
+    let mut reader = Reader::new(core_keys());
+    let load = Instant::now();
+    let report = w.load(&mut reader, true);
+    eprintln!(
+        "reader (native): loaded {} files in {:.0?}",
+        report.files,
+        load.elapsed()
+    );
+    assert_eq!(report.files as usize, total);
+    let history = HistoryDb::new(c.db().clone());
+    let by = native_rules::SortOrder::parse(None, None).unwrap();
+    let ms = |since: Instant| since.elapsed().as_secs_f64() * 1e3;
+
+    // What is derived once per index state.
+    let t = Instant::now();
+    let sql_timeline = json(
+        &history
+            .read(now, |src, h| Ok(native_past::timeline(src, h, now)))
+            .unwrap(),
+    );
+    let sql_build = ms(t);
+    let t = Instant::now();
+    let core_timeline = json(&reader.timeline(Some(nowf)).unwrap());
+    eprintln!(
+        "history built:      sql {sql_build:8.1} ms   reader {:8.1} ms",
+        ms(t)
+    );
+    assert_eq!(sql_timeline, core_timeline);
+
+    // Listings at the moment: the root (the young subtrees are walked once: `young` to its
+    // end, `mixed` and `photos` to the old entries behind their young ones), `photos` (every
+    // subfolder is asked whether it was there), a folder of a thousand files, the folder
+    // that was deleted since. A listing that was asked before is answered from what the
+    // walks learned.
+    let quick = !cfg!(debug_assertions);
+    for (dir, what, again) in [
+        ("", "root, first", false),
+        ("", "root, again", true),
+        ("photos", "photos, first", false),
+        ("photos", "photos, again", true),
+        ("mixed", "mixed", false),
+        ("old", "old", false),
+        ("old/d000", "old/d000", false),
+        ("young", "young (absent)", false),
+        ("gone", "gone (absent)", false),
+        ("edit/d000", "edit/d000", false),
+    ] {
+        let t = Instant::now();
+        let listing = history
+            .read(now, |src, h| native_past::list_at(src, h, dir, at))
+            .unwrap();
+        let sql = json(&native_past::list_answer(
+            dir.to_owned(),
+            listing,
+            by,
+            0,
+            2_000,
+            at,
+        ));
+        let sql_ms = ms(t);
+        let t = Instant::now();
+        let core = json(
+            &reader
+                .list_at(dir, None, None, None, None, at as f64, Some(nowf))
+                .unwrap(),
+        );
+        let core_ms = ms(t);
+        eprintln!("list at T, {what:16} sql {sql_ms:8.1} ms   reader {core_ms:8.1} ms");
+        assert_eq!(sql, core, "{dir:?}");
+        if again && quick {
+            assert!(
+                sql_ms <= 100.0 && core_ms <= 100.0,
+                "{what}: {sql_ms:.1} ms and {core_ms:.1} ms"
+            );
+        }
+    }
+    // Other moments at the root, each for the first time: what the walks learned serves them.
+    let t = Instant::now();
+    for step in 1..=20u64 {
+        let then = at + step * 3_600_000;
+        history
+            .read(now, |src, h| native_past::list_at(src, h, "", then))
+            .unwrap();
+        reader
+            .list_at("", None, None, None, None, then as f64, Some(nowf))
+            .unwrap();
+    }
+    let each = ms(t) / 20.0;
+    eprintln!("list at 20 other moments, root: {each:8.1} ms each (sql and reader together)");
+    assert!(!quick || each <= 100.0, "{each:.1} ms per moment");
+    // The folder as it was before it went.
+    let before = after_delete - DAY;
+    let t = Instant::now();
+    let was = reader
+        .list_at("gone", None, None, None, None, before as f64, Some(nowf))
+        .unwrap();
+    eprintln!(
+        "list at T, gone before        reader {:8.1} ms ({} folders)",
+        ms(t),
+        was.total
+    );
+    assert_eq!(was.total, folders(deleted));
+
+    // A search: now, and at the moment.
+    let t = Instant::now();
+    let (hits, more) = c.search("f0500", 200).unwrap();
+    let sql_now = ms(t);
+    let present = json(&native_rules::search_json("f0500".into(), hits, more, by));
+    let t = Instant::now();
+    let core_present = json(&reader.search("f0500", None, None, None).unwrap());
+    let core_now = ms(t);
+    assert_eq!(present, core_present);
+    let t = Instant::now();
+    let (hits, more) = history
+        .read(now, |src, h| {
+            native_past::search_at(src, h, "f0500", 200, at)
+        })
+        .unwrap();
+    let sql_then = ms(t);
+    let then = json(&native_past::search_answer(
+        "f0500".into(),
+        hits,
+        more,
+        by,
+        at,
+    ));
+    let t = Instant::now();
+    let core_then = json(
+        &reader
+            .search_at("f0500", None, None, None, at as f64, Some(nowf))
+            .unwrap(),
+    );
+    eprintln!(
+        "search now / at T:  sql {sql_now:8.1} / {sql_then:8.1} ms   reader {core_now:8.1} / {:8.1} ms",
+        ms(t)
+    );
+    assert_eq!(then, core_then);
+    // A search that finds nothing reads every path: the worst case.
+    let t = Instant::now();
+    let _ = c.search("no-such-name", 200).unwrap();
+    let sql_now = ms(t);
+    let t = Instant::now();
+    let _ = reader.search("no-such-name", None, None, None).unwrap();
+    let core_now = ms(t);
+    let t = Instant::now();
+    let _ = history
+        .read(now, |src, h| {
+            native_past::search_at(src, h, "no-such-name", 200, at)
+        })
+        .unwrap();
+    let sql_then = ms(t);
+    let t = Instant::now();
+    let _ = reader
+        .search_at("no-such-name", None, None, None, at as f64, Some(nowf))
+        .unwrap();
+    eprintln!(
+        "search, no match:   sql {sql_now:8.1} / {sql_then:8.1} ms   reader {core_now:8.1} / {:8.1} ms",
+        ms(t)
+    );
+
+    // The versions of one file, and what was deleted from the root.
+    let path = "edit/d000/f0000.bin";
+    let t = Instant::now();
+    let sql = json(
+        &history
+            .read(now, |src, h| native_past::versions(src, h, path, None, now))
+            .unwrap(),
+    );
+    let sql_ms = ms(t);
+    let t = Instant::now();
+    let core = json(&reader.versions(path, None, Some(nowf)).unwrap());
+    eprintln!(
+        "versions:           sql {sql_ms:8.1} ms   reader {:8.1} ms",
+        ms(t)
+    );
+    assert_eq!(sql, core);
+    let t = Instant::now();
+    let found = history
+        .rows(|src| native_past::deleted(src, "", now))
+        .unwrap()
+        .unwrap();
+    let sql = json(&native_past::deleted_json(
+        String::new(),
+        found,
+        by,
+        0,
+        2_000,
+    ));
+    let sql_ms = ms(t);
+    let t = Instant::now();
+    let core = json(
+        &reader
+            .deleted("", None, None, None, None, Some(nowf))
+            .unwrap(),
+    );
+    eprintln!(
+        "deleted from root:  sql {sql_ms:8.1} ms   reader {:8.1} ms",
+        ms(t)
+    );
+    assert_eq!(sql, core);
+
+    if let Some(out) = std::env::var_os("GCLONE_WEB_CORE_SCALE") {
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(out.join("index")).unwrap();
+        let mut listing = Vec::new();
+        for meta in w.index_objects() {
+            std::fs::write(out.join("index").join(&meta.name), w.bytes(&meta)).unwrap();
+            listing.push(serde_json::json!({ "name": meta.name, "created_ms": meta.created_ms }));
+        }
+        let facts = serde_json::json!({
+            "bundle": gclone::util::hex(&ops::bundle_of(&core_keys())),
+            "listing": listing, "files": total, "now": now, "at": at, "before": before,
+        });
+        std::fs::write(out.join("scale.json"), serde_json::to_vec(&facts).unwrap()).unwrap();
+        eprintln!("exported to {}", out.display());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The same expectations for the wasm build (test/run.sh → test/e2e.mjs)
 // ---------------------------------------------------------------------------------------------
 
@@ -2090,6 +3032,10 @@ async fn export_for_the_wasm_suite() {
     let mut reader = Reader::new(core_keys());
     let report = w.load(&mut reader, true);
     assert_same_view(&c, &reader, &report);
+    // Blobs that only an earlier version points into are needed as well.
+    for (file_id, blob) in &w.blobs {
+        write(&format!("busy/blobs/{file_id}"), blob);
+    }
     let mut files = Vec::new();
     for (n, head) in c.walk("").unwrap().into_iter().enumerate() {
         if head.entry.kind != EntryKind::File {
@@ -2313,7 +3259,27 @@ async fn export_for_the_wasm_suite() {
         };
         ranges.push(serde_json::json!({ "header": header, "size": size, "kind": kind, "start": start, "end": end }));
     }
+    // The time machine: every answer about the past, and the tickets of the versions.
+    assert_same_past(&c, &mut reader, &mut calls);
+    let now = c.backend().now_ms();
+    let mut versions = Vec::new();
+    for (n, (path, v, hash)) in versions_of(&c, &mut reader).into_iter().enumerate() {
+        let ticket = reader.ticket_of(&path, Some(&v), Some(now as f64)).unwrap();
+        write(&format!("busy/versions/{n}"), &w.plain[&hash]);
+        versions.push(serde_json::json!({
+            "path": path,
+            "v": v,
+            "plain": format!("versions/{n}"),
+            "ticket": {
+                "name": ticket.name, "size": ticket.size, "file_id": ticket.file_id,
+                "blob_name": ticket.blob_name, "off": ticket.off, "clen": ticket.clen,
+                "chunk_log2": ticket.chunk_log2,
+            },
+        }));
+    }
     let busy = serde_json::json!({
+        "now": now,
+        "versions": versions,
         "bundle": hex(&ops::bundle_of(&core_keys())),
         "vault_id": VAULT_HEX,
         "listing": listing,

@@ -10,7 +10,7 @@
 # command line tool has to be the same version.
 [package]
 name = "gclone-web-core"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "The read path of gclone for the hosted viewer (WebAssembly)"

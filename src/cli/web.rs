@@ -320,6 +320,8 @@ pub async fn run(g: &GlobalOpts, args: WebArgs) -> anyhow::Result<i32> {
     drop(lock);
     let (vault, _) = open_vault(&paths, &config, backend.clone(), keys.clone(), None).await?;
     let ledger = Db::open_shared(&paths.db_file(&config.vault_id)).ok();
+    // And one for the time machine: a walk through the history must not hold up a listing.
+    let history = Db::open_shared(&paths.db_file(&config.vault_id)).ok();
     let guard = Arc::new(DeviceGuard::new(&paths, &config)?);
 
     let wanted = args.port.unwrap_or(0);
@@ -342,6 +344,7 @@ pub async fn run(g: &GlobalOpts, args: WebArgs) -> anyhow::Result<i32> {
     let app = web::App::new(web::Options {
         vault,
         ledger,
+        history,
         refresher,
         refreshed,
         vault_name: name.clone(),

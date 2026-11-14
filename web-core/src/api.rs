@@ -200,46 +200,126 @@ impl Vault {
 
     /// The viewer's `list` answer. `path`: `""` for the root. `sort` (`name`, `size`, `mtime`),
     /// `order` (`asc`, `desc`), `offset` and `limit` may be `undefined`: the local viewer's
-    /// defaults. Throws `not-found` (no such folder) and `bad-input`.
+    /// defaults. With `at` (a moment in milliseconds since 1970; `now` is then required, the
+    /// caller's clock): the folder as it was at that moment, with `"at"` — moved into the
+    /// window — and, for a folder that did not exist then, `"absent"` and `"nearest"`. Throws
+    /// `not-found` (no such folder, without `at`) and `bad-input`.
+    #[allow(clippy::too_many_arguments)]
     pub fn list(
+        &mut self,
+        path: &str,
+        sort: Option<String>,
+        order: Option<String>,
+        offset: Option<f64>,
+        limit: Option<f64>,
+        at: Option<f64>,
+        now: Option<f64>,
+    ) -> Result<String, JsError> {
+        let (sort, order) = (sort.as_deref(), order.as_deref());
+        let listed = match at {
+            Some(at) => self
+                .reader
+                .list_at(path, sort, order, offset, limit, at, now),
+            None => self.reader.list(path, sort, order, offset, limit),
+        };
+        json(&listed.map_err(throw)?)
+    }
+
+    /// The viewer's `stat` answer: the entry at `path`, with its path. With `at` (and `now`):
+    /// the entry of that moment; with `v` (and `now`): the version of the file that the id
+    /// names — both with `"v"`, the id of the version shown, and `"since"`. Not both. Throws
+    /// `not-found`, `bad-input`.
+    pub fn stat(
+        &mut self,
+        path: &str,
+        at: Option<f64>,
+        v: Option<String>,
+        now: Option<f64>,
+    ) -> Result<String, JsError> {
+        json(
+            &self
+                .reader
+                .stat_at(path, at, v.as_deref(), now)
+                .map_err(throw)?,
+        )
+    }
+
+    /// The viewer's `search` answer. `limit`, `sort` and `order` may be `undefined`. With `at`
+    /// (and `now`): what was there at that moment.
+    pub fn search(
+        &mut self,
+        q: &str,
+        limit: Option<f64>,
+        sort: Option<String>,
+        order: Option<String>,
+        at: Option<f64>,
+        now: Option<f64>,
+    ) -> Result<String, JsError> {
+        let (sort, order) = (sort.as_deref(), order.as_deref());
+        let found = match at {
+            Some(at) => self.reader.search_at(q, limit, sort, order, at, now),
+            None => self.reader.search(q, limit, sort, order),
+        };
+        json(&found.map_err(throw)?)
+    }
+
+    /// The viewer's `versions` answer: `{"path", "now_ms", "from_ms", "deleted", "more",
+    /// "versions": [{"v", "current"?, "shown"?, "size", "mtime_ms", "written_ms"?,
+    /// "written_approx"?, "written_by", "until_ms"?, "by"?, "why"?, "restore"?}]}` — the file
+    /// as it is and its removed versions that are kept, newest first. `at`: the moment whose
+    /// version is marked `"shown"`. `now`: the caller's clock (this module reads none).
+    pub fn versions(&mut self, path: &str, at: Option<f64>, now: f64) -> Result<String, JsError> {
+        json(&self.reader.versions(path, at, Some(now)).map_err(throw)?)
+    }
+
+    /// The viewer's `deleted` answer: `{"path", "gone", "sort", "order", "total", "offset",
+    /// "entries", "restore"?, "as_it_was_ms"?}` — what was deleted from the folder `path` and
+    /// is kept, in pages like `list`. Throws `not-found` (no folder, and nothing kept under
+    /// the name).
+    pub fn deleted(
         &self,
         path: &str,
         sort: Option<String>,
         order: Option<String>,
         offset: Option<f64>,
         limit: Option<f64>,
+        now: f64,
     ) -> Result<String, JsError> {
-        let listed = self
-            .reader
-            .list(path, sort.as_deref(), order.as_deref(), offset, limit);
-        json(&listed.map_err(throw)?)
-    }
-
-    /// The viewer's `stat` answer: the entry at `path`, with its path. Throws `not-found`.
-    pub fn stat(&self, path: &str) -> Result<String, JsError> {
-        json(&self.reader.stat(path).map_err(throw)?)
-    }
-
-    /// The viewer's `search` answer. `limit`, `sort` and `order` may be `undefined`.
-    pub fn search(
-        &self,
-        q: &str,
-        limit: Option<f64>,
-        sort: Option<String>,
-        order: Option<String>,
-    ) -> Result<String, JsError> {
-        let found = self
-            .reader
-            .search(q, limit, sort.as_deref(), order.as_deref());
+        let found = self.reader.deleted(
+            path,
+            sort.as_deref(),
+            order.as_deref(),
+            offset,
+            limit,
+            Some(now),
+        );
         json(&found.map_err(throw)?)
+    }
+
+    /// The viewer's `timeline` answer: `{"now_ms", "from_ms", "devices", "moments": [[ms,
+    /// files, device, approx]]}`.
+    pub fn timeline(&mut self, now: f64) -> Result<String, JsError> {
+        json(&self.reader.timeline(Some(now)).map_err(throw)?)
     }
 
     /// The ticket of one file: `{"v": 1, "name", "size", "file_id", "blob_name", "off", "clen",
     /// "chunk_log2", "key", "header"}` — the key of that one file's stream and where its
-    /// ciphertext is. For the Service Worker, over the ticket port; never for the page. Throws
-    /// `not-found`, `not-a-file`, `corrupt` (the index entry contradicts itself), `needs-newer`.
-    pub fn ticket(&self, path: &str) -> Result<String, JsError> {
-        json(&self.reader.ticket(path).map_err(throw)?)
+    /// ciphertext is. For the Service Worker, over the ticket port; never for the page. With
+    /// `v` (a version id, and `now`): the ticket of that version of the file, while it is
+    /// kept. Throws `not-found`, `not-a-file`, `corrupt` (the index entry contradicts itself),
+    /// `needs-newer`.
+    pub fn ticket(
+        &self,
+        path: &str,
+        v: Option<String>,
+        now: Option<f64>,
+    ) -> Result<String, JsError> {
+        json(
+            &self
+                .reader
+                .ticket_of(path, v.as_deref(), now)
+                .map_err(throw)?,
+        )
     }
 }
 

@@ -107,7 +107,12 @@
    * passes; `hooks.failed(error)`: a call failed with a code the shell has to act on.
    */
   function createProvider(vault, hooks) {
-    /** One id per path and unlock: 128 random bits. The Service Worker knows files by these. */
+    /**
+     * One id per file and unlock: 128 random bits. The Service Worker knows files by these.
+     * An earlier version of a file (the time machine) is a file of its own here: `ids` is
+     * keyed by the path, or by path, NUL and version id — no path holds a NUL — and `paths`
+     * gives `{ path, v }` back for an id.
+     */
     const ids = new Map();
     const paths = new Map();
     const controller = () => navigator.serviceWorker.controller;
@@ -125,23 +130,24 @@
       if (data.type !== 'need-ticket') return;
       // The Service Worker has no ticket for an id: it was restarted, or the browser asked
       // for the address before the ticket arrived. Only an id of this unlock is answered.
-      const path = paths.get(data.id);
-      if (!path) return;
+      const file = paths.get(data.id);
+      if (!file) return;
       if (!data.port) openChannel();
-      vault.send('issue', { id: data.id, path });
+      vault.send('issue', { id: data.id, path: file.path, v: file.v });
     }
     navigator.serviceWorker.addEventListener('message', onServiceWorker);
     navigator.serviceWorker.addEventListener('controllerchange', openChannel);
     openChannel();
 
-    function idOf(path) {
-      let id = ids.get(path);
+    function idOf(path, v) {
+      const name = v ? `${path}\0${v}` : path;
+      let id = ids.get(name);
       if (!id) {
         id = id22();
-        ids.set(path, id);
-        paths.set(id, path);
+        ids.set(name, id);
+        paths.set(id, { path, v: v || null });
       }
-      vault.send('issue', { id, path });
+      vault.send('issue', { id, path, v: v || null });
       return id;
     }
 
@@ -154,8 +160,12 @@
           if (hooks && hooks.failed) hooks.failed(error);
           throw new Error(error.message);
         }
-        // What the page fetches a file by: an opaque id, never its name.
-        if (name === 'stat' && value && !value.dir && typeof value.path === 'string') value.id = idOf(value.path);
+        // What the page fetches a file by: an opaque id, never its name. A `stat` of an
+        // earlier moment or of one version says which version it shows (`v`): its id is that
+        // version's, and stays that version's whatever becomes of the file.
+        if (name === 'stat' && value && !value.dir && typeof value.path === 'string') {
+          value.id = idOf(value.path, typeof value.v === 'string' ? value.v : null);
+        }
         if ((name === 'info' || name === 'refresh') && hooks && hooks.info) hooks.info(value);
         return value;
       },

@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::ops::Bound;
 
 use crate::consts::HISTORY_KEEP_MS;
 use crate::error::{FormatError, IndexError, StateError};
@@ -78,6 +79,22 @@ pub struct MemIndex {
     vault_name: String,
 }
 
+/// A head as the borrowing accessors yield it: `(path, stamp, entry, origin)`.
+pub type HeadRef<'a> = (&'a str, &'a Stamp, &'a Entry, Option<&'a Stamp>);
+/// A removed version likewise: `(path, stamp, entry, removed_ms, by)`.
+pub type RemovedRef<'a> = (&'a str, &'a Stamp, &'a Entry, u64, &'a Stamp);
+
+/// The keys of the paths `p` with `from <= p < hi` (`None`: no upper bound). An empty range
+/// when `hi <= from`.
+fn paths_between(from: &str, hi: Option<&str>) -> (Bound<VersionKey>, Bound<VersionKey>) {
+    let first = |path: &str| (path.to_owned(), STAMP_MIN, [0; 32]);
+    let end = match hi {
+        Some(hi) => Bound::Excluded(first(hi.max(from))),
+        None => Bound::Unbounded,
+    };
+    (Bound::Included(first(from)), end)
+}
+
 fn path_range(path: &str) -> std::ops::RangeInclusive<VersionKey> {
     (path.to_owned(), STAMP_MIN, [0; 32])..=(path.to_owned(), STAMP_MAX, [0xff; 32])
 }
@@ -121,6 +138,76 @@ impl MemIndex {
                 },
             )
             .collect()
+    }
+
+    /// Every head by `(path, stamp, entry.hash)` — the last head of a path is its winner — as
+    /// `(path, stamp, entry, origin)`. Borrows: nothing is copied.
+    pub fn heads_iter(&self) -> impl Iterator<Item = HeadRef<'_>> {
+        self.heads
+            .iter()
+            .map(|((path, stamp, _), (entry, origin))| {
+                (path.as_str(), stamp, entry, origin.as_ref())
+            })
+    }
+
+    /// The heads of the paths `p` with `from <= p` and `p < hi` (`None`: no bound), in order.
+    pub fn heads_range<'a>(
+        &'a self,
+        from: &str,
+        hi: Option<&str>,
+    ) -> impl Iterator<Item = HeadRef<'a>> + use<'a> {
+        self.heads
+            .range(paths_between(from, hi))
+            .map(|((path, stamp, _), (entry, origin))| {
+                (path.as_str(), stamp, entry, origin.as_ref())
+            })
+    }
+
+    /// Every removed version by `(path, stamp, entry.hash)`, as
+    /// `(path, stamp, entry, removed_ms, by)`. Borrows.
+    pub fn removed_iter(&self) -> impl Iterator<Item = RemovedRef<'_>> {
+        self.removed
+            .iter()
+            .map(|((path, stamp, _), (entry, ms, by))| (path.as_str(), stamp, entry, *ms, by))
+    }
+
+    /// The removed versions of the paths `p` with `from <= p` and `p < hi`, in order.
+    pub fn removed_range<'a>(
+        &'a self,
+        from: &str,
+        hi: Option<&str>,
+    ) -> impl Iterator<Item = RemovedRef<'a>> + use<'a> {
+        self.removed
+            .range(paths_between(from, hi))
+            .map(|((path, stamp, _), (entry, ms, by))| (path.as_str(), stamp, entry, *ms, by))
+    }
+
+    pub fn blob(&self, id: &BlobId) -> Option<&BlobRec> {
+        self.blobs.get(id)
+    }
+
+    /// The entry of the version `(path, stamp, hash)`: a head, or a removed version.
+    pub fn version(&self, path: &str, stamp: &Stamp, hash: &[u8; 32]) -> Option<&Entry> {
+        let key = (path.to_owned(), *stamp, *hash);
+        match self.heads.get(&key) {
+            Some((entry, _)) => Some(entry),
+            None => self.removed.get(&key).map(|(entry, _, _)| entry),
+        }
+    }
+
+    pub fn head_count(&self) -> usize {
+        self.heads.len()
+    }
+
+    pub fn device_name(&self, id: &DeviceId) -> Option<&str> {
+        self.devices.get(id).map(|(name, _)| name.as_str())
+    }
+
+    /// `id → name` of every device, by id.
+    pub fn device_names(&self) -> impl Iterator<Item = (&DeviceId, &str)> {
+        self.devices
+            .iter()
+            .map(|(id, (name, _))| (id, name.as_str()))
     }
 
     /// Sorted by id.

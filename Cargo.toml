@@ -1,6 +1,6 @@
 [package]
 name = "gclone"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Client-side encrypted, rsync-style sync to Google Drive"
