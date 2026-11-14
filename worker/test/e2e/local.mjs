@@ -283,9 +283,10 @@ async function timeMachineLocal(browser, engine, label) {
       await small.waitForSelector('#rows .row');
       await timeMachinePhone(small, label);
     } finally {
+      // The page goes first: one that outlives its server reports a refused connection.
+      await phone.close();
       await second.stop();
     }
-    await phone.close();
     // (The refused POSTs above are the browser's to remark on; Firefox's PDF viewer has its own.)
     assert.deepEqual(problems.filter((line) => !/Layout was forced before the page was fully loaded|405|Method Not Allowed/.test(line)), [], `${label}: console`);
     console.log(`${label}: the time machine in the local viewer: versions, deleted files, earlier moments, the copied commands, keyboard, phone; places with their moment in history.state`);

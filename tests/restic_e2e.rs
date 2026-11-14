@@ -2067,6 +2067,10 @@ async fn restic_and_gclone_are_signalled_together() {
 
     let mut held = Held::start(&r, &d, &via, &on);
     assert_eq!(on.live("locks").len(), 1);
+    // The lock is on Drive before restic has its answer. A restic signalled between gclone's
+    // commit and that answer gives up on a lock that stays (nobody can tell whether it read
+    // the answer); that is not what this test is about, so restic gets time to read it.
+    std::thread::sleep(Duration::from_secs(2));
     let gclone: u32 = std::fs::read_to_string(&pid_file)
         .unwrap()
         .trim()
