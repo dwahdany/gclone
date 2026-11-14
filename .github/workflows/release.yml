@@ -10,7 +10,7 @@ name: Release
 # access - until the owner runs scripts/release-sign-macos.sh <tag> on a Mac: that script verifies every asset of the
 # draft against its attestation, adds gclone-aarch64-apple-darwin-signed.tar.gz (the attested macOS binary with a
 # Developer ID signature, proven identical apart from the signature), extends SHA256SUMS, and publishes. The signing
-# identity never leaves that Mac and no secret of it is known to GitHub (docs/SPEC.md §17.28, README "Publishing a release").
+# identity never leaves that Mac and no secret of it is known to GitHub (docs/SPEC.md §17.28, DEVELOPMENT.md "Publishing a release").
 # Immutable releases must be switched on for the repository (Settings → General → Releases) BEFORE the tag is
 # pushed: a published release then cannot have its files replaced. The script refuses to run where they are off.
 #

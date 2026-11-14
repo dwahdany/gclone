@@ -81,7 +81,7 @@ fn caveat(purged: bool, left: Option<(&[String], &[String])>) -> String {
          whoever holds an old keyfile with its passphrase — or a copy of a device's \
          secrets.json — can still decrypt the vault, including what is uploaded from now on. \
          There is no re-keying yet; see \"If a passphrase or a device's key file leaked\" in \
-         the README."
+         docs/SECURITY.md."
     )
 }
 

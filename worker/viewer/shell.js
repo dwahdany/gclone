@@ -253,7 +253,7 @@
     // served this origin before left in the browser (a worker for `/callback` alone would
     // take the way back from Google). It is removed whenever this page gets to run. (A foreign
     // worker for the whole origin answers `/` itself, and this page never runs: that takes
-    // clearing the site's data by hand — README, "After a change of hands".)
+    // clearing the site's data by hand — docs/SECURITY.md, "After a change of hands".)
     try {
       for (const other of await sw.getRegistrations()) {
         const worker = other.active || other.waiting || other.installing;

@@ -223,7 +223,7 @@ async function main() {
 
     // The script of a Service Worker that is not the viewer's — a registration that whoever served this origin before
     // left in a browser, asking for its update: the Worker's answer tells the browser to drop this site's data
-    // (README, "After a change of hands"). The asset layer says nothing of the kind: `/sw.js` is the viewer's own, and
+    // (docs/SECURITY.md, "After a change of hands"). The asset layer says nothing of the kind: `/sw.js` is the viewer's own, and
     // a script someone planted under /a/ is out of this switch's reach.
     const asScript = { "service-worker": "script", "sec-fetch-dest": "serviceworker", "sec-fetch-site": "same-origin" };
     for (const path of ["/planted-sw.js", "/v/sw.js", "/SW.js"]) {
