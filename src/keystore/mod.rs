@@ -7,20 +7,33 @@
 //! - `enclave`: `secrets.sealed`, the same document encrypted to a Secure Enclave key of this
 //!   Mac. A copy of the file is useless on any other machine.
 //!
+//! Since 0.5.1 (§17.30) the sealed store is what a Mac uses unless its owner said otherwise:
+//! a login seals its secrets from the start, and a device that is on the plain file is moved
+//! by itself once the trial has passed ([`automatic_move`]). `gclone keystore use file` and
+//! `GCLONE_KEYSTORE_TRIAL=0` switch that off — the variable for the whole device, through a
+//! marker that a run with it leaves ([`mark_trial_off`]); Linux has no sealed store.
+//!
 //! Rules that hold everywhere in this module:
 //!
 //! 1. Reading finds the secrets wherever they are ([`LayeredStore::resolve`]).
-//! 2. No automatic step creates, replaces or removes either file. Only `login` (`save`),
-//!    `logout` (`delete`) and `gclone keystore use` (the two moves) do, each under the
-//!    exclusive secrets lock.
-//! 3. `secrets.sealed` is never written unless it was opened in the same process (or is made
-//!    from a `secrets.json` whose keys were just proven), and never removed unless
+//! 2. Only four things create, replace or remove either file, each under the exclusive
+//!    secrets lock: `login` (`save`, and the move at its end), `logout` (`delete`), `gclone
+//!    keystore use` (the two moves) and the automatic move towards `secrets.sealed`. Nothing
+//!    ever moves secrets to the plain file but `gclone keystore use file` and a save that
+//!    could not seal.
+//! 3. `secrets.sealed` is never written unless it was opened in the same process, or is made
+//!    from the exact bytes of a `secrets.json` that holds keys and is read back, through the
+//!    enclave, to those bytes before that file is removed; and it is never removed unless
 //!    `secrets.json` holds the keys — or the device is being signed out. Sealed keys are
 //!    never replaced by a document without keys: a login that has no key (yet) goes to
 //!    `secrets.json`, beside the sealed file.
 //! 4. Nothing here can show a dialog: there is no Keychain call (see `macos.rs`).
-//! 5. The trial (`trial.rs`) never influences what `load` returns, and never holds a command
-//!    up for longer than `trial::STEP_WAIT`.
+//! 5. The trial (`trial.rs`) never influences what `load` returns, and neither does the
+//!    automatic move; a command waits for the trial's step for at most `trial::STEP_WAIT`
+//!    and for a move it started for at most [`AUTO_MOVE_WAIT`]. No call into the Secure
+//!    Enclave is waited for without a bound, whoever makes it (`seal::Bounded`).
+//! 6. The automatic move never happens from a process that did not open the trial's test
+//!    value itself, with the very key it then seals to.
 
 use std::collections::HashSet;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -59,6 +72,12 @@ pub(crate) const WRITER_WAIT: Duration = Duration::from_secs(5);
 const READER_WAIT: Duration = Duration::from_secs(2);
 /// The pause before the one second try of a stored key that failed while a new key works.
 const STORED_KEY_RETRY_PAUSE: Duration = Duration::from_millis(300);
+/// How long a command waits for an automatic move that it started ([`automatic_move`]): the
+/// move makes two calls into the Secure Enclave and a handful of small writes, some tens of
+/// milliseconds together. A move that takes longer goes on on its own thread while the
+/// command does its work — every point of it is a safe place to be cut off — and the trial's
+/// record gets a failure, so that it is not tried again run after run.
+pub(crate) const AUTO_MOVE_WAIT: Duration = Duration::from_secs(10);
 
 /// The standard first line of a cache directory tag (https://bford.info/cachedir/).
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
@@ -140,9 +159,26 @@ fn pick_sealer() -> SealerChoice {
 
 /// The sealer of this process: the Secure Enclave in a release build on macOS; in a debug
 /// build only what `GCLONE_TEST_KEYSTORE_SEALER` names (§7.1).
+///
+/// Whatever it is, its calls into the hardware are bounded (`seal::Bounded`, rule 5): ten
+/// seconds each, and after one that did not come back every later one fails at once.
 pub(crate) fn sealer() -> SealerChoice {
     static SEALER: OnceLock<SealerChoice> = OnceLock::new();
-    SEALER.get_or_init(pick_sealer).clone()
+    SEALER
+        .get_or_init(|| {
+            pick_sealer()
+                .map(|inner| Arc::new(seal::Bounded::new(inner, call_wait())) as Arc<dyn Sealer>)
+        })
+        .clone()
+}
+
+/// `seal::CALL_WAIT`; debug builds honour `GCLONE_TEST_KEYSTORE_WAIT_MS` (§7.1), so that a
+/// test of a call that does not return need not wait ten seconds for every command.
+fn call_wait() -> Duration {
+    crate::cli::test_env("GCLONE_TEST_KEYSTORE_WAIT_MS")
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(seal::CALL_WAIT)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -317,6 +353,52 @@ fn write_choice(paths: &Paths, store: &str, point: &str) -> Result<(), ConfigErr
 }
 
 // ---------------------------------------------------------------------------------------------
+// keystore-trial.off: GCLONE_KEYSTORE_TRIAL=0, for the whole device
+// ---------------------------------------------------------------------------------------------
+
+/// A run with `GCLONE_KEYSTORE_TRIAL=0` used this device's plain `secrets.json` and left its
+/// marker ([`mark_trial_off`]).
+pub(crate) fn trial_off_marked(paths: &Paths) -> bool {
+    std::fs::symlink_metadata(paths.trial_off_file()).is_ok()
+}
+
+/// `GCLONE_KEYSTORE_TRIAL=0` in a run's environment says "this run must not come to depend
+/// on the Secure Enclave" — a scheduler's job in a session nobody tried, say. The variable
+/// alone could not keep that promise: it made the run take no step of the trial, so the one
+/// session the owner was unsure about was the one the test never saw, any other run passed
+/// the bar, removed `secrets.json`, and the job needed the enclave after all (§17.30). So a
+/// run with the variable that is answered from a `secrets.json` with keys leaves this empty
+/// marker (created once, `O_EXCL`), and while it is there nothing is tested, sealed or moved
+/// on this device by itself — in any run. `gclone keystore use enclave` and `gclone keystore
+/// check --new-trial` take it away; a run with the variable puts it back.
+///
+/// `GCLONE_TEST_KEYSTORE_NO_MARKER=1` (debug builds, §7.1) keeps a run from leaving it: the
+/// tests' way to look at a device, or to prepare one, without changing what happens to it.
+fn mark_trial_off(paths: &Paths) {
+    if trial_off_marked(paths)
+        || crate::cli::test_env("GCLONE_TEST_KEYSTORE_NO_MARKER").as_deref() == Some("1")
+    {
+        return;
+    }
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(paths.trial_off_file());
+    match made {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => tracing::debug!("cannot record that GCLONE_KEYSTORE_TRIAL=0 is used here: {e}"),
+    }
+}
+
+/// The owner asked for the sealed store, or for a new trial: the marker goes.
+pub(crate) fn clear_trial_off(paths: &Paths) {
+    let _ = std::fs::remove_file(paths.trial_off_file());
+}
+
+// ---------------------------------------------------------------------------------------------
 // secrets.sealed: the envelope
 // ---------------------------------------------------------------------------------------------
 
@@ -430,6 +512,11 @@ pub struct LayeredStore {
     sealer: SealerChoice,
     /// The trial and the once-only notes run from `load` (never in unit tests unless asked).
     side_effects: bool,
+    /// The sealed store is the default (§17.30): a login with no choice on file seals, and a
+    /// passed trial is followed by the move. Off in unit tests unless asked
+    /// ([`LayeredStore::sealed_by_default`]), so that a test of another module that saves
+    /// secrets finds them in `secrets.json`.
+    automatic: bool,
 }
 
 /// State roots whose once-per-process work after a load is done.
@@ -451,7 +538,77 @@ impl LayeredStore {
             },
             sealer,
             side_effects,
+            automatic: !cfg!(test),
         }
+    }
+
+    /// This store with the default of §17.30 switched on or off (unit tests).
+    #[cfg(test)]
+    pub(crate) fn sealed_by_default(mut self, on: bool) -> Self {
+        self.automatic = on;
+        self
+    }
+
+    /// This store for a load that takes the trial's step and does not move the secrets
+    /// afterwards: `gclone keystore use enclave`, whose own move — after the key was proven
+    /// against the vault and the passphrase against a keyfile — is the one that must happen.
+    pub(crate) fn without_unasked_move(mut self) -> Self {
+        self.automatic = false;
+        self
+    }
+
+    /// A `secrets.sealed` lies beside the `secrets.json` this device is working from, and it
+    /// is not the unfinished work of a move to the running trial's key (which the next run
+    /// finishes): it is sealed to another key, cannot be read, or there is no running trial.
+    /// That is what an older gclone leaves that signed in on a sealed device — its
+    /// `secrets.json` beside the store it cannot read — and what an interrupted `keystore
+    /// use` leaves. While it lies there nothing is tested and nothing is moved by itself:
+    /// moving again removed the file the older gclone needs, every time its owner had just
+    /// repaired it (§17.30). Read off the two files; no call into the enclave.
+    pub(crate) fn sealed_beside_is_foreign(&self) -> bool {
+        let sealed_to = match self.read_sealed() {
+            Ok(None) => return false,
+            Ok(Some(bytes)) => parse_envelope(&bytes).ok().map(|envelope| envelope.public),
+            Err(_) => None,
+        };
+        match (sealed_to, trial::load(&self.paths)) {
+            (Some(sealed_to), trial::Stored::Record(record)) => {
+                !(record.key.is_some() && record.public.as_deref() == Some(sealed_to.as_str()))
+            }
+            _ => true,
+        }
+    }
+
+    /// The sealer for secrets that nobody asked to seal (§17.30), or `None`: the owner chose
+    /// the plain file, `keystore.json` cannot be read, `GCLONE_KEYSTORE_TRIAL=0` is set — here,
+    /// or in a run that left its marker —, or this process has no sealer. The explicit choice
+    /// `enclave` counts whatever the environment says — it is the owner's command.
+    fn sealer_by_default(&self) -> Option<Arc<dyn Sealer>> {
+        let sealer = self.sealer.as_ref().ok()?;
+        match read_choice(&self.paths) {
+            Choice::Enclave => Some(sealer.clone()),
+            Choice::Unset
+                if self.automatic
+                    && !trial::disabled_by_env()
+                    && !trial_off_marked(&self.paths) =>
+            {
+                Some(sealer.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The sealer for what happens without any command of the owner's — the trial's step
+    /// and the move after it — or `None`: the owner chose the plain file, `keystore.json`
+    /// cannot be read, `GCLONE_KEYSTORE_TRIAL=0` is set here or left its marker (which also
+    /// stops a device that chose `enclave` from being moved by itself), or this process has
+    /// no sealer.
+    fn sealer_for_unasked_steps(&self) -> Option<Arc<dyn Sealer>> {
+        if trial::disabled_by_env() || trial_off_marked(&self.paths) {
+            return None;
+        }
+        let sealer = self.sealer.as_ref().ok()?;
+        matches!(read_choice(&self.paths), Choice::Unset | Choice::Enclave).then(|| sealer.clone())
     }
 
     pub(crate) fn sealer(&self) -> &SealerChoice {
@@ -542,7 +699,7 @@ impl LayeredStore {
             Unopenable::NoSealer(NoSealer::NotMac) => {
                 "This device's login and key are in secrets.sealed, sealed by the Secure \
                  Enclave of a Mac; this machine cannot open that file. Run `gclone login`; it \
-                 asks for the passphrase."
+                 asks for the passphrase and connects this device again."
                     .into()
             }
             Unopenable::NoSealer(NoSealer::DebugBuild) => format!(
@@ -557,17 +714,22 @@ impl LayeredStore {
                 };
                 match fresh {
                     Ok(()) => format!(
-                        "This device's key was sealed for another Mac, or this Mac's Secure \
-                         Enclave was reset: the stored key cannot be used any more ({e}; tried \
-                         twice, and a new key works). Run `gclone login`; it asks for the \
-                         passphrase. The sealed file is kept until that login has the key \
-                         again."
+                        "This Mac's Secure Enclave cannot open this device's sealed key \
+                         (secrets.sealed): it was sealed for another Mac — the files came here \
+                         by a migration or from a backup — or this Mac's Secure Enclave was \
+                         reset, and the stored key cannot be used any more ({e}; tried twice, \
+                         and a new key works). Run `gclone login`; it asks for the passphrase \
+                         (for a vault on Google Drive it signs in to Google first) and \
+                         connects this device again. The sealed file is kept until that login \
+                         has the key again."
                     ),
                     Err(_) => format!(
                         "The Secure Enclave cannot be used in this session ({e}). Run gclone \
                          from a terminal or a LaunchAgent of the logged-in user; `gclone \
                          keystore check` shows what this session can do. Do not sign in again: \
-                         the stored key is probably intact."
+                         the stored key is probably intact. If gclone has to run in this \
+                         session, `gclone keystore use file` — from a session where it works — \
+                         moves the secrets back to the plain file, which every session reads."
                     ),
                 }
             }
@@ -671,8 +833,9 @@ impl LayeredStore {
     }
 
     /// What `load` does besides answering, once per process and state root: the backup
-    /// exclusion and, for a device on the plain file, one step of the trial. Nothing here can
-    /// fail the load.
+    /// exclusion; for a device on the plain file one step of the trial and, when the trial
+    /// has passed, the move into the sealed store (§17.30); and the note about that move, if
+    /// one is owed. Nothing here can fail the load or change what it returns.
     fn after_load(&self, loaded: &Loaded) {
         if !self.side_effects {
             return;
@@ -685,15 +848,80 @@ impl LayeredStore {
             return;
         }
         protect_state_root(&self.paths, true);
-        let on_plain = loaded.source == Source::Plain
-            && std::fs::symlink_metadata(self.paths.sealed_file()).is_err();
-        if on_plain
-            && !trial::disabled_by_env()
+        let keyed_plain = loaded.source == Source::Plain && !loaded.secrets.keys.is_empty();
+        // This run must not come to depend on the enclave, its environment says: then no
+        // other run makes it so either.
+        if keyed_plain
+            && trial::disabled_by_env()
+            && self.sealer.is_ok()
             && matches!(read_choice(&self.paths), Choice::Unset | Choice::Enclave)
-            && let Ok(sealer) = &self.sealer
         {
-            // On a thread of its own, awaited for a bounded time: rule 5.
-            trial::step_bounded(&self.paths, sealer.clone());
+            mark_trial_off(&self.paths);
+        }
+        if loaded.source == Source::Plain
+            && let Some(sealer) = self.sealer_for_unasked_steps()
+            && !self.sealed_beside_is_foreign()
+        {
+            // On a thread of its own, awaited for a bounded time: rule 5. A step that did not
+            // come back is not followed by a move.
+            let stepped = trial::step_bounded(&self.paths, sealer.clone());
+            if stepped && self.automatic && keyed_plain {
+                let store = LayeredStore {
+                    paths: self.paths.clone(),
+                    plain: FileSecretStore {
+                        path: self.paths.secrets_file(),
+                    },
+                    sealer: Ok(sealer),
+                    side_effects: false,
+                    automatic: true,
+                };
+                let outcome =
+                    trial::within(&self.paths, AUTO_MOVE_WAIT, move || automatic_move(&store));
+                match outcome {
+                    Some(AutoMove::Moved | AutoMove::NotDue | AutoMove::Busy) | None => {}
+                    Some(AutoMove::Kept(why)) => {
+                        tracing::debug!("the secrets were not moved into the sealed store: {why}");
+                    }
+                }
+            }
+        }
+        if loaded.source == Source::Sealed && !trial::disabled_by_env() {
+            self.end_trial_of_sealing_key();
+        }
+        move_note(&self.paths);
+    }
+
+    /// A move that was cut off between the removal of the plain file and the end of the
+    /// trial's record left a record that still looks like a running trial — of the very key
+    /// the secrets are sealed to. The first load afterwards ends it. (Read off the two
+    /// files; no call into the enclave.)
+    fn end_trial_of_sealing_key(&self) {
+        if std::fs::symlink_metadata(self.paths.trial_file()).is_err() {
+            return;
+        }
+        let trial::Stored::Record(record) = trial::load(&self.paths) else {
+            return;
+        };
+        if record.key.is_none() || record.public.is_none() {
+            return;
+        }
+        let sealed_to = self
+            .read_sealed()
+            .ok()
+            .flatten()
+            .and_then(|bytes| parse_envelope(&bytes).ok())
+            .map(|envelope| envelope.public);
+        if sealed_to == record.public {
+            let public = record.public;
+            trial::update(&self.paths, |now| {
+                // Only the record that was looked at: another process may have started a
+                // new trial in between.
+                if now.public != public || now.key.is_none() {
+                    return false;
+                }
+                *now = std::mem::take(now).moved(trial::clock_ms());
+                true
+            });
         }
     }
 
@@ -774,7 +1002,9 @@ impl LayeredStore {
         clean_leftovers(&self.paths)?;
 
         let plain_exists = std::fs::symlink_metadata(self.paths.secrets_file()).is_ok();
+        let chosen = read_choice(&self.paths) == Choice::Enclave;
         let mut to_sealed = None;
+        let mut new_store = false;
         if !plain_exists {
             match self.read_sealed()? {
                 // The sealed file is this device's store and opens here: the save stays in it.
@@ -803,20 +1033,26 @@ impl LayeredStore {
                     // one whose keys this save would drop: the save goes to secrets.json
                     // and the file stays as it is.
                 }
-                // A signed-out device whose owner chose the sealed store: a new key, if one
-                // can be made and used here.
+                // A signed-out device: the sealed store from the start (§17.30), unless the
+                // owner chose the plain file, the trial's record speaks against it or has not
+                // passed yet, or no key can be made and used here ([`Self::key_for_login`]).
                 None => {
-                    if read_choice(&self.paths) == Choice::Enclave
-                        && let Ok(sealer) = &self.sealer
-                    {
-                        match sealer.create() {
-                            Ok((blob, public)) => {
-                                to_sealed = Some((sealer.clone(), blob, public));
+                    // Nothing of an earlier login is left here, so no note about one is owed
+                    // either: an older gclone's `logout` leaves the marker of a move behind,
+                    // and the note then said "gclone tested it over several days" about a
+                    // store that this login is only now beginning.
+                    let _ = std::fs::remove_file(self.paths.move_note_file());
+                    if let Some(sealer) = self.sealer_by_default() {
+                        let undecided = trial_undecided(&self.paths);
+                        match self.key_for_login(&sealer, chosen, undecided) {
+                            LoginKey::Key(key) => {
+                                to_sealed = Some((sealer, key.blob, key.public));
+                                new_store = true;
                             }
-                            Err(e) => tracing::warn!(
-                                "the sealed key store cannot be used here ({e}); this login \
-                                 goes to secrets.json"
-                            ),
+                            LoginKey::Held(why) => {
+                                tracing::debug!("this login goes to secrets.json: {why}");
+                            }
+                            LoginKey::Failed(e) => self.could_not_seal(chosen, &e),
                         }
                     }
                 }
@@ -828,12 +1064,21 @@ impl LayeredStore {
                 .and_then(|envelope| self.write_sealed(&envelope, "save-sealed"));
             match written {
                 Ok(()) => {
+                    // A sealed store that begins here ends a trial that was running — its
+                    // record says whose key took the secrets (`Report`) — and takes the
+                    // record of a trial that ended earlier, for another key, away.
+                    if new_store {
+                        trial::note_sealed(&self.paths, &util::b64url(&public));
+                    }
                     drop(lock);
                     protect_state_root(&self.paths, held_login);
                     return Ok(());
                 }
                 // Nothing was renamed into place, or what was does not read back: the
                 // secrets go to the plain file, which readers prefer when it holds keys.
+                Err(e) if new_store => {
+                    self.could_not_seal(chosen, &seal::SealError(e.to_string()));
+                }
                 Err(e) => tracing::warn!(
                     "the secrets could not be sealed ({e}); they were saved to secrets.json \
                      instead"
@@ -852,12 +1097,167 @@ impl LayeredStore {
                     .is_ok_and(|opened| same_keys(&opened.secrets, s));
             if obsolete {
                 self.remove_sealed()?;
+                // The device is on the plain file again: a note that says "your secrets are
+                // in secrets.sealed now" is owed to nobody (a later move owes it anew).
+                let _ = std::fs::remove_file(self.paths.move_note_file());
             }
         }
         drop(lock);
         protect_state_root(&self.paths, held_login);
         Ok(())
     }
+}
+
+/// The key a login seals its secrets to, or why it does not seal.
+enum LoginKey {
+    Key(PickedKey),
+    /// The login goes to `secrets.json` and nothing is wrong: the trial has the word.
+    Held(&'static str),
+    /// No key could be made and used here.
+    Failed(SealError),
+}
+
+/// A trial is running on this device and has not passed. Looked at by `gclone login` before
+/// it does anything else: a trial that this login's own loads start does not count. Nor does
+/// a record beside a device whose secrets are in the sealed store alone — there is no trial
+/// there, whatever a record says that an older gclone or an interrupted move left.
+pub(crate) fn trial_undecided(paths: &Paths) -> bool {
+    let sealed_alone = std::fs::symlink_metadata(paths.secrets_file()).is_err()
+        && std::fs::symlink_metadata(paths.sealed_file()).is_ok();
+    if sealed_alone {
+        return false;
+    }
+    match trial::load(paths) {
+        trial::Stored::Record(record) => {
+            let summary = record.summary();
+            summary.running && !summary.complete
+        }
+        _ => false,
+    }
+}
+
+impl LayeredStore {
+    /// The trial's record speaks against sealing secrets that nobody asked to seal: a
+    /// failure is on it, in some session of this Mac.
+    fn trial_speaks_against(&self) -> bool {
+        matches!(trial::load(&self.paths), trial::Stored::Record(record) if record.speaks_against())
+    }
+
+    /// The key for a login's secrets, where the sealed store is this device's default — the
+    /// bar of §8.2 as a login meets it:
+    ///
+    /// - the owner chose `enclave`: a key, whatever the trial's record says;
+    /// - the record speaks against it (a failure, a session that could not make a key): no;
+    /// - **a trial was running when the login began and had not passed** (`undecided`): no.
+    ///   The device was working from `secrets.json` a `gclone logout` ago, with whatever
+    ///   runs unattended on it, and the trial had not yet seen a restart or all of that:
+    ///   signing out and in again does not jump the bar, any more than signing in again
+    ///   without the `logout` does. The login goes to `secrets.json` and the trial goes on;
+    /// - the trial has passed and its move has not happened yet: the trial's key, if its
+    ///   test value opens in this process — otherwise no, as for the automatic move;
+    /// - otherwise — no record, or one that ended with a move: this is a new device, or one
+    ///   that depended on the enclave already — a key made now, which sealed a value and
+    ///   opened it in this process.
+    fn key_for_login(&self, sealer: &Arc<dyn Sealer>, chosen: bool, undecided: bool) -> LoginKey {
+        let pick = || pick_key_bounded(&self.paths, sealer);
+        if chosen {
+            return pick().map_or_else(LoginKey::Failed, LoginKey::Key);
+        }
+        if self.trial_speaks_against() {
+            return LoginKey::Held("the Secure Enclave trial's record holds a failure");
+        }
+        if undecided {
+            return LoginKey::Held(
+                "the Secure Enclave trial of this device has not passed yet, and it decides",
+            );
+        }
+        let passed = matches!(
+            trial::load(&self.paths),
+            trial::Stored::Record(record) if record.summary().complete
+        );
+        match pick() {
+            Ok(key) if passed && !key.from_trial => LoginKey::Held(
+                "the Secure Enclave trial has passed, and its test value did not open in this \
+                 process",
+            ),
+            Ok(key) => LoginKey::Key(key),
+            Err(e) => LoginKey::Failed(e),
+        }
+    }
+
+    /// A login that should have been sealed goes to the plain file. Where the owner chose the
+    /// sealed store that is a warning; where it is only the default it is silent, and the
+    /// reason is written down for `gclone status` and `gclone keystore` (§17.30).
+    fn could_not_seal(&self, chosen: bool, error: &seal::SealError) {
+        if chosen {
+            tracing::warn!(
+                "the sealed key store cannot be used here ({error}); this login goes to \
+                 secrets.json"
+            );
+        } else {
+            tracing::debug!(
+                "the sealed key store cannot be used here ({error}); this login goes to \
+                 secrets.json"
+            );
+        }
+        if !trial::disabled_by_env() {
+            trial::note_cannot_seal(&self.paths, error);
+        }
+    }
+}
+
+/// A key for this device's secrets: the trial's own key if its test value opens right now —
+/// then the trial's record belongs to the very key the device will depend on — else a new
+/// key, which sealed a value and opened it again in this process.
+pub(crate) struct PickedKey {
+    pub blob: Zeroizing<Vec<u8>>,
+    pub public: Vec<u8>,
+    /// It is the trial's key.
+    pub from_trial: bool,
+}
+
+pub(crate) fn pick_key(paths: &Paths, sealer: &dyn Sealer) -> Result<PickedKey, SealError> {
+    if let trial::Stored::Record(record) = trial::load(paths)
+        && record.open_canary(sealer).is_ok()
+        && let Some((blob, public)) = record.key_for_secrets()
+    {
+        return Ok(PickedKey {
+            blob,
+            public,
+            from_trial: true,
+        });
+    }
+    let (blob, public) = sealer.create()?;
+    let value: [u8; 16] = util::random();
+    let sealed = sealer.seal(&public, &value)?;
+    let back = sealer.open(&blob, &public, &sealed)?;
+    if back.as_slice() != value {
+        return Err(SealError(
+            "a value sealed to the new key did not open to itself".into(),
+        ));
+    }
+    Ok(PickedKey {
+        blob,
+        public,
+        from_trial: false,
+    })
+}
+
+/// [`pick_key`] for a login, which is the first thing many a session asks of the Secure
+/// Enclave: on a thread of its own, awaited for at most `trial::STEP_WAIT`. A call that does
+/// not come back is "no key can be made here": the login goes to the plain file and says
+/// nothing (§17.30), instead of standing still with the secrets lock held.
+fn pick_key_bounded(paths: &Paths, sealer: &Arc<dyn Sealer>) -> Result<PickedKey, SealError> {
+    let (for_thread, sealer) = (paths.clone(), sealer.clone());
+    trial::within(paths, trial::STEP_WAIT, move || {
+        pick_key(&for_thread, sealer.as_ref())
+    })
+    .unwrap_or_else(|| {
+        Err(SealError(format!(
+            "the call into the Secure Enclave did not return within {} s",
+            trial::STEP_WAIT.as_secs()
+        )))
+    })
 }
 
 /// What a save knows about the secrets it replaces.
@@ -919,6 +1319,8 @@ impl SecretStore for LayeredStore {
         remove_if_present(&self.paths.secrets_file())?;
         stop("delete-plain-done");
         remove_if_present(&self.paths.sealed_file())?;
+        // A note about a move that is still owed has nothing left to be about.
+        let _ = std::fs::remove_file(self.paths.move_note_file());
         drop(lock);
         Ok(())
     }
@@ -1003,11 +1405,12 @@ pub(crate) fn protect_state_root(paths: &Paths, held_login: bool) {
 /// first run rewrote from the copy it had loaded — several unattended commands starting
 /// together lost the "owed" for good (the exclusion attribute was set by then, so the note
 /// never became due again).
+///
+/// It does not depend on the trial: `GCLONE_KEYSTORE_TRIAL=0` used to switch it off as well,
+/// and a device whose scheduler sets that never learned that its older backups hold the key
+/// (§17.30).
 #[cfg(target_os = "macos")]
 fn backup_note(paths: &Paths, due_now: bool) {
-    if trial::disabled_by_env() {
-        return;
-    }
     let marker = paths.backup_note_file();
     if can_show_notes() {
         // Whoever removes the marker shows what was owed: once, whatever runs beside this.
@@ -1045,16 +1448,16 @@ pub(crate) fn backup_excluded(paths: &Paths) -> Option<Result<bool, String>> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The moves of `gclone keystore use`
+// The moves: `gclone keystore use`, the end of a login, and the one that nobody asked for
 // ---------------------------------------------------------------------------------------------
 
 /// Why a move did not happen. Nothing was changed unless the text says otherwise.
 #[derive(Debug)]
 pub(crate) enum MoveError {
-    /// `secrets.json` is not what the command looked at before it asked its questions.
+    /// `secrets.json` is not what the caller looked at before it began.
     Changed,
-    /// `secrets.json` is gone and `secrets.sealed` opens here: another `gclone keystore use
-    /// enclave` finished the move while this one ran. Nothing was changed by this one.
+    /// `secrets.json` is gone and `secrets.sealed` opens here: another move into the sealed
+    /// store finished while this one ran. Nothing was changed by this one.
     AlreadySealed,
     /// Refused, with the text for the user.
     Refused(String),
@@ -1073,6 +1476,21 @@ impl From<std::io::Error> for MoveError {
     }
 }
 
+/// Who moves the secrets into the sealed store (§8.2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MoveBy {
+    /// `gclone keystore use enclave`: the owner's command, after the key was proven against
+    /// the vault and the passphrase against a keyfile. Waits for the lock, records the choice,
+    /// and replaces whatever `secrets.sealed` lies beside the plain file.
+    Command,
+    /// The end of a `gclone login` whose secrets ended in the plain file although the sealed
+    /// store is this device's default (§17.30). Waits for the lock; records no choice.
+    Login,
+    /// By itself, after a passed trial (§17.30): one try for the lock, no choice recorded,
+    /// and the note about the move is owed before the plain file goes.
+    Trial,
+}
+
 /// What an interrupted `login` or `keystore use` left beside the files they write: temp
 /// copies from before a rename. The caller holds the exclusive lock, so nobody is writing
 /// these files now. (The trial's record is written without the lock and is left alone.)
@@ -1087,28 +1505,39 @@ fn clean_leftovers(paths: &Paths) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `gclone keystore use enclave`, step 5: seals the exact bytes of `secrets.json` to the key
-/// (`blob`, `public`), verifies what was written through the normal load path, and only then
-/// removes the plain file. `expected`: the bytes of `secrets.json` the command proved against
-/// the vault. A failure before the removal leaves `secrets.json` in place and takes the
-/// sealed file of this run away again.
+/// The move into the sealed store, one sequence for every caller (`by`): seals the exact
+/// bytes of `secrets.json` to the key (`blob`, `public`), verifies what was written through
+/// the normal load path, and only then removes the plain file. `expected`: the bytes of
+/// `secrets.json` the caller looked at before it began (`gclone keystore use enclave` proved
+/// them against the vault). A failure before the removal leaves `secrets.json` in place and
+/// takes the sealed file of this run away again.
+///
+/// A move that nobody asked for ([`MoveBy::Login`], [`MoveBy::Trial`]) looks at the
+/// opt-outs again under the lock, and never writes over a `secrets.sealed` that it cannot
+/// open or that holds other keys than `secrets.json`: such a file may be the only copy of
+/// another state, and only the owner's command gives it up.
 pub(crate) fn move_to_enclave(
     store: &LayeredStore,
     expected: &[u8],
     blob: &[u8],
     public: &[u8],
+    by: MoveBy,
 ) -> Result<(), MoveError> {
     let paths = &store.paths;
     let sealer = store
         .sealer
         .clone()
         .map_err(|why| MoveError::Refused(why.text().to_string()))?;
-    let _lock = lock_exclusive(paths, WRITER_WAIT)?;
+    let wait = match by {
+        MoveBy::Command | MoveBy::Login => WRITER_WAIT,
+        MoveBy::Trial => Duration::ZERO,
+    };
+    let _lock = lock_exclusive(paths, wait)?;
     clean_leftovers(paths)?;
     // 5.1
     let Some(document) = store.read_plain_bytes()? else {
-        // No plain file any more. If the sealed file opens here, another run of this very
-        // command got there first: that is not "the login changed".
+        // No plain file any more. If the sealed file opens here, another move got there
+        // first: that is not "the login changed".
         return Err(match store.read_sealed()? {
             Some(bytes) if store.open_sealed(&bytes).is_ok() => MoveError::AlreadySealed,
             _ => MoveError::Changed,
@@ -1120,6 +1549,59 @@ pub(crate) fn move_to_enclave(
     let secrets: Secrets = parse_json("secrets.json", &document)?;
     if secrets.keys.is_empty() {
         return Err(MoveError::Changed);
+    }
+    if by != MoveBy::Command {
+        // The owner may have said no since the caller looked (`gclone keystore use file`
+        // writes its choice under this lock).
+        let wanted = match by {
+            MoveBy::Trial => store.sealer_for_unasked_steps().is_some(),
+            _ => store.sealer_by_default().is_some(),
+        };
+        if !wanted {
+            return Err(MoveError::Refused(
+                "the sealed store is not wanted on this device (`gclone keystore use file`, or \
+                 GCLONE_KEYSTORE_TRIAL=0)"
+                    .into(),
+            ));
+        }
+        if let Some(beside) = store.read_sealed()? {
+            match store.open_sealed(&beside) {
+                // The automatic move finishes only what it began itself: a sealed copy of
+                // the same keys under the very key it seals to. One under another key is the
+                // store of an earlier sealing with an older gclone's `secrets.json` beside
+                // it (or an interrupted command): removing that plain file again broke the
+                // older gclone every time its owner had signed in with it.
+                Ok(opened)
+                    if same_keys(&opened.secrets, &secrets)
+                        && by == MoveBy::Trial
+                        && opened.envelope.public != util::b64url(public) =>
+                {
+                    return Err(MoveError::Refused(
+                        "a secrets.sealed that is sealed to another key lies beside \
+                         secrets.json (an older gclone signed in here after the secrets were \
+                         sealed, or a `gclone keystore use` was interrupted); `gclone keystore \
+                         use enclave` or `gclone keystore use file` settles it"
+                            .into(),
+                    ));
+                }
+                Ok(opened) if same_keys(&opened.secrets, &secrets) => {}
+                Ok(_) => {
+                    return Err(MoveError::Refused(
+                        "a secrets.sealed with other keys lies beside secrets.json; `gclone \
+                         keystore use file` or `gclone keystore use enclave` settles it"
+                            .into(),
+                    ));
+                }
+                Err(why) => {
+                    return Err(MoveError::Refused(format!(
+                        "a secrets.sealed that does not open lies beside secrets.json ({}); \
+                         `gclone keystore use file --discard-sealed` or `gclone keystore use \
+                         enclave` settles it",
+                        why.brief()
+                    )));
+                }
+            }
+        }
     }
     // 5.2 – 5.4
     let sealed = (|| {
@@ -1144,20 +1626,219 @@ pub(crate) fn move_to_enclave(
              secrets.json is still this device's key store."
         )));
     }
-    // 5.5
-    write_choice(paths, STORE_ENCLAVE, "enclave-choice")?;
+    // 5.5: the choice is the owner's — only the command records one. The move that nobody
+    // asked for leaves its note owed instead, before the plain file goes: a run that is
+    // killed after this point is finished by the next one, and the note is still there. A
+    // note that cannot be recorded stops that move: without it nobody would ever be told
+    // that this device depends on this Mac's enclave and on the passphrase from now on.
+    match by {
+        MoveBy::Command => {
+            write_choice(paths, STORE_ENCLAVE, "enclave-choice")?;
+            // The owner's command is the answer to a run that asked for no trial …
+            clear_trial_off(paths);
+        }
+        MoveBy::Trial => {
+            if !owe_move_note(paths) {
+                let _ = store.remove_sealed();
+                return Err(MoveError::Refused(
+                    "the note about the move cannot be recorded (keystore-note.due in the \
+                     state folder). Nothing was changed: secrets.json is still this device's \
+                     key store."
+                        .into(),
+                ));
+            }
+            stop("enclave-note-owed");
+        }
+        MoveBy::Login => {}
+    }
+    if by != MoveBy::Trial {
+        // … and the command and the login say themselves what they did: a note that an
+        // earlier move by itself still owes is about a store that is being replaced.
+        let _ = std::fs::remove_file(paths.move_note_file());
+    }
     // 5.6
     store.remove_plain()?;
     stop("enclave-plain-removed");
-    // 5.7: the trial is over; its record stays as the evidence — of the trial's key, which
-    // is the key that holds the secrets now only if `choose_key` could use it. The record
+    // 5.7: a running trial is over; its record stays as the evidence — of the trial's key,
+    // which is the key that holds the secrets now only if `pick_key` could use it. The record
     // keeps the public half of its key, and whoever reports compares it with the sealed
-    // file's (`Report::trial_key_holds_secrets`): nothing here claims it.
-    if !trial::disabled_by_env() || matches!(trial::load(paths), trial::Stored::Record(_)) {
-        trial::end_at_move(paths, util::now_ms());
-    }
+    // file's (`Report::trial_key_holds_secrets`): nothing here claims it. The record of a
+    // trial that ended at an earlier sealing, for another key, is forgotten.
+    // (A device that never had a trial gets no record from this: there is nothing to end.)
+    trial::note_sealed(paths, &util::b64url(public));
     protect_state_root(paths, true);
     Ok(())
+}
+
+/// What the move that nobody asked for came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AutoMove {
+    /// The secrets are in `secrets.sealed` now, and the plain file is gone.
+    Moved,
+    /// Nothing to do: the trial has not passed (or there is none), or the secrets are not —
+    /// or no longer — in a plain file with keys.
+    NotDue,
+    /// Another gclone holds the secrets lock; a later run looks again.
+    Busy,
+    /// The trial has passed and the secrets stay where they are all the same: why.
+    Kept(String),
+}
+
+/// The move that nobody asked for (§8.2, §17.30): a device on the plain file whose trial is
+/// complete — the test value opened on enough days, across a restart, without one failure —
+/// gets its secrets sealed to the trial's own key, by the same sequence as `gclone keystore
+/// use enclave` and under the same lock, without the passphrase and without a question.
+///
+/// It runs in the process that just took a step of the trial, and opens the test value once
+/// more here, with the key it is about to seal to: a process that cannot use that key moves
+/// nothing (rule 6). The opt-outs — the choice `file`, `GCLONE_KEYSTORE_TRIAL=0` — are looked
+/// at here and again under the lock.
+pub(crate) fn automatic_move(store: &LayeredStore) -> AutoMove {
+    let paths = &store.paths;
+    if !store.automatic {
+        return AutoMove::NotDue;
+    }
+    let Some(sealer) = store.sealer_for_unasked_steps() else {
+        return AutoMove::NotDue;
+    };
+    let trial::Stored::Record(record) = trial::load(paths) else {
+        return AutoMove::NotDue;
+    };
+    if !record.summary().complete {
+        return AutoMove::NotDue;
+    }
+    if let Err(e) = record.open_canary(sealer.as_ref()) {
+        return AutoMove::Kept(format!(
+            "the trial's test value did not open in this process ({e})"
+        ));
+    }
+    let Some((blob, public)) = record.key_for_secrets() else {
+        return AutoMove::NotDue;
+    };
+    let expected = match store.read_plain_bytes() {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return AutoMove::NotDue,
+        Err(e) => return AutoMove::Kept(e.to_string()),
+    };
+    match move_to_enclave(store, &expected, &blob, &public, MoveBy::Trial) {
+        Ok(()) => AutoMove::Moved,
+        Err(MoveError::AlreadySealed) => AutoMove::NotDue,
+        Err(MoveError::Config(ConfigError::KeyStoreBusy)) => AutoMove::Busy,
+        Err(MoveError::Changed) => {
+            AutoMove::Kept("secrets.json changed while it was looked at".into())
+        }
+        Err(MoveError::Refused(why)) => AutoMove::Kept(why),
+        Err(MoveError::Config(e)) => AutoMove::Kept(e.to_string()),
+    }
+}
+
+/// What the end of a `gclone login` did about the key store.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AfterLogin {
+    /// The secrets are in `secrets.sealed` (the saves put them there).
+    Sealed,
+    /// They were in the plain file and were moved into `secrets.sealed` now.
+    Moved,
+    /// They are in the plain file and stay there: the sealed store is not this device's
+    /// default (Linux, a choice, the environment), or it could not be used — the text, if
+    /// there is something to say.
+    Plain(Option<String>),
+}
+
+/// The end of a `gclone login` (§17.30): where the sealed store is this device's default and
+/// the login's secrets ended in the plain file all the same — it found a sealed file that
+/// did not open, or an older gclone's keyless login beside the sealed keys — they are moved
+/// now, to a key that opened a value in this process. The caller does not ask for this on a
+/// device that was on a plain file with keys when the login began: there the trial decides.
+/// `undecided_before`: a trial was running and had not passed when the login began
+/// ([`trial_undecided`]) — then it decides here as well ([`LayeredStore::key_for_login`]).
+pub(crate) fn seal_after_login(store: &LayeredStore, undecided_before: bool) -> AfterLogin {
+    let paths = &store.paths;
+    let loaded = match store.resolve() {
+        Ok(Some(loaded)) => loaded,
+        _ => return AfterLogin::Plain(None),
+    };
+    match loaded.source {
+        Source::Sealed => return AfterLogin::Sealed,
+        Source::Merged => return AfterLogin::Plain(None),
+        Source::Plain if loaded.secrets.keys.is_empty() => return AfterLogin::Plain(None),
+        Source::Plain => {}
+    }
+    let Some(sealer) = store.sealer_by_default() else {
+        return AfterLogin::Plain(None);
+    };
+    let chosen = read_choice(paths) == Choice::Enclave;
+    let key = match store.key_for_login(&sealer, chosen, undecided_before) {
+        LoginKey::Key(key) => key,
+        LoginKey::Held(why) => return AfterLogin::Plain(Some(why.to_string())),
+        LoginKey::Failed(e) => {
+            store.could_not_seal(false, &e);
+            return AfterLogin::Plain(Some(e.to_string()));
+        }
+    };
+    let expected = match store.read_plain_bytes() {
+        Ok(Some(bytes)) => bytes,
+        _ => return AfterLogin::Plain(None),
+    };
+    match move_to_enclave(store, &expected, &key.blob, &key.public, MoveBy::Login) {
+        Ok(()) => AfterLogin::Moved,
+        Err(MoveError::AlreadySealed) => AfterLogin::Sealed,
+        Err(MoveError::Changed) => AfterLogin::Plain(None),
+        Err(MoveError::Refused(why)) => AfterLogin::Plain(Some(why)),
+        Err(MoveError::Config(e)) => AfterLogin::Plain(Some(e.to_string())),
+    }
+}
+
+/// The note about a move that nobody asked for. Shown once, to a person: when the move
+/// happens in a run on a terminal, by that run; otherwise it is owed — the empty marker
+/// `keystore-note.due`, made with `O_EXCL` before the plain file is removed and consumed by
+/// its removal, like the backup note's — and shown by the next run on a terminal that finds
+/// the device sealed. `gclone keystore use file`, `gclone keystore use enclave`, `logout` and
+/// a login that begins a new store take the marker away. A marker that cannot be made stops
+/// the move.
+const MOVE_NOTE: &str = "note: this device's login and vault key are now kept in secrets.sealed, \
+    which only this Mac's Secure Enclave can open (gclone tested it over several days and a \
+    restart first); the plain secrets.json is gone. A copy of the sealed file is useless \
+    anywhere else. If this Mac is erased, repaired or replaced, `gclone login` and your \
+    passphrase connect it again. `gclone keystore use file` moves back to the plain file \
+    (gclone 0.4.0 and older read only that one); `gclone keystore` shows the details.";
+
+/// `true`: the note is owed — the marker is there, as a file that a later run can take
+/// away. `false`: it could not be made (a full disk, say), and the move does not happen.
+fn owe_move_note(paths: &Paths) -> bool {
+    let marker = paths.move_note_file();
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&marker);
+    match made {
+        Ok(_) => true,
+        // Owed already: an earlier try of this move got this far.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::symlink_metadata(&marker).is_ok_and(|md| md.file_type().is_file())
+        }
+        Err(e) => {
+            tracing::debug!("cannot record that the note about the move is owed: {e}");
+            false
+        }
+    }
+}
+
+/// Shows the note about the move if it is owed, this run may show notes and the device is on
+/// the sealed store now. Whoever removes the marker shows the note: once, whatever runs
+/// beside this.
+fn move_note(paths: &Paths) {
+    let marker = paths.move_note_file();
+    if std::fs::symlink_metadata(&marker).is_err() || !can_show_notes() {
+        return;
+    }
+    let sealed_alone = std::fs::symlink_metadata(paths.secrets_file()).is_err()
+        && std::fs::symlink_metadata(paths.sealed_file()).is_ok();
+    if sealed_alone && std::fs::remove_file(&marker).is_ok() {
+        eprintln!("{MOVE_NOTE}");
+    }
 }
 
 /// `gclone keystore use enclave` on a device whose secrets are sealed already: nothing moves,
@@ -1179,6 +1860,7 @@ pub(crate) fn settle_sealed(store: &LayeredStore) -> Result<bool, MoveError> {
     if read_choice(paths) != Choice::Enclave {
         write_choice(paths, STORE_ENCLAVE, "enclave-choice")?;
     }
+    clear_trial_off(paths);
     Ok(true)
 }
 
@@ -1219,8 +1901,9 @@ pub(crate) enum ToFile {
 }
 
 /// `gclone keystore use file` (the table of §8.2). The choice is written first, so that an
-/// interrupted run is never undone by a later command; `secrets.json` is written and read
-/// back before `secrets.sealed` is removed.
+/// interrupted run is never undone by a later command — not by the automatic move either,
+/// which looks at the choice under this lock; `secrets.json` is written and read back before
+/// `secrets.sealed` is removed.
 pub(crate) fn move_to_file(
     store: &LayeredStore,
     discard_sealed: bool,
@@ -1230,6 +1913,9 @@ pub(crate) fn move_to_file(
     check_private_dir(&paths.state_root)?;
     let _lock = lock_exclusive(paths, WRITER_WAIT)?;
     clean_leftovers(paths)?;
+    // Whatever happens next, a note that says "your secrets are sealed now" is not owed to
+    // somebody who is moving them back.
+    let _ = std::fs::remove_file(paths.move_note_file());
     let plain = store.read_plain()?;
     let sealed = store.read_sealed()?;
     let has_keys = |s: &Secrets| !s.keys.is_empty();
@@ -1364,6 +2050,15 @@ pub(crate) struct Report {
     pub plain_leftovers: usize,
     /// `Err`: why this process cannot use a sealed store at all.
     pub sealer: Result<&'static str, NoSealer>,
+    /// `GCLONE_KEYSTORE_TRIAL=0` is set for this process: no trial, and nothing is moved.
+    pub trial_off: bool,
+    /// A run with `GCLONE_KEYSTORE_TRIAL=0` left its marker: no trial and no move on this
+    /// device, in any run ([`mark_trial_off`]).
+    pub trial_off_marked: bool,
+    /// `secrets.json` is the store, a `secrets.sealed` lies beside it, and it is not the
+    /// unfinished work of a move to the trial's key: nothing is tested or moved by itself
+    /// ([`LayeredStore::sealed_beside_is_foreign`]).
+    pub blocked_by_sealed: bool,
     /// The Time Machine exclusion; `None` on Linux.
     pub backup_excluded: Option<Result<bool, String>>,
     pub cachedir_tag: bool,
@@ -1400,10 +2095,13 @@ pub(crate) fn report_with(paths: &Paths, store: &LayeredStore) -> Report {
         Err(ConfigError::KeyStoreUnavailable(text)) => Where::SealedUnusable(text),
         Err(e) => Where::Unreadable(e.to_string()),
     };
+    // A record that was forgotten (`trial::note_sealed`, `trial::forget`) is no trial.
     let trial = match trial::load(paths) {
-        trial::Stored::Record(record) => Some(record.summary()),
+        trial::Stored::Record(record) if !record.is_blank() => Some(record.summary()),
         _ => None,
     };
+    let blocked_by_sealed =
+        both_present && place == Where::Plain && store.sealed_beside_is_foreign();
     // Read off the two files: the public half the trial recorded, and the one the sealed
     // file names (not secret; the file is not opened for it).
     let sealed_to = store
@@ -1425,6 +2123,9 @@ pub(crate) fn report_with(paths: &Paths, store: &LayeredStore) -> Report {
         trial_key_holds_secrets,
         plain_leftovers: plain_leftovers(paths),
         sealer: store.sealer.as_ref().map(|s| s.name()).map_err(|e| *e),
+        trial_off: trial::disabled_by_env(),
+        trial_off_marked: trial_off_marked(paths),
+        blocked_by_sealed,
         backup_excluded: backup_excluded(paths),
         cachedir_tag: exists(paths.state_root.join("CACHEDIR.TAG")),
     }
@@ -1433,10 +2134,13 @@ pub(crate) fn report_with(paths: &Paths, store: &LayeredStore) -> Report {
 impl Report {
     /// "2 of 3 days, no restart seen yet".
     fn trial_progress(t: &trial::Summary) -> String {
-        let days = if t.days >= trial::DAYS_NEEDED {
-            format!("{} days", t.days)
-        } else {
+        let days = if t.days < trial::DAYS_NEEDED {
             format!("{} of {} days", t.days, trial::DAYS_NEEDED)
+        } else if t.running && !t.aged {
+            // Three calendar days can be little more than 24 hours.
+            format!("{} days, not yet 48 hours apart", t.days)
+        } else {
+            format!("{} days", t.days)
         };
         let restart = if t.restart {
             "a restart survived"
@@ -1463,9 +2167,29 @@ impl Report {
                         "{plain} — Secure Enclave trial suspended (keystore.json is unreadable)"
                     )
                 }
+                // A run with the variable used this device: its marker holds for every run.
+                _ if self.trial_off_marked => format!(
+                    "{plain} — kept: a run with GCLONE_KEYSTORE_TRIAL=0 uses this device (no \
+                     Secure Enclave trial, nothing is moved; `gclone keystore use enclave` \
+                     moves the secrets)"
+                ),
+                // The environment of this run switches the trial and the move off; a run
+                // that loads the secrets with it leaves the marker of the arm above.
+                _ if self.trial_off => format!(
+                    "{plain} — GCLONE_KEYSTORE_TRIAL=0: no Secure Enclave trial here, nothing \
+                     is moved"
+                ),
+                // The warning says what lies there and what settles it.
+                _ if self.blocked_by_sealed => format!(
+                    "{plain} — kept: nothing is tested or moved while secrets.sealed lies \
+                     beside it"
+                ),
+                // Still here although the trial has passed: the run that looks has not taken
+                // its own step yet (`gclone keystore`), or its session cannot open the key.
                 (_, Ok(_), Some(t)) if t.complete => {
                     format!(
-                        "{plain} — Secure Enclave trial complete: `gclone keystore use enclave`"
+                        "{plain} — Secure Enclave trial complete: the next run that can open \
+                         the test value moves the secrets into the sealed store"
                     )
                 }
                 (_, Ok(_), Some(t)) if t.running => {
@@ -1527,8 +2251,9 @@ impl Report {
                 })
                 .unwrap_or_default();
             out.push(format!(
-                "the Secure Enclave trial failed {} time(s){whereabouts}. `gclone keystore` \
-                 shows the details.",
+                "the Secure Enclave trial failed {} time(s){whereabouts}. Nothing is moved into \
+                 the sealed store while a failure is on its record: `gclone keystore` shows the \
+                 details, `gclone keystore check --new-trial` starts a new trial.",
                 t.failures
             ));
         }
@@ -1551,15 +2276,13 @@ impl Report {
                 if sealed { "enclave" } else { "file" }
             ));
         }
-        if self.trial_key_holds_secrets == Some(false)
-            && self.trial.as_ref().is_some_and(|t| t.moved)
-            && matches!(self.store, Where::Sealed | Where::Merged)
-        {
+        if self.trial_evidence_is_for_another_key() {
             out.push(
                 "the secrets are sealed to a key that was made at the move, not to the Secure \
                  Enclave trial's key: the trial's record (days, restart, sessions) is evidence \
                  for another key. `gclone keystore check` from every session gclone runs in \
-                 (cron, ssh, a LaunchAgent) shows whether this one opens there."
+                 (cron, ssh, a LaunchAgent) shows whether this one opens there; `gclone \
+                 keystore check --new-trial` forgets the old record."
                     .into(),
             );
         }
@@ -1568,10 +2291,26 @@ impl Report {
                 None => String::new(),
                 Some(why) => format!(" secrets.sealed is not a copy of it: {why}."),
             };
+            // What settles it: `use file` refuses a sealed file that differs or does not
+            // open unless it is told to give it up.
+            let remedy = if self.sealed_differs.is_some() {
+                "`gclone keystore use file --discard-sealed` removes secrets.sealed, `gclone \
+                 keystore use enclave` replaces it"
+            } else {
+                "`gclone keystore use file` or `gclone keystore use enclave` settles it"
+            };
+            let by_itself = if self.choice == Choice::File {
+                ""
+            } else if self.blocked_by_sealed {
+                ". Until then gclone tests and moves nothing by itself here; if an older gclone \
+                 uses this device (0.4.0 and before read only secrets.json), update it first, \
+                 or keep the plain file with `gclone keystore use file`"
+            } else {
+                "; a move that gclone began by itself is finished by the next run"
+            };
             out.push(format!(
                 "secrets.json and secrets.sealed both exist (an interrupted move, or an older \
-                 gclone signed in here). gclone uses secrets.json.{detail} `gclone keystore use \
-                 file` or `gclone keystore use enclave` settles it."
+                 gclone signed in here). gclone uses secrets.json.{detail} {remedy}{by_itself}."
             ));
         }
         if self.store == Where::Merged {
@@ -1588,13 +2327,17 @@ impl Report {
                  Enclave trial is suspended. `gclone keystore use file` or `gclone keystore use \
                  enclave` writes it anew."
             )),
-            (Choice::Enclave, Where::Plain) if !self.both_present => out.push(
+            (Choice::Enclave, Where::Plain) if !self.both_present => out.push(format!(
                 "the sealed store was chosen with `gclone keystore use enclave`, but this \
                  device's secrets are in the plain file secrets.json (a login that could not use \
                  the Secure Enclave, or an older gclone, put them there). `gclone keystore use \
-                 enclave` moves them; `gclone keystore use file` keeps the plain file."
-                    .into(),
-            ),
+                 enclave` moves them now{}; `gclone keystore use file` keeps the plain file.",
+                if self.trial_off_marked {
+                    ""
+                } else {
+                    " — gclone does it by itself once its trial has passed"
+                }
+            )),
             (Choice::File, Where::Sealed) => out.push(
                 "the plain file was chosen with `gclone keystore use file`, but the secrets are \
                  still in secrets.sealed (an interrupted move). Run `gclone keystore use file` \
@@ -1604,6 +2347,20 @@ impl Report {
             _ => {}
         }
         out
+    }
+
+    /// The trial ended when the secrets were sealed, to another key than its own — and it
+    /// had seen something: more than its first day, or a restart. Then its record looks like
+    /// evidence and is none, and `status` and `keystore` say so. A record of one day without
+    /// a restart is what `gclone keystore use enclave` as the first command after a login
+    /// left with gclone 0.5.0 (§17.30): no evidence to mistake, nothing to warn about.
+    pub(crate) fn trial_evidence_is_for_another_key(&self) -> bool {
+        self.trial_key_holds_secrets == Some(false)
+            && self
+                .trial
+                .as_ref()
+                .is_some_and(|t| t.moved && (t.days > 1 || t.restart))
+            && matches!(self.store, Where::Sealed | Where::Merged)
     }
 
     /// `key_store` of `gclone keystore --json`.
@@ -1630,6 +2387,7 @@ impl Report {
                 "restart": t.restart,
                 "sessions": t.sessions,
                 "failures": t.failures,
+                "aged": t.aged,
                 "complete": t.complete,
                 "unavailable": t.unavailable.as_ref().map(|u| u.error.clone()),
                 "unavailable_session": t.unavailable.as_ref().map(|u| u.session.clone()),
@@ -1649,7 +2407,10 @@ impl Report {
                 "usable": !matches!(self.store, Where::SealedUnusable(_) | Where::Unreadable(_)),
                 "choice": choice,
                 "trial": trial,
+                "trial_disabled": self.trial_off,
+                "trial_off_marker": self.trial_off_marked,
                 "both_present": self.both_present,
+                "blocked_by_sealed": self.blocked_by_sealed,
                 "plain_leftovers": self.plain_leftovers,
                 "backup_excluded": backup,
                 "cachedir_tag": self.cachedir_tag,

@@ -28,7 +28,9 @@
 #   8. continuity: the designated requirement equals that of the previous signed release (the
 #      first signed release asks for a typed confirmation instead);
 #   9. proves that the signed binary is the attested one apart from the signature;
-#  10. runs the signed binary (version, a directory vault, `keystore check`) in a temp home;
+#  10. runs the signed binary in a temp home: version, a login to a directory vault — which
+#      must seal its secrets with this Mac's Secure Enclave (0.5.1) —, copy and cat from the
+#      sealed store, `keystore check`;
 #  11. notarizes it (only if GCLONE_NOTARY_PROFILE names a notarytool keychain profile);
 #  12. packs gclone-aarch64-apple-darwin-signed.tar.gz;
 #  13. extends SHA256SUMS and uploads both;
@@ -565,9 +567,12 @@ smoke() {
     mkdir -p "$home/src"
     printf 'release smoke test\n' >"$home/src/a.txt"
     printf 'a passphrase for the smoke test only\n' >"$home/pass"
+    # The temp home and state directory are what keeps this away from the owner's gclone.
+    # GCLONE_KEYSTORE_TRIAL is taken out of the environment, not set to 0: since 0.5.1 that
+    # would also keep the login from sealing, and the sealing login is what is run here.
     run() {
-        HOME="$home" GCLONE_CONFIG_DIR="$home/config" GCLONE_STATE_DIR="$home/state" \
-            GCLONE_KEYSTORE_TRIAL=0 "$SIGNED_BIN" "$@"
+        env -u GCLONE_KEYSTORE_TRIAL HOME="$home" GCLONE_CONFIG_DIR="$home/config" \
+            GCLONE_STATE_DIR="$home/state" "$SIGNED_BIN" "$@"
     }
     shown=$(run --version) || die "the signed binary does not start"
     case "$shown" in
@@ -577,18 +582,39 @@ smoke() {
     say "   $shown"
     run login --vault-dir "$home/vault" --passphrase-file "$home/pass" >/dev/null 2>"$WORK/smoke.err" ||
         die "the signed binary cannot create a directory vault" "$(tail -n 3 "$WORK/smoke.err")"
+    # What every Mac does with this binary at its first login (0.5.1): the secrets are sealed
+    # by the Secure Enclave from the start, and no plain secrets.json is left. Looked at
+    # before anything else runs; judged below, once `keystore check` has said whether this
+    # machine has a Secure Enclave at all.
+    sealed_login=0
+    if [ -f "$home/state/secrets.sealed" ] && [ ! -e "$home/state/secrets.json" ]; then
+        sealed_login=1
+    fi
+    # copy and cat: from the sealed store, where the login sealed.
     run copy "$home/src" :smoke >/dev/null 2>"$WORK/smoke.err" ||
         die "the signed binary cannot copy" "$(tail -n 3 "$WORK/smoke.err")"
     [ "$(run cat :smoke/a.txt 2>/dev/null)" = "release smoke test" ] ||
         die "the signed binary does not read back what it copied"
-    # The Secure Enclave of this Mac, from the signed binary: a key is made and discarded.
+    # The Secure Enclave of this Mac, from the signed binary: a key is made and discarded,
+    # and the sealed store of the login above is opened.
     if run keystore check >"$WORK/smoke.out" 2>&1; then
-        say "   login, copy, cat and \`keystore check\` work"
-    elif [ "$SELFTEST" = 1 ] && [ "${GCLONE_REQUIRE_ENCLAVE:-0}" != 1 ] && grep -q '^New key .*FAILED' "$WORK/smoke.out"; then
-        # A machine without a Secure Enclave (a hosted CI runner) can run the self-test; the
-        # owner's Mac, where releases are signed, cannot skip this.
-        say "   login, copy and cat work"
-        say "   SKIPPED: \`keystore check\` — no Secure Enclave on this machine (self-test only)"
+        [ "$sealed_login" = 1 ] ||
+            die "the signed binary's login did not seal its secrets although \`keystore check\` passes:" \
+                "$(cd "$home/state" 2>/dev/null && printf '%s ' ./*)" \
+                "$(run keystore 2>&1 | sed -n '1,4p')"
+        grep -q '^Sealed store *secrets.sealed opens in this session' "$WORK/smoke.out" ||
+            die "\`gclone keystore check\` did not open the sealed store of the smoke test's login:" \
+                "$(tail -n 6 "$WORK/smoke.out")"
+        say "   the login seals its secrets (secrets.sealed, no secrets.json);"
+        say "   copy and cat work from the sealed store, and \`keystore check\` passes"
+    elif [ "$SELFTEST" = 1 ] && [ "${GCLONE_REQUIRE_ENCLAVE:-0}" != 1 ] &&
+        [ "$sealed_login" = 0 ] && [ -f "$home/state/secrets.json" ] &&
+        grep -q '^New key .*FAILED' "$WORK/smoke.out"; then
+        # A machine without a Secure Enclave (a hosted CI runner) can run the self-test: the
+        # login falls back to the plain file there. The owner's Mac, where releases are
+        # signed, cannot skip this.
+        say "   login (to the plain file), copy and cat work"
+        say "   SKIPPED: the sealing login and \`keystore check\` — no Secure Enclave on this machine (self-test only)"
     else
         die "\`gclone keystore check\` fails with the signed binary:" "$(tail -n 6 "$WORK/smoke.out")"
     fi

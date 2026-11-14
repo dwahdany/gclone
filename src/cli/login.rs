@@ -169,6 +169,10 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
     if let Some(config) = &config {
         note_config(&paths, config);
     }
+    // Before anything is loaded (a load takes the trial's step): a trial that is running on
+    // this device and has not passed decides where the secrets go — signing out and in
+    // again does not jump its bar (§8.2).
+    let trial_undecided = keystore::trial_undecided(&paths);
     // A sealed key store that cannot be opened is "no usable secrets" for `login`, the one
     // command that can put the key back: it says why and goes on. The sealed file is not
     // touched until this login holds the key again (§8.2).
@@ -234,13 +238,22 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
         drive => drive,
     };
     let cached_keys = secrets.as_ref().is_some_and(|s| !s.keys.is_empty());
+    // Where the keys this login found came from (§8.2), looked at after the load above — which
+    // may itself have moved a device whose trial had passed into the sealed store.
+    let keys_from = match keystore::LayeredStore::new(&paths).resolve() {
+        Ok(Some(loaded)) if cached_keys => Some(loaded.source),
+        _ => None,
+    };
     // The login of a keyless secrets.json with the keys of secrets.sealed (an older gclone
     // signed in on a sealed device, §8.2): this run writes the two as one file.
-    let merged = cached_keys
-        && matches!(
-            keystore::LayeredStore::new(&paths).resolve(),
-            Ok(Some(loaded)) if loaded.source == keystore::Source::Merged
-        );
+    let merged = keys_from == Some(keystore::Source::Merged);
+    let before = KeyStoreBefore {
+        // A device that was working from a plain file with keys: its secrets stay there
+        // until the trial has passed (§17.30) — this login does not jump that queue.
+        on_plain: keys_from == Some(keystore::Source::Plain),
+        sealed: keys_from == Some(keystore::Source::Sealed),
+        trial_undecided,
+    };
     let session = Session {
         ui,
         paths,
@@ -255,7 +268,7 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
     // --- step B.1: a connected device that only signed in again
     if let (Some(config), true) = (&session.config, cached_keys) {
         let code = relogin(&session, config, secrets, merged).await?;
-        note_key_store(&session.ui, &session.paths);
+        settle_key_store(&session.ui, &session.paths, before).await?;
         return Ok(code);
     }
 
@@ -337,13 +350,51 @@ pub async fn run(g: &GlobalOpts, args: LoginArgs) -> anyhow::Result<i32> {
             attach(&session, &found[picked]).await?
         }
     }
-    note_key_store(&session.ui, &session.paths);
+    settle_key_store(&session.ui, &session.paths, before).await?;
     Ok(0)
 }
 
-/// A login that ended in the plain file although the owner chose the sealed store (§8.2):
-/// the sealed file could not be opened, or no key could be made in this session.
-fn note_key_store(ui: &Ui, paths: &Paths) {
+/// Where this device's keys were when the login began.
+#[derive(Copy, Clone)]
+struct KeyStoreBefore {
+    /// In `secrets.json`.
+    on_plain: bool,
+    /// In `secrets.sealed`.
+    sealed: bool,
+    /// A trial was running and had not passed (`keystore::trial_undecided`).
+    trial_undecided: bool,
+}
+
+/// The end of every login (§8.2, §17.30). On a Mac the sealed store is the default: the
+/// saves above put a new login there from the start, and what ended in the plain file all
+/// the same — this login found a sealed file that did not open, or an older gclone's login
+/// beside the sealed key — is moved now (`keystore::seal_after_login`), unless the device was
+/// working from the plain file before, or a trial was running there that had not passed (a
+/// `logout` and a `login` in the middle of it): there the trial decides. Says where the secrets are
+/// when that changed, and warns when a login ended in the plain file although the owner
+/// chose the sealed store.
+async fn settle_key_store(ui: &Ui, paths: &Paths, before: KeyStoreBefore) -> anyhow::Result<()> {
+    let after = if before.on_plain {
+        None
+    } else {
+        let store = keystore::LayeredStore::new(paths);
+        let undecided = before.trial_undecided;
+        Some(blocking(move || Ok(keystore::seal_after_login(&store, undecided))).await?)
+    };
+    match after {
+        Some(keystore::AfterLogin::Sealed | keystore::AfterLogin::Moved) if !before.sealed => {
+            ui.info(
+                "This device's login and key are sealed by this Mac's Secure Enclave \
+                 (secrets.sealed): a copy of that file is useless anywhere else. If this Mac is \
+                 erased or repaired, `gclone login` and the passphrase connect it again. \
+                 `gclone keystore use file` keeps a plain file instead.",
+            );
+        }
+        Some(keystore::AfterLogin::Plain(Some(why))) => {
+            tracing::debug!("this login stays in secrets.json: {why}");
+        }
+        _ => {}
+    }
     if keystore::read_choice(paths) == keystore::Choice::Enclave
         && std::fs::symlink_metadata(paths.secrets_file()).is_ok()
     {
@@ -353,6 +404,7 @@ fn note_key_store(ui: &Ui, paths: &Paths) {
              be used in this session. `gclone keystore use enclave` moves it there.",
         );
     }
+    Ok(())
 }
 
 fn check_vault_name(name: &str) -> anyhow::Result<()> {
@@ -555,13 +607,12 @@ async fn relogin(
     if !login.fresh {
         // The login still works and nothing is renewed — but where it lies in secrets.json
         // without a key, with the key in secrets.sealed, the two become one file now: the
-        // save goes to secrets.json, and the sealed copy of the same keys is removed.
+        // save goes to secrets.json, and the sealed copy of the same keys is removed. (On a
+        // Mac whose default is the sealed store the end of this login then moves that file
+        // back into it, §17.30, and says so.)
         if merged && let Some(both) = &secrets {
             s.store.save(both)?;
-            s.ui.info(
-                "The login in secrets.json and the key in secrets.sealed are one file again \
-                 (secrets.json).",
-            );
+            s.ui.info("The login in secrets.json and the key in secrets.sealed are one again.");
         }
         s.ui.out("Vault unchanged.");
         return Ok(0);

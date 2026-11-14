@@ -4,6 +4,10 @@
 //! Enclave of a Mac (`super::macos::EnclaveSealer`); [`FakeSealer`] stands in for it in tests
 //! on every platform and is not part of a release build.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use zeroize::Zeroizing;
 
 /// Why a sealer could not do what was asked. The text is the platform's own error, for the
@@ -53,6 +57,108 @@ pub(crate) fn probe(sealer: &dyn Sealer) -> Result<(), SealError> {
         Err(SealError(
             "a value sealed to a new key did not open to itself".into(),
         ))
+    }
+}
+
+/// How long one call into the Secure Enclave is waited for ([`Bounded`]). The calls take a
+/// few milliseconds each (§17.28).
+pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
+
+/// A sealer whose calls into the hardware (`create`, `open`) come back within a bound, with
+/// an error if the hardware does not answer (§17.30).
+///
+/// Every sealer of a gclone process is wrapped in one ([`super::sealer`]). Since 0.5.1 a Mac
+/// is sealed without anybody asking, and from then on every command opens the sealed store:
+/// a framework call that does not return — nobody has seen one; the sessions nobody measured
+/// are where it would happen — stopped the command for good, `gclone status` and `gclone
+/// keystore` included, and a `login` or `keystore use file` in that state held the secrets
+/// lock against the session that could have repaired the device.
+///
+/// Each call runs on a thread of its own. After the first one that did not come back in time
+/// its thread is still inside the framework, and every later call of this process fails at
+/// once with the same error instead of waiting again: one bounded wait per command.
+pub(crate) struct Bounded {
+    inner: Arc<dyn Sealer>,
+    wait: Duration,
+    stuck: AtomicBool,
+}
+
+impl Bounded {
+    pub(crate) fn new(inner: Arc<dyn Sealer>, wait: Duration) -> Bounded {
+        Bounded {
+            inner,
+            wait,
+            stuck: AtomicBool::new(false),
+        }
+    }
+
+    fn no_answer(&self) -> SealError {
+        let waited = match self.wait.as_secs() {
+            0 => format!("{} ms", self.wait.as_millis()),
+            secs => format!("{secs} s"),
+        };
+        SealError(format!("{NO_ANSWER} within {waited}"))
+    }
+
+    fn call<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn Sealer) -> Result<T, SealError> + Send + 'static,
+    ) -> Result<T, SealError> {
+        if self.stuck.load(Ordering::SeqCst) {
+            return Err(self.no_answer());
+        }
+        let inner = self.inner.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("secure-enclave".into())
+            .spawn(move || {
+                let _ = done.send(work(inner.as_ref()));
+            })
+            .map_err(|e| {
+                SealError(format!(
+                    "no thread could be started for the call into the Secure Enclave: {e}"
+                ))
+            })?;
+        match finished.recv_timeout(self.wait) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.stuck.store(true, Ordering::SeqCst);
+                Err(self.no_answer())
+            }
+            // The thread ended without an answer (it panicked).
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(SealError(
+                "the call into the Secure Enclave ended without an answer".into(),
+            )),
+        }
+    }
+}
+
+/// How the text of a [`SealError`] begins when the hardware did not answer in time.
+pub(crate) const NO_ANSWER: &str = "the Secure Enclave did not answer";
+
+impl Sealer for Bounded {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn create(&self) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), SealError> {
+        self.call(|sealer| sealer.create())
+    }
+
+    /// Needs no call into the hardware: not bounded.
+    fn seal(&self, public: &[u8], plain: &[u8]) -> Result<Vec<u8>, SealError> {
+        self.inner.seal(public, plain)
+    }
+
+    fn open(
+        &self,
+        blob: &[u8],
+        public: &[u8],
+        sealed: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, SealError> {
+        let blob = Zeroizing::new(blob.to_vec());
+        let (public, sealed) = (public.to_vec(), sealed.to_vec());
+        self.call(move |sealer| sealer.open(&blob, &public, &sealed))
     }
 }
 
@@ -331,6 +437,61 @@ mod tests {
         assert_eq!(
             flaky.open(&blob, &public, &sealed).unwrap().as_slice(),
             b"x"
+        );
+    }
+
+    /// A call into the hardware that does not return is an error after the bound — once:
+    /// every later call of the process fails at once. Calls that answer are passed through.
+    #[test]
+    fn a_bounded_sealer_gives_up_on_a_call_that_does_not_return() {
+        let works = Bounded::new(Arc::new(FakeSealer::new("mac-1", None)), CALL_WAIT);
+        assert_eq!(works.name(), "Secure Enclave (test stand-in)");
+        let (blob, public) = works.create().unwrap();
+        let sealed = works.seal(&public, b"x").unwrap();
+        assert_eq!(
+            works.open(&blob, &public, &sealed).unwrap().as_slice(),
+            b"x"
+        );
+        probe(&works).unwrap();
+        // an error of the hardware is that error
+        let refused = Bounded::new(
+            Arc::new(FakeSealer::new("mac-1", Some(FakeFail::Open))),
+            CALL_WAIT,
+        );
+        assert!(
+            refused
+                .open(&blob, &public, &sealed)
+                .unwrap_err()
+                .0
+                .contains("cannot use the key store")
+        );
+
+        let hangs = Bounded::new(
+            Arc::new(FakeSealer::new("mac-1", Some(FakeFail::Hang))),
+            Duration::from_millis(150),
+        );
+        let before = std::time::Instant::now();
+        let error = hangs.open(&blob, &public, &sealed).unwrap_err();
+        let waited = before.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        assert_eq!(error.0, format!("{NO_ANSWER} within 150 ms"));
+        // … and nothing waits a second time: not a new key, not the probe.
+        let before = std::time::Instant::now();
+        assert!(hangs.create().unwrap_err().0.starts_with(NO_ANSWER));
+        assert!(probe(&hangs).unwrap_err().0.starts_with(NO_ANSWER));
+        assert!(hangs.open(&blob, &public, &sealed).is_err());
+        // (three more waits would be 450 ms)
+        assert!(before.elapsed() < Duration::from_millis(400));
+        // sealing needs no hardware
+        hangs.seal(&public, b"y").unwrap();
+        assert!(
+            Bounded::new(Arc::new(FakeSealer::new("m", None)), CALL_WAIT)
+                .no_answer()
+                .0
+                .ends_with("within 10 s")
         );
     }
 }

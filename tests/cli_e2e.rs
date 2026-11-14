@@ -3926,6 +3926,141 @@ async fn drive_mode_a_transient_enclave_failure_during_login_keeps_the_sealed_ke
     assert!(a.secrets_file().exists() != sealed.exists(), "one store");
 }
 
+/// §17.30: on a Mac the sealed store is the default, and a login seals from its first save.
+/// For a Drive vault that first save is the grant alone, written before the passphrase is
+/// asked: killed right after it, the device holds a sealed login without a key and no plain
+/// file — and the login that follows seals the keys to the same key. No `secrets.json` at any
+/// point, no choice on file, no command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_mode_a_login_on_a_mac_is_sealed_from_its_first_save() {
+    let fake = FakeDrive::start().await;
+    let lab = Lab::new();
+    let pass = lab.pass();
+    let auth_url = format!("{}/auth", fake.base());
+    let mut a = drive_device(&lab, &fake, "a");
+    // A Mac as its owner runs it: the stand-in for the Secure Enclave, and no opt-out in the
+    // environment (the harness sets one for every other test).
+    for (name, value) in [
+        ("GCLONE_TEST_KEYSTORE_SEALER", "fake"),
+        ("GCLONE_KEYSTORE_TRIAL", "1"),
+        ("GCLONE_TEST_BOOT", "boot-a"),
+        ("GCLONE_TEST_SESSION", "0x2030"),
+    ] {
+        a.env.push((name.into(), value.into()));
+    }
+    let login = [
+        "login",
+        &auth_url,
+        "--no-browser",
+        "--passphrase-file",
+        &pass,
+    ];
+    let sealed = a.state.join("secrets.sealed");
+    let names = |d: &Device| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&d.state)
+            .expect("state root")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Killed right after the first save — the grant, before the passphrase is asked.
+    let mut killed = a.clone();
+    killed.env.push((
+        "GCLONE_TEST_KEYSTORE_STOP".into(),
+        "save-sealed-done".into(),
+    ));
+    let out = drive_login(&fake, &killed, &login).await;
+    assert_eq!(
+        out.code, 137,
+        "the stop point of the first save\n{}",
+        out.stderr
+    );
+    assert!(
+        sealed.exists() && !a.secrets_file().exists(),
+        "{:?}",
+        names(&a)
+    );
+    assert!(
+        names(&a).iter().all(|name| !name.contains("secrets.json")),
+        "no plain copy, not under a temp name either: {:?}",
+        names(&a)
+    );
+    let envelope = a.json(&sealed);
+    assert_eq!(envelope["store"], "enclave");
+    assert!(
+        envelope.get("vault_id").is_none(),
+        "the sealed document holds the login and no key yet"
+    );
+    let first_key = envelope["public"].clone();
+    let members: Vec<&str> = envelope
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        members,
+        [
+            "alg",
+            "key",
+            "public",
+            "sealed",
+            "sealed_ms",
+            "store",
+            "version"
+        ],
+        "an envelope: no member of a secrets document in plain"
+    );
+
+    // The login again: it finds its grant in the sealed store, asks for nothing twice, and
+    // seals the keys to the same key.
+    let out = drive_login(&fake, &a, &login).await.ok();
+    assert!(
+        out.stderr
+            .contains("This device's login and key are sealed by this Mac's Secure Enclave"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        sealed.exists() && !a.secrets_file().exists(),
+        "{:?}",
+        names(&a)
+    );
+    let envelope = a.json(&sealed);
+    assert_eq!(envelope["public"], first_key, "one key for both saves");
+    assert!(envelope["vault_id"].is_string(), "it holds the keys now");
+    assert!(!a.state.join("keystore.json").exists(), "nobody chose");
+    assert!(names(&a).iter().all(|name| !name.contains(".tmp-")));
+    let src = lab.path("src");
+    make_tree(&src);
+    run_async(&a, &["copy", &s(&src), ":docs"]).await.ok();
+    run_async(&a, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    run_async(&a, &["status"])
+        .await
+        .ok()
+        .stdout_has("Key store    Secure Enclave of this Mac (secrets.sealed)");
+
+    // A second device, in one go: sealed as well, with the vault's key from the keyfile.
+    let mut b = drive_device(&lab, &fake, "b");
+    b.env = a.env.clone();
+    b.env
+        .push(("GCLONE_TEST_KEYSTORE_MACHINE".into(), "mac-2".into()));
+    drive_login(&fake, &b, &login).await.ok();
+    assert!(b.state.join("secrets.sealed").exists() && !b.secrets_file().exists());
+    run_async(&b, &["ls", ":docs"])
+        .await
+        .ok()
+        .stdout_has("a.txt");
+    // A logout of either leaves no secret behind.
+    run_async(&a, &["logout"]).await.ok();
+    assert!(!sealed.exists() && !a.secrets_file().exists());
+}
+
 /// F2 of the key-store review (§8.2, §17.28): the device's secrets are sealed, an older gclone
 /// says "not signed in", its `login` signs in and writes `secrets.json` with the login and no
 /// key — and its passphrase prompt is abandoned. The key stays where it is: every command
@@ -4066,16 +4201,30 @@ async fn drive_mode_a_keyless_login_file_beside_the_sealed_store() {
     .await
     .ok();
     write_keyless(&a);
-    drive_login(&fake, &a, &login).await.ok();
+    let out = drive_login(&fake, &a, &login).await.ok();
+    // Exactly one store — and, the sealed store being what this device uses, the sealed one
+    // (§17.30: the login's saves made the two files one plain file, and its end moved that
+    // into the sealed store again; it used to stay in secrets.json).
     assert!(
-        a.secrets_file().exists() && !sealed.exists(),
-        "exactly one store"
+        sealed.exists() && !a.secrets_file().exists(),
+        "exactly one store, the sealed one"
     );
-    assert_eq!(a.json(&a.secrets_file())["keys"], original["keys"]);
+    assert!(
+        out.stderr
+            .contains("This device's login and key are sealed by this Mac's Secure Enclave"),
+        "{}",
+        out.stderr
+    );
     run_async(&a, &["ls", ":docs"])
         .await
         .ok()
         .stdout_has("later.txt");
+    run_async(&a, &["status"])
+        .await
+        .ok()
+        .stdout_has("Key store    Secure Enclave of this Mac (secrets.sealed)");
+    run_async(&a, &["keystore", "use", "file"]).await.ok();
+    assert_eq!(a.json(&a.secrets_file())["keys"], original["keys"]);
 }
 
 /// A device for `FakeDrive`, as in `drive_mode`.

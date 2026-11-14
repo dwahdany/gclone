@@ -221,6 +221,17 @@ has "== 16. The published release"
 has "Release $tag is published and verified."
 has "this is the FIRST signed release"
 has "(self-test: ad hoc signature"
+# Step 10 (0.5.1): the signed binary's login seals its secrets — what every Mac's first login
+# does. On a machine without a Secure Enclave the script says that it skipped exactly that,
+# which GCLONE_REQUIRE_ENCLAVE=1 (the Mac that signs releases) does not accept.
+case "$out" in
+    *"the login seals its secrets (secrets.sealed, no secrets.json)"*) ;;
+    *"SKIPPED: the sealing login and"*)
+        [ "${GCLONE_REQUIRE_ENCLAVE:-0}" != 1 ] ||
+            fail "$current: step 10 skipped the sealing login although GCLONE_REQUIRE_ENCLAVE=1"
+        ;;
+    *) fail "$current: step 10 says nothing about the sealing login" "$(printf '%s\n' "$out" | grep -A 4 '== 10\.')" ;;
+esac
 [ "$(cat "$state/releases/$tag/draft")" = false ] || fail "$current: not published"
 [ "$(cat "$state/log")" = "upload $tag $signed_asset
 upload $tag SHA256SUMS

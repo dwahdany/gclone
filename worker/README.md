@@ -417,7 +417,7 @@ a **build-provenance attestation** — a statement by GitHub that these bytes we
 
 **Release-day order.** Since 0.5.0 the release workflow stops at a *draft* release: pushing the tag
 builds, tests and attests the files, and nothing is public yet. The order is: push the tag **alone**
-(`git push origin v0.5.0` — not `main` yet) → wait for the workflow → on the owner's Mac
+(`git push origin v0.5.1` — not `main` yet) → wait for the workflow → on the owner's Mac
 `scripts/release-sign-macos.sh <tag>` (it verifies the draft, adds the signed macOS build and
 publishes; main README, "Publishing a release") → deploy the viewer as below → `git push origin
 main`. `fetch-viewer` finds nothing to fetch while the release is still a draft, and `main` waits
@@ -430,32 +430,32 @@ Then [deploy](#deploying-the-viewer), and go through the [checklist](#first-depl
 
 ## Deploying the viewer
 
-From a checkout of the release's tag (`git checkout v0.5.0`: the Worker's code and the header set the scripts
+From a checkout of the release's tag (`git checkout v0.5.1`: the Worker's code and the header set the scripts
 compare against come from the checkout; the viewer's files come from the release):
 
 ```sh
 cd worker
-node scripts/fetch-viewer.mjs v0.5.0                       # 1
+node scripts/fetch-viewer.mjs v0.5.1                       # 1
 npm ci                                                     # 2
 npm run deploy                                             # 3
-node scripts/verify-deployed.mjs https://<host> v0.5.0     # 4
+node scripts/verify-deployed.mjs https://<host> v0.5.1     # 4
 ```
 
-1. **`fetch-viewer`** downloads `gclone-viewer-0.5.0.tar.gz` from the tag's release into a temporary directory,
+1. **`fetch-viewer`** downloads `gclone-viewer-0.5.1.tar.gz` from the tag's release into a temporary directory,
    verifies its attestation and that the release is immutable —
 
    ```sh
-   gh attestation verify gclone-viewer-0.5.0.tar.gz --repo <owner>/<repo> \
+   gh attestation verify gclone-viewer-0.5.1.tar.gz --repo <owner>/<repo> \
      --signer-workflow <owner>/<repo>/.github/workflows/release.yml \
-     --source-ref refs/tags/v0.5.0 --deny-self-hosted-runners \
+     --source-ref refs/tags/v0.5.1 --deny-self-hosted-runners \
      --source-digest <the commit this checkout is at>
-   gh release verify-asset v0.5.0 gclone-viewer-0.5.0.tar.gz --repo <owner>/<repo>
+   gh release verify-asset v0.5.1 gclone-viewer-0.5.1.tar.gz --repo <owner>/<repo>
    ```
 
    — and only then unpacks it, checks it (`scripts/check-dist.mjs`) and replaces `./dist` with it. The first
    command says: built by this repository's release workflow, on this tag, **from the commit you have checked
    out** — the Worker's code is deployed from the checkout and the viewer from the release, and the two belong
-   to one commit (if the checkout is somewhere else, the script says `git checkout v0.5.0`). The second says:
+   to one commit (if the checkout is somewhere else, the script says `git checkout v0.5.1`). The second says:
    this file belongs to a release whose tag and files GitHub has fixed. It prints the version, the build id, the
    commit and the tarball's SHA-256 — **keep those four lines**. It uses Node's built-in modules, `gh` and `git`
    only, which is why it runs **before** `npm ci`: nothing of npm has run when the bundle is verified.
@@ -545,7 +545,7 @@ note what you saw.
       ```
 
       `200` with the policy, `200` with the policy, `404` — and `tail` shows **no** line for any of the three.
-      (`<build>` is printed by `fetch-viewer`.) `node scripts/verify-deployed.mjs https://<host> v0.5.0` passes.
+      (`<build>` is printed by `fetch-viewer`.) `node scripts/verify-deployed.mjs https://<host> v0.5.1` passes.
 - [ ] **4. Cloudflare accepted the deployment** (`npm run deploy` ended without an error about the main module
       `src/entry.ts` or the assets).
 - [ ] **5. The phone** (iOS Safari; see also [the phone test](#the-phone-test-15-minutes)):

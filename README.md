@@ -50,16 +50,19 @@ tested with the real restic against the fake Google Drive — **it, too, has not
 the real Google Drive yet**.
 
 0.5.0 also adds a second place for a Mac's login and key: a file that only that Mac's Secure
-Enclave can open ([Where a device keeps its key](#where-a-device-keeps-its-key)). It was run
-with the real Secure Enclave of one Mac (Apple silicon, macOS 27) from a terminal; **not
-yet across a restart or a system update, and not from ssh or a daemon** — which is what the
-built-in trial and `gclone keystore check` are for. Nothing moves there on its own: the
-plain file stays until you run `gclone keystore use enclave`. Releases are now published
+Enclave can open ([Where a device keeps its key](#where-a-device-keeps-its-key)). **From
+0.5.1 on that file is what a Mac uses, without a command**: a login on a Mac that is not
+connected yet seals its secrets from the start, and a Mac that is on the plain file is
+tested for three days and a restart and then moved ([Upgrading to 0.5.1](#upgrading-to-051) says what that means for a Mac that runs
+gclone today). The sealed file was run with the real Secure Enclave of one Mac (Apple
+silicon, macOS 27) from a terminal — a sealing login and a move after a test that passed on
+a test clock among it; **not yet across a real restart or a system update, and not from ssh
+or a daemon** — the built-in test and `gclone keystore check` find that out on each Mac, and
+`gclone login` with the passphrase is the way back if a sealed file ever stops opening.
+Releases are now published
 from a draft by a script on the maintainer's Mac that also signs the macOS build
-([Publishing a release](#publishing-a-release)); **that script has only run against a fake
-release so far**. For this first release made that way the order matters: the tag is pushed
-alone, and `main` only after the release is published — until then `main` keeps the
-previous `install.sh`, which installs old and new releases alike.
+([Publishing a release](#publishing-a-release)); 0.5.0 was the first release published that
+way.
 
 ## Install
 
@@ -124,7 +127,7 @@ it). To use your own auth Worker, pass its URL once: `gclone login https://<your
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.5.0` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.5.1` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`), `--require-attestation` (install nothing that `gh` did
 not verify), `--no-attestation` (checksum only: releases before 0.5.0 carry no attestation
@@ -152,7 +155,7 @@ carry the one from the repository variable `GCLONE_DEFAULT_AUTH_URL`, so that `g
 needs no argument:
 
 ```
-gclone 0.5.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.5.1 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
 ```
 
 On Linux gclone uses the system's CA certificates (the `ca-certificates` package — present on
@@ -166,6 +169,71 @@ by `--version`, which is also the way back to an older one) and touches nothing 
 login, the configuration and the local index stay. Update all devices in reasonable time: a
 device that meets index objects written by a newer gclone stops with exit code 3 until it is
 updated (see [Limitations](#limitations)).
+
+#### Upgrading to 0.5.1
+
+**On Linux nothing changes.** On a Mac, 0.5.1 changes where the device keeps its login and
+vault key — by itself, without asking
+([Where a device keeps its key](#where-a-device-keeps-its-key) has the whole story):
+
+- **A Mac that is connected today keeps working from its plain `secrets.json` for now.**
+  gclone tests the Mac's Secure Enclave in every run (it did so since 0.5.0; those days
+  count). When the test has passed — it worked on three different days at least 48 hours
+  apart, after a restart, and never failed in any session gclone ran in — the next run moves
+  the login and key into `secrets.sealed` and removes `secrets.json`. You are told once, at
+  a terminal.
+- **A `gclone login` on a Mac that is not connected writes `secrets.sealed` from the
+  start** — a new device, a Mac after `gclone logout`, a Mac whose sealed file no longer
+  opens. Three logins do **not** seal: signing in again on a Mac that is working from the
+  plain file changes nothing about where the secrets are (the test decides); so does a
+  `logout` and `login` while the test is still running; and after the test has recorded a
+  failure a new login stays on the plain file too, until
+  `gclone keystore check --new-trial`.
+- **After that, the passphrase is the way back.** `secrets.sealed` opens on that Mac only.
+  If the Mac is erased, repaired (a new logic board), replaced, or its files are restored
+  onto another Mac, gclone says that this Mac cannot open the sealed key, and
+  `gclone login` — the Google sign-in and the passphrase, as on a new device — connects it
+  again. Make sure the passphrase is in your password manager **before** the move; if it is
+  lost, `gclone passwd` on a connected device sets a new one.
+- **An older gclone on the same Mac stops finding the login once it is sealed.** gclone
+  0.4.0 and older read only `secrets.json`: they say *"not connected"* (exit 4), and their
+  `logout` does not sign the device out. That matters when something still starts an old
+  binary — restic runs whatever `gclone` is first on its `PATH`, a scheduler may name an old
+  path. Update every copy, or keep the plain file (next point). If you sign in with the old
+  gclone instead — it tells you to — it writes a `secrets.json` beside the sealed file, and
+  from then on 0.5.1 moves nothing by itself on that Mac: both keep working,
+  `gclone status` says that the two files exist, and `gclone keystore use enclave` (once the
+  old binary is gone) or `gclone keystore use file` settles it. **gclone 0.5.0 reads a
+  sealed file** and keeps working beside 0.5.1; it just does not seal anything itself. Going
+  back to 0.4.0: run `gclone keystore use file` with the new binary first.
+- **To keep the plain file**: `gclone keystore use file`, once. It is remembered — no test,
+  no move, not after a later login either.
+- **`GCLONE_KEYSTORE_TRIAL=0`** in the environment of a run — a scheduler's job, say — means
+  "this run must not come to depend on the Secure Enclave". That run tests nothing, moves
+  nothing and seals no login; and the first such run that uses the plain `secrets.json`
+  leaves a marker (`keystore-trial.off`), after which **no other run tests or moves
+  anything on that Mac either** — `gclone status` says *"kept: a run with
+  GCLONE_KEYSTORE_TRIAL=0 uses this device"*. `gclone keystore use enclave` or
+  `gclone keystore check --new-trial` take the marker away (the job puts it back at its next
+  run). **If a job of yours has carried this variable since 0.5.0, run that job — or
+  `gclone keystore use file` — before anything else after the update**: 0.5.0 left no
+  marker, and a Mac whose test has already passed is moved by the first run of 0.5.1 that
+  does not carry the variable. A sealed file is read with the variable set, like any other.
+- **A warning that 0.5.0 could leave for good.** If `gclone keystore use enclave` was the
+  first command after a login with 0.5.0, `gclone status` warned from then on that *"the
+  secrets are sealed to a key that was made at the move, not to the Secure Enclave trial's
+  key"*. 0.5.1 no longer warns about a test that had only just begun; where the warning is
+  still shown (the test had run for days, and its key could not be used at the move),
+  `gclone keystore check` from each session shows whether the key opens there, and
+  `gclone keystore check --new-trial` forgets the old record.
+- **If gclone runs unattended** (cron, a LaunchAgent, restic): nothing to do if those jobs
+  ran during the test — a job in whose session the Secure Enclave does not work stops the
+  move, and `gclone status` says so. A job that runs less often than every few days, or over
+  ssh, may meet the sealed file for the first time after the move; if it then fails with
+  *"The Secure Enclave cannot be used in this session"* (also when the Secure Enclave does
+  not answer there: gclone waits ten seconds for it, never longer),
+  `gclone keystore use file` from a terminal makes it work again — do not sign in again from
+  the failing job. `gclone keystore check`, run from the job, tells beforehand.
 
 ### Building from source
 
@@ -226,15 +294,18 @@ checkout that has the tag:
 
 ```sh
 git fetch --tags
-scripts/release-sign-macos.sh v0.5.0
+scripts/release-sign-macos.sh v0.5.1
 ```
 
 It verifies every file of the draft against its attestation and `SHA256SUMS`, signs a copy of
 the attested macOS binary with the Developer ID identity of that Mac (hardened runtime, no
 entitlements), proves that the signed binary is the attested one apart from the signature,
-runs it, adds `gclone-aarch64-apple-darwin-signed.tar.gz` and its line in `SHA256SUMS`,
+runs it — in a temporary home: a login to a directory vault, which has to seal its secrets
+with that Mac's Secure Enclave as every Mac's first login does since 0.5.1, then a copy and
+a read from the sealed store, and `gclone keystore check` —, adds
+`gclone-aarch64-apple-darwin-signed.tar.gz` and its line in `SHA256SUMS`,
 downloads the whole draft again and checks it once more, and publishes after you type
-`publish v0.5.0`. Then it verifies the published release (`gh release verify`,
+`publish v0.5.1`. Then it verifies the published release (`gh release verify`,
 `gh release verify-asset`, `install.sh --require-attestation`). It refuses to go on as soon as
 anything does not verify, and until it publishes it can simply be run again — also after an
 upload that was cut off (the draft may then be without `SHA256SUMS` or without the signed
@@ -246,7 +317,7 @@ network error, a rate limit, an attestation that is not served yet). That is not
 run
 
 ```sh
-scripts/release-sign-macos.sh --verify-published v0.5.0
+scripts/release-sign-macos.sh --verify-published v0.5.1
 ```
 
 which needs no draft and no signing identity, changes nothing, and can be repeated: it
@@ -300,9 +371,9 @@ before the first signed release:
 **Order on a release day** — the tag first, `main` last:
 
 ```sh
-git push origin v0.5.0                 # the tag ALONE: it carries the commit and starts release.yml
+git push origin v0.5.1                 # the tag ALONE: it carries the commit and starts release.yml
 #   … wait for the workflow: a draft release
-scripts/release-sign-macos.sh v0.5.0   # verify, sign, publish
+scripts/release-sign-macos.sh v0.5.1   # verify, sign, publish
 #   … deploy the viewer (worker/README.md)
 git push origin main                   # only now
 ```
@@ -563,10 +634,10 @@ gclone gc --purge                           # ...and delete for good what gc tra
 gclone repair                               # republish missing index objects from this device's cache
 gclone passwd                               # new passphrase (for future devices); the old keyfile goes to the trash
 gclone passwd --purge-old                   # ...and the old keyfiles are deleted for good, trash included
-gclone keystore                             # where this device keeps its login and key; the Secure Enclave trial (macOS)
+gclone keystore                             # where this device keeps its login and key; the Secure Enclave test (macOS)
 gclone keystore check                       # can this session (cron, ssh, a LaunchAgent) use the Secure Enclave? exit 0 = yes
-gclone keystore use enclave                 # macOS: move the key out of the plain file (checks the passphrase first)
-gclone keystore use file                    # ...and back
+gclone keystore use file                    # macOS: keep the login and key in the plain file — now and from now on
+gclone keystore use enclave                 # macOS: seal them now instead of waiting for the test (checks the passphrase first)
 gclone logout                               # remove this device's login and cached key
 ```
 
@@ -1087,16 +1158,21 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
   `drive.file`: it can only touch files it created itself, not the rest of your Drive. The
   Worker enforces that: it asks Google for nothing else, and it hands out no token for a grant
   that carries any other scope.
-- **On the device** the refresh token and the cached master key sit in plaintext in
-  `secrets.json` (mode 0600; gclone refuses to use it if it or its directory is accessible to
-  others). Anyone who can read that file as you has the vault. At-rest protection is disk
-  encryption. Treat the file like an SSH private key: never copy it to another machine.
-  gclone keeps its state directory out of Time Machine backups and marks it for other backup
-  tools, and never uploads its configuration or state directory itself, even when you sync
-  your whole home. **On a Mac you can move the key out of the plain file**, into a file that
-  only that Mac's Secure Enclave can open: `gclone keystore use enclave` —
-  [Where a device keeps its key](#where-a-device-keeps-its-key) says what that does and does
-  not protect against.
+- **On the device** the refresh token and the cached master key are one small document. **On
+  Linux** it sits in plaintext in `secrets.json` (mode 0600; gclone refuses to use it if it
+  or its directory is accessible to others): anyone who can read that file as you has the
+  vault, at-rest protection is disk encryption, and the file is to be treated like an SSH
+  private key — never copy it to another machine. **On a Mac** the document is kept in
+  `secrets.sealed`, encrypted to a key that only that Mac's Secure Enclave can use — by
+  default, from the login on, or after gclone has tested the Secure Enclave on a Mac that
+  was on the plain file. That makes a *copy* of the file worthless — a backup, a synced
+  folder, a disk image, the disk in another machine — and **nothing more**: a program that
+  runs as you on that Mac can use the key exactly as gclone does (there is no Touch ID or
+  password prompt in the way, on purpose: gclone runs unattended).
+  [Where a device keeps its key](#where-a-device-keeps-its-key) has the details. On both
+  systems gclone keeps its state directory out of Time Machine backups and marks it for
+  other backup tools, and never uploads its configuration or state directory itself, even
+  when you sync your whole home.
 - **Login phishing.** The sign-in is Google's device-code flow, and starting one needs no
   credentials. Someone can therefore start a login of *their own* and try to talk you into
   entering *their* code at `google.com/device`; the allowlist does not help, because the
@@ -1136,51 +1212,130 @@ Full version: §1.3 (threat model), §4 (formats) and §15 (accepted risks) of t
 A connected device holds two secrets: its Google login (a refresh token) and the vault's
 master key. They are one small document, and there are two places for it.
 
-**The plain file** — `secrets.json` in `~/.local/state/gclone`, mode 0600. This is the
-default everywhere and the only store on Linux. *What a copy is worth:* everything. Whoever
-obtains the file — from a backup, a synced folder, a disk image, another program's bug that
-reads files — has the vault key for good (it cannot be changed, see below) and the login
-until you revoke it.
+**The plain file** — `secrets.json` in `~/.local/state/gclone`, mode 0600. The only store on
+Linux, and on a Mac the place the secrets are in until the sealed file has taken them (or
+for good, if you say so). *What a copy is worth:* everything. Whoever obtains the file — from
+a backup, a synced folder, a disk image, another program's bug that reads files — has the
+vault key for good (it cannot be changed, see below) and the login until you revoke it.
 
 **The sealed file (Macs with a Secure Enclave)** — `secrets.sealed`, the same document
-encrypted to a key that lives in that Mac's Secure Enclave and cannot leave it. *What a copy
-is worth:* nothing, anywhere but on that Mac. gclone opens it without a prompt, in a
-terminal, from a LaunchAgent and from cron alike; it needs no Keychain and no signature.
+encrypted to a key that lives in that Mac's Secure Enclave and cannot leave it. **This is
+what a Mac uses, without a command** (since 0.5.1). *What a copy is worth:* nothing, anywhere
+but on that Mac. gclone opens it without a prompt, in a terminal, from a LaunchAgent and from
+cron alike; it needs no Keychain and no signature.
 
-What the sealed file does **not** stop: **a program running as you on that Mac.** Such a
+What the sealed file **protects against**: a copy of the file being used somewhere else — a
+backup that leaves your hands, a folder that a sync tool picked up, a disk image, the Mac's
+disk read in another machine, a file-reading bug in some other program.
+
+What it does **not** protect against: **a program running as you on that Mac.** Such a
 program can ask the Secure Enclave exactly as gclone does — or simply run
-`gclone copy : /somewhere`, or `gclone passwd` and read the new keyfile. It is protection for
-the file at rest and in copies, not a wall between your programs.
+`gclone copy : /somewhere`, or `gclone passwd` and read the new keyfile. There is no Touch
+ID and no password in the way, on purpose: gclone has to work from a scheduler at night. It
+is protection for the file at rest and in copies, not a wall between your programs.
 
-What it costs: **if the Mac is erased, repaired (a new logic board) or restored onto other
-hardware, the sealed file is dead, and the passphrase is the only way back for that device**
-(`gclone login`, as on a new device). That is why the move checks your passphrase first.
+What it costs: **the sealed file is useless on any other machine — your next Mac
+included.** If the Mac is erased, repaired (a new logic board), replaced, or its files are
+brought to another Mac by a migration or from a backup, gclone says so in plain words —
+*"This Mac's Secure Enclave cannot open this device's sealed key … Run `gclone login`"* —
+and **`gclone login` with the passphrase is the way back** (for a Drive vault it signs in to
+Google first), exactly as on a new device. The passphrase is therefore the recovery path
+for every Mac: keep it in your password manager, and if it is ever lost, set a new one with
+`gclone passwd` on a device that is still connected.
 
-**The trial.** Before you decide, gclone finds out whether the Secure Enclave works wherever
-you run gclone. On a Mac it keeps a Secure Enclave key that seals a random test value —
-never your secrets — and opens it in every run. `gclone status` shows what it has seen:
+**How a Mac gets there — nothing to run.**
+
+- *A login on a Mac that is not connected seals from the start.* `gclone login` makes a
+  Secure Enclave key, seals a value with it and opens it again, and writes the login and key
+  to `secrets.sealed`; on a new device a plain `secrets.json` never exists, and on a Mac
+  whose sealed file had stopped opening none is left at the end of the command. It says so
+  in one line. Where the Secure Enclave cannot be used — a Mac without one, a virtual
+  machine, a session without access to it — the login quietly uses the plain file, and
+  `gclone status` names the reason:
+
+  ```
+  Key store    Secure Enclave of this Mac (secrets.sealed)
+  Key store    plain file secrets.json (0600) — no Secure Enclave on this machine
+  ```
+
+  A login does **not** seal where a store that stops opening could break something that
+  works today: signing in again on a Mac that is working from the plain file changes
+  nothing (the test below decides), and so does a `gclone logout` followed by a
+  `gclone login` while that test is still running. After the test has recorded a failure —
+  or a login could not seal in some session — a new login stays on the plain file as well,
+  until `gclone keystore check --new-trial`.
+
+- *A Mac that is on the plain file is tested first, then moved.* That is every Mac that was
+  connected before 0.5.1. gclone keeps a Secure Enclave key that seals a random test value —
+  never your secrets — and opens it in every run, in whatever session that run is.
+  `gclone status` shows what it has seen:
+
+  ```
+  Key store    plain file secrets.json (0600) — Secure Enclave trial: 2 of 3 days, no restart seen yet
+  ```
+
+  The test has passed when it worked on **three different days that are at least 48 hours
+  apart, after a restart, and never failed** — in any session: a terminal, cron, a
+  LaunchAgent, restic's `serve restic`. The next gclone run after that — any command, also an unattended one, provided it can open
+  the test value itself — seals the secrets to the tested key, reads them back through the
+  Secure Enclave, compares, and only then removes `secrets.json`. No passphrase is asked and
+  nothing has to be confirmed. The next time you use gclone at a terminal it tells you once:
+
+  ```
+  note: this device's login and vault key are now kept in secrets.sealed, which only this
+  Mac's Secure Enclave can open (gclone tested it over several days and a restart first); …
+  ```
+
+  Why three days and a restart: so that a Mac that works today is not broken tomorrow. A
+  restart is the one thing no quick test can show, and three days — 48 hours from the first
+  success to the last, not just three dates — give a daily scheduled job the chance to run
+  twice in its own session, where a failure would stop the move. A job that runs less often
+  is not covered by that: see [Upgrading to 0.5.1](#upgrading-to-051).
+
+- *One failure stops it.* A session in which the test value did not open — or the Secure
+  Enclave did not answer within two seconds — is written down, the secrets stay in the plain
+  file, and `gclone status` warns. It never clears by itself: look at `gclone keystore`
+  (which sessions were seen — a terminal has "graphic access", cron has not — and every
+  failure), run `gclone keystore check` from the session in question (exit 0 = the Secure
+  Enclave is usable right there), and `gclone keystore check --new-trial` starts the test
+  over. A session that cannot make a Secure Enclave key at all — some schedulers' — is
+  reported as that session (`no Secure Enclave key could be made in session 0x2 … on
+  <date>`), not as a Mac without a Secure Enclave. The test never holds a command up: its
+  step is given two seconds. A failure also outlives a repair: if a sealed Mac broke in some
+  session and you signed in again from there (which puts the secrets back into the plain
+  file), the test that starts afterwards begins with that failure — nothing is moved a
+  second time until you have looked.
+
+**Saying no.**
+
+```sh
+gclone keystore use file
+```
+
+moves the login and key back into `secrets.json` — byte for byte the file there was — reads
+it back and then removes `secrets.sealed`; on a Mac that is still on the plain file it just
+records the decision. Either way **it is remembered**: no test, no move, and a later
+`gclone login` writes the plain file too.
+
+`GCLONE_KEYSTORE_TRIAL=0` in the environment of a run — a scheduler's job in a session you
+are not sure of, say — tells gclone that this run must not come to depend on the Secure
+Enclave: no test step, nothing moved, a login not sealed. Because a job is not protected by
+being the one run the test never sees, the first such run that uses the plain
+`secrets.json` leaves a marker in the state folder (`keystore-trial.off`), and from then on
+**no run tests, seals or moves anything on that Mac**, with or without the variable.
+`gclone status` shows it:
 
 ```
-Key store    plain file secrets.json (0600) — Secure Enclave trial: 2 of 3 days, no restart seen yet
-Key store    plain file secrets.json (0600) — Secure Enclave trial complete: `gclone keystore use enclave`
+Key store    plain file secrets.json (0600) — kept: a run with GCLONE_KEYSTORE_TRIAL=0 uses this device (…)
 ```
 
-"Complete" means it worked on three different days, after a restart, and never failed.
-`gclone keystore` shows the details — which sessions were seen (a terminal has "graphic
-access", cron has not) and every failure. If gclone runs from a scheduler, run
-`gclone keystore check` from that scheduler once: it exits 0 when the Secure Enclave is
-usable right there. The trial changes nothing and decides nothing; a Mac whose owner does
-nothing stays on the plain file. It also never holds a command up: its step is given two
-seconds, and one that does not come back is written down as a failure and not tried again in
-that session for a day. A session that cannot make a Secure Enclave key at all — some
-schedulers' — is reported as that session (`no Secure Enclave key could be made in session
-0x2 … on <date>`), not as a Mac without a Secure Enclave, and the trial starts in the first
-session that can; it then keeps that failure on its record, so "complete" waits until you
-have looked at it (`gclone keystore`, then `gclone keystore check --new-trial`). If you run
-gclone unattended and want none of this: `gclone keystore use file`, or
-`GCLONE_KEYSTORE_TRIAL=0` in the scheduler's environment.
+`gclone keystore check --new-trial` takes the marker away and starts the test over (a run
+with the variable puts it back); `gclone keystore use enclave` takes it away and seals. The
+variable does not un-seal anything: a Mac whose secrets are sealed already is read through
+the Secure Enclave by that job too — `gclone keystore use file` is what brings the plain
+file back.
 
-**The move** is one command, run by you at a terminal:
+To change your mind, or to seal at once instead of waiting for the test:
 
 ```sh
 gclone keystore use enclave
@@ -1188,46 +1343,61 @@ gclone keystore use enclave
 
 It proves this device's key against the vault, asks for your passphrase and checks that it
 opens the vault's keyfile (not sure of it? `gclone passwd` on this device sets a new one
-first), tells you what the trial has and has not seen, seals the secrets, reads them back
+first), tells you what the test has and has not seen, seals the secrets, reads them back
 through the Secure Enclave, and only then removes `secrets.json`. `--passphrase-file PATH`
-and `--yes` make it scriptable.
+and `--yes` make it scriptable. A wrong passphrase stops it with nothing changed — also on
+a Mac whose test has just passed: the command never lets the unasked move go first. The
+move gclone makes by itself is the same sequence without the questions — which also means
+**nobody checked your passphrase** at that point.
 
-**The way back** needs no passphrase:
+**Older gclone on the same Mac.** gclone 0.4.0 and older know only `secrets.json`. Once the
+secrets are sealed they say "not connected" — and **their `gclone logout` does not sign the
+device out** (they see nothing to remove; `secrets.sealed` stays). Use the new binary to
+sign out. If something on that Mac still starts an older gclone — restic starts whatever
+`gclone` is first on its `PATH` — update it, or keep the plain file with
+`gclone keystore use file`; gclone cannot see such a binary before it moves the secrets.
+`gclone keystore use enclave` lists the other `gclone` binaries it finds. A `gclone web` of
+an older version that is running stops when the move happens. If you sign in with the older
+gclone on a sealed Mac, it writes a `secrets.json` with the key beside `secrets.sealed`;
+gclone then uses that file, tests and moves nothing by itself while both are there (it
+would only take the older gclone's file away again), and `gclone status` says
 
-```sh
-gclone keystore use file
+```
+Key store    plain file secrets.json (0600) — kept: nothing is tested or moved while secrets.sealed lies beside it
 ```
 
-It writes `secrets.json` — byte for byte the file there was — reads it back and then removes
-`secrets.sealed`. It also records that you want the plain file: no trial, no hint.
-
-**Older gclone on the same Mac.** gclone 0.4.0 and older know only `secrets.json`. After the
-move they say "not signed in" — and **their `gclone logout` does not sign the device out**
-(they see nothing to remove; `secrets.sealed` stays). Use the new binary to sign out. If
-something on that Mac still starts an older gclone — restic starts whatever `gclone` is first
-on its `PATH` — update it first, or stay on the plain file; `keystore use enclave` lists the
-other `gclone` binaries it finds. A `gclone web` of an older version that is running stops
-when the move happens.
+until you settle it: `gclone keystore use file` keeps the plain file,
+`gclone keystore use enclave` — after the older gclone is updated — seals again. gclone
+0.5.0 reads the sealed file and is not affected.
 
 **Scheduling on macOS.** A LaunchAgent of the logged-in user and cron both work with the
 sealed file (measured). ssh sessions and LaunchDaemons are expected to, and were not
 measured: `gclone keystore check` from there tells. Before the first login after a restart
 nothing runs at all with FileVault on (the disk is locked); a Mac without FileVault that
-runs gclone before anyone logs in should stay on the plain file. If a sealed device ever
-says *"The Secure Enclave cannot be used in this session"*, the key is fine — run gclone
-from a session of the logged-in user, and do **not** sign in again. If it says *"the stored
-key cannot be used any more"* (it has then tried the key twice, and a new key worked), the
-Mac's Secure Enclave no longer has the key: `gclone login` with the passphrase puts it back.
-That login never throws the sealed file away before it has the key again: if you get the
-passphrase wrong or give up, the file is exactly what it was — and should the Secure Enclave
-have recovered meanwhile, the device simply works again, with the new login in `secrets.json`
-beside the sealed key (`gclone keystore` says so, and a `gclone login` that completes makes
-them one file).
+runs gclone before anyone logs in should stay on the plain file: `gclone keystore use file`.
+If a sealed device ever says *"The Secure Enclave cannot be used in this session"*, the key
+is fine — run gclone from a session of the logged-in user, or put the secrets back into the
+plain file with `gclone keystore use file` from such a session, and do **not** sign in
+again. The same text, with *"the Secure Enclave did not answer within 10 s"*, is what a
+session gets in which the Secure Enclave does not respond at all: no gclone command waits
+for it longer than that, `gclone status` and `gclone keystore` included. If it says *"This Mac's Secure Enclave cannot open this device's sealed key"* (it
+has then tried the key twice, and a new key worked), the Mac's Secure Enclave no longer has
+the key: `gclone login` with the passphrase puts it back, sealed again by the Mac you are
+on. That login never throws the sealed file away before it has the key again: if you get
+the passphrase wrong or give up, the file is exactly what it was — and should the Secure
+Enclave have recovered meanwhile, the device simply works again, with the new login in
+`secrets.json` beside the sealed key (`gclone keystore` says so, and a `gclone login` that
+completes makes them one sealed file).
 
 If `gclone status` ever warns about *plain copies of this device's login and key* in the
 state folder: a write was interrupted at some point and left a temporary copy behind.
 `gclone keystore use enclave` (or `use file`, whichever store you use) removes them; while
-they are there, a copy of the state folder is not worthless elsewhere.
+they are there, a copy of the state folder is not worthless elsewhere. If it says that
+`secrets.json` and `secrets.sealed` *both exist*, a move was interrupted or an older gclone
+signed in: gclone keeps using `secrets.json`. The next run finishes a move that gclone began
+by itself; anything else waits for you, and the warning names the command
+(`gclone keystore use file`, with `--discard-sealed` if the sealed file does not open here
+or holds another key; or `gclone keystore use enclave`).
 
 **Backups.** Whichever store is in use, gclone keeps its state folder out of backups as far
 as it can: on a Mac the folder is excluded from Time Machine (gclone says so once), and on
@@ -1348,12 +1518,19 @@ can be unlocked, treat it like the stolen device above.
 - **The sealed key store** ([Where a device keeps its key](#where-a-device-keeps-its-key)) is
   for Macs with a Secure Enclave; Linux keeps the plain 0600 file (no desktop keyring is used:
   on a headless machine there is none to rely on after a reboot). It protects copies of the
-  file, not against programs running as you. Not measured yet: a sealed file across a
-  restart or a macOS update, ssh sessions, daemons, a locked screen — the trial and
-  `gclone keystore check` exist to find out on your Mac before you depend on it. Nothing is
-  ever moved there automatically, so a Mac whose owner never runs `gclone keystore use enclave`
-  stays on the plain file. The access token cache (`token.json`, valid for about an hour)
-  stays a plain file. There is still no way to change the vault key: a `secrets.json` that
+  file, not against programs running as you: there is no user-presence check. Since 0.5.1 a
+  Mac uses it **without being asked**, which has a price: a sealed file is dead on any other
+  machine, so every Mac depends on the passphrase for recovery — and the move gclone makes
+  by itself does not check that you still know it; a job in a session the test never saw
+  (one that runs less often than every few days, ssh, a daemon) or an older gclone on the
+  same Mac can fail with exit 4 after the move, until `gclone keystore use file`. A job
+  that has set `GCLONE_KEYSTORE_TRIAL=0` since 0.5.0 is protected only from its first run
+  with 0.5.1 on (the marker it leaves); a Mac whose test had passed before can be moved by
+  an earlier run. Not measured yet: a sealed file across a real restart or a macOS update (the test measures
+  the restart on each Mac before a device that was on the plain file is moved; a *new* login
+  is sealed without that evidence), ssh sessions, daemons, a locked screen, a Mac without a
+  Secure Enclave (expected: an error and the plain file; only simulated). The access token
+  cache (`token.json`, valid for about an hour) stays a plain file. There is still no way to change the vault key: a `secrets.json` that
   was copied or backed up in the past stays a key to the vault.
 - `gclone web` is a viewer, not a file manager: read-only, no thumbnails, no list of deleted
   files (`gclone restore --list` has it), and what the browser cannot show (HEIC outside
@@ -1472,24 +1649,25 @@ can be unlocked, treat it like the stolen device above.
 | What | Where | Mode |
 |---|---|---|
 | `config.json` — which vault, the auth Worker URL (no secrets) | `$GCLONE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/gclone`, else `~/.config/gclone` | 0600 |
-| `secrets.json` — this device's refresh token and the cached master key | `$GCLONE_STATE_DIR`, else `$XDG_STATE_HOME/gclone`, else `~/.local/state/gclone` | 0600 |
-| `secrets.sealed` — the same, sealed by the Mac's Secure Enclave, **instead of** `secrets.json` after `gclone keystore use enclave` | same directory | 0600 |
-| `keystore.json` — which of the two you chose with `gclone keystore use` (no secret) | same directory | 0600 |
-| `keystore-trial.json` — macOS: the Secure Enclave trial's own key, test value and record (no secret of the vault) | same directory | 0600 |
-| `keystore-trial.lock` — macOS: an empty lock file for changes of that record; `backup-note.due` — an empty marker while the one-time note about older backups is still owed to a terminal | same directory | 0600 |
+| `secrets.json` — this device's refresh token and the cached master key, in plain: Linux; a Mac until its secrets are sealed, or by choice | `$GCLONE_STATE_DIR`, else `$XDG_STATE_HOME/gclone`, else `~/.local/state/gclone` | 0600 |
+| `secrets.sealed` — the same, sealed by the Mac's Secure Enclave, **instead of** `secrets.json`: what a Mac uses | same directory | 0600 |
+| `keystore.json` — only if you chose with `gclone keystore use`: which of the two (no secret) | same directory | 0600 |
+| `keystore-trial.json` — macOS: the Secure Enclave test's own key, test value and record (no secret of the vault) | same directory | 0600 |
+| `keystore-trial.lock` — macOS: an empty lock file for changes of that record; `backup-note.due`, `keystore-note.due` — empty markers while a one-time note (about older backups; about the move into the sealed file) is still owed to a terminal; `keystore-trial.off` — an empty marker: a run with `GCLONE_KEYSTORE_TRIAL=0` uses this device, so nothing is tested or moved | same directory | 0600 |
 | `secrets.lock`, `CACHEDIR.TAG` — a lock file; the mark that keeps the folder out of backups | same directory | 0600 |
 | `token.json` — cached access token | same directory | 0600 |
 | `state.db`, `lock`, `index-cache/` — the index replica and sync state | `<state root>/<vault id>/` | 0600 / 0700 |
 
 `gclone serve restic` reads the secrets (`secrets.json` or `secrets.sealed`) and `token.json`,
-writes only `token.json` — and, on a Mac that is still on the plain file, the trial's record —
-and uses neither `config.json` nor a vault's state: it takes no lock, and runs beside any other
-gclone command.
+writes only `token.json` — and, on a Mac that is still on the plain file, the test's record;
+like every command there it also makes the move into the sealed file once the test has
+passed — and uses neither `config.json` nor a vault's state: it takes no vault lock, and runs
+beside any other gclone command.
 
 `gclone logout` deletes `secrets.json`, `secrets.sealed` and `token.json` (and temp copies of
 them that an interrupted write may have left in that directory); `gclone logout --forget` also
 deletes `config.json` and the vault's state directory. `keystore.json`, `keystore-trial.json`,
-`secrets.lock` and `CACHEDIR.TAG` stay: none of them holds a secret. The state folder is left
+`keystore-trial.off`, `secrets.lock` and `CACHEDIR.TAG` stay: none of them holds a secret. The state folder is left
 out of Time Machine backups (macOS) and marked with `CACHEDIR.TAG`
 ([Where a device keeps its key](#where-a-device-keeps-its-key)). `state.db` contains plaintext paths and hashes
 and is as sensitive as the synced files themselves.
@@ -1592,10 +1770,10 @@ so.)
 - `Cargo.lock` is committed; build with `--locked`. Dependencies are compiled with
   `opt-level = 3` in dev and test builds too: the keyfile KDF is Argon2id at 256 MiB.
 - The key store ([Where a device keeps its key](#where-a-device-keeps-its-key)): a debug build
-  uses no Secure Enclave and runs no trial; the tests select a stand-in with
-  `GCLONE_TEST_KEYSTORE_SEALER=fake`. On a Mac with a Secure Enclave, `cargo test` also runs two
-  tests against the real one (names starting with `hardware_`; they make keys that are stored
-  nowhere); elsewhere those print `SKIPPED: no Secure Enclave on this machine` and pass.
+  uses no Secure Enclave, seals nothing and runs no trial; the tests select a stand-in with
+  `GCLONE_TEST_KEYSTORE_SEALER=fake`. On a Mac with a Secure Enclave, `cargo test` also runs
+  three tests against the real one (names starting with `hardware_`; they make keys that are
+  stored nowhere); elsewhere those print `SKIPPED: no Secure Enclave on this machine` and pass.
   `GCLONE_REQUIRE_ENCLAVE=1` turns that skip into a failure — set it on the Mac that signs
   releases. `GCLONE_TEST_OLD_GCLONE=/path/to/gclone-0.4.0 cargo test --test keystore` also runs
   the released 0.4.0 binary beside the new files.
