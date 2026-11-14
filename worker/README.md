@@ -16,7 +16,7 @@ decrypts the vault in the browser. For that the Worker serves the page and its s
 [The viewer's files](#the-viewers-files)). Without the viewer's three secrets and files the Worker is the plain
 sign-in helper for `gclone login`, and everything about devices below is unchanged. Setting the viewer up is
 [its own section](#the-hosted-viewer-setup); what it means for the vault's security — the page that asks for the
-passphrase is served by this Worker — is in the repository's README, "Browse from any browser".
+passphrase is served by this Worker — is in [`docs/SECURITY.md`, "The hosted viewer: what you trust"](../docs/SECURITY.md#the-hosted-viewer-what-you-trust).
 
 You set it up **once** — not once per device. Afterwards every device is connected with
 `gclone login https://<host>`.
@@ -248,7 +248,7 @@ instead.
   while the hosted viewer was in use: deploying the release again is not the end of it. A browser that opened the
   viewer in that time can keep the other party's page (a Service Worker of theirs answers the address from inside
   the browser), and `verify-deployed` cannot see a browser. **Clear the site's data in every browser that had the
-  viewer open, before the passphrase is typed there again**: the steps are in the repository's `README.md`, "After a
+  viewer open, before the passphrase is typed there again**: the steps are in `docs/SECURITY.md`, "After a
   change of hands (the hosted viewer)", and `docs/AUTH.md`. What the Worker does about it by itself, and where that
   stops, is under [What the Worker guarantees](#what-the-worker-guarantees).
 - **Cost and limits.** A login is one start plus one poll every 5 seconds while you enter the code (a minute at
@@ -345,8 +345,8 @@ filled in by your password manager, and the browser fetches ciphertext from Goog
 
 **Decide first whether you want it.** The page that asks for the passphrase is served by this Worker. Whoever
 controls the Worker, its secrets, the Cloudflare account or the domain can serve a page that takes the passphrase —
-and with it everything. A device that never opens the hosted viewer is not affected. The repository's README
-("Browse from any browser") and `docs/SPEC.md` §1.3 say what that means; the three habits against phishing are
+and with it everything. A device that never opens the hosted viewer is not affected. `docs/SECURITY.md`
+("The hosted viewer: what you trust") and `docs/SPEC.md` §1.3 say what that means; the three habits against phishing are
 [below](#phishing-codes-and-look-alike-pages).
 
 It needs a **custom domain** ([above](#custom-domain-and-rate-limiting-rule-recommended)): two of the settings below
@@ -419,7 +419,7 @@ a **build-provenance attestation** — a statement by GitHub that these bytes we
 builds, tests and attests the files, and nothing is public yet. The order is: push the tag **alone**
 (`git push origin v0.5.1` — not `main` yet) → wait for the workflow → on the owner's Mac
 `scripts/release-sign-macos.sh <tag>` (it verifies the draft, adds the signed macOS build and
-publishes; main README, "Publishing a release") → deploy the viewer as below → `git push origin
+publishes; `DEVELOPMENT.md`, "Publishing a release") → deploy the viewer as below → `git push origin
 main`. `fetch-viewer` finds nothing to fetch while the release is still a draft, and `main` waits
 because the install one-liner pipes `install.sh` from it: the new script refuses a latest release
 without attested binaries, which is what the previous release is until this one is published.
@@ -1015,7 +1015,7 @@ passphrase.
 put SEAL_KEY` ends every browser session at once (devices are not affected). The vault was locked when the device
 was put away — the viewer locks after 15 minutes without input and after 5 minutes in the background — so what the
 finder has is the session: ciphertext and the keyfile, until the cookie's sealed end or the new `SEAL_KEY`. If the
-browser had the passphrase saved, treat it as a stolen unlocked device (the repository's README, "Lost or stolen
+browser had the passphrase saved, treat it as a stolen unlocked device (`docs/SECURITY.md`, "Lost or stolen
 device").
 
 ## Moving from the browser sign-in (gclone before 0.2.0)

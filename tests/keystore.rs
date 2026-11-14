@@ -2603,7 +2603,7 @@ fn leftovers_beside_a_sealed_store_are_reported_and_settled() {
 
 /// What the released gclone 0.4.0 does beside the new files (§17.28, E10): it must go on
 /// working while the device is on `secrets.json`, and what it does on a sealed device is what
-/// the README says. Runs with a real v0.4.0 binary named by `GCLONE_TEST_OLD_GCLONE` (the
+/// docs/SECURITY.md says. Runs with a real v0.4.0 binary named by `GCLONE_TEST_OLD_GCLONE` (the
 /// `gclone` of the v0.4.0 release archive for this machine); without one it prints a visible
 /// note and passes.
 #[test]
@@ -2735,7 +2735,7 @@ fn the_released_0_4_0_binary_beside_the_new_files() {
     d.run(&["keystore", "use", "file"]).ok();
     old(&["ls", ":docs"]).ok().has("from-old.txt");
 
-    // §17.30, the README's upgrade note: a device that gclone 0.4.0 made, on a Mac that
+    // §17.30, the upgrade note in docs/SECURITY.md: a device that gclone 0.4.0 made, on a Mac that
     // then runs this version. While the trial runs the old binary works beside it; the run
     // that completes the trial moves the secrets, and from then on the old binary says "not
     // connected" — until `gclone keystore use file`, which gives back the file it wrote and

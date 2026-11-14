@@ -147,8 +147,8 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
 }
 
 /** A browser fetching the script of a Service Worker that is not the viewer's: it installs or — far more likely —
- *  checks for an update of one that was registered while someone else served this origin (README.md, "After a change
- *  of hands"). The honest deployment registers `/sw.js` and nothing else, and that file never reaches this code.
+ *  checks for an update of one that was registered while someone else served this origin (docs/SECURITY.md, "After a
+ *  change of hands"). The honest deployment registers `/sw.js` and nothing else, and that file never reaches this code.
  *  Browsers send `Service-Worker: script` with the request for a Service Worker's own script; Firefox sends it for
  *  the scripts that one imports as well, which `Sec-Fetch-Dest` tells apart (`script`, not `serviceworker`) — the
  *  viewer's Service Worker imports its files, and a file of a deployment that has not arrived yet must not clear

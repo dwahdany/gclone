@@ -323,7 +323,7 @@ signing_identity() {
         keychain_args=$GCLONE_SIGN_KEYCHAIN
     else
         say "   WARNING: GCLONE_SIGN_KEYCHAIN is not set. With the identity in the login keychain,"
-        say "   every program of this user can sign as you without being asked (README, \"Publishing a release\")."
+        say "   every program of this user can sign as you without being asked (DEVELOPMENT.md, \"Publishing a release\")."
     fi
     # Only identities of type "Developer ID Application" count; an "Apple Distribution" or
     # "Apple Development" identity beside it is ignored.
@@ -890,7 +890,7 @@ Usage: scripts/release-sign-macos.sh <tag>
        scripts/release-sign-macos.sh --selftest [--binary PATH]
 
 Signs the macOS build of the draft release <tag> with the Developer ID identity of this Mac and
-publishes the release, after verifying every file. See the head of the script and the README
+publishes the release, after verifying every file. See the head of the script and DEVELOPMENT.md
 ("Publishing a release") for the procedure and the environment variables.
 
 --verify-published verifies a release that IS published, from GitHub alone: every file against

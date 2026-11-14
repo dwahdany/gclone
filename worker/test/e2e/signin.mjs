@@ -272,7 +272,7 @@ try {
   assert.ok(logged.includes('/web/token') && !/ya29|1\/\/fake|4\/0A|@example/.test(logged), 'the Worker logs routes and statuses only');
   console.log(`chrome ${browser.version()}: sign-in round trip through the real Worker code: start → Google → /callback → token (cookie: HttpOnly, Secure, SameSite=Strict) → reload → refresh → unlock → logout; an address off the allowlist is refused and revoked`);
 
-  // --- After a change of hands (README; the audit's L6). Someone else served this origin for a while, and a
+  // --- After a change of hands (docs/SECURITY.md; the audit's L6). Someone else served this origin for a while, and a
   //     browser that came by then keeps their Service Worker: it answers `/` from the browser, so the release
   //     that is deployed again never loads there, and a client without that browser's profile sees nothing wrong.
   const visitor = await browser.newContext();

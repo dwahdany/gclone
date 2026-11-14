@@ -276,7 +276,7 @@ The refresh token and the unlocked vault key are one small document in gclone's 
 can read it.
 
 **On Linux** it is the plain file `secrets.json`. A copy of that file is the login and the
-vault key — so gclone marks the folder for backup tools (README, "Local files"), and the file
+vault key — so gclone marks the folder for backup tools ([USAGE.md, "Local files"](USAGE.md#local-files)), and the file
 is never to be copied anywhere.
 
 **On a Mac with a Secure Enclave** it is `secrets.sealed`: the same content, encrypted to a
@@ -417,8 +417,8 @@ vault — so let an attached device go first.
      If you cannot be sure which browsers that was, do it in all of them. A browser you no longer
      have is not a problem: it holds no key.
   4. If the passphrase was typed into the viewer during that time, treat it — and the vault key —
-     as known to whoever served the page: see the README, "If a passphrase or a device's key file
-     leaked".
+     as known to whoever served the page: see [SECURITY.md](SECURITY.md#if-a-passphrase-or-a-devices-key-file-leaked), "If a passphrase or a
+     device's key file leaked".
 
   The Worker helps a little with step 3 and must not be relied on: a request for the script of any
   Service Worker other than the viewer's own is answered with `Clear-Site-Data`, on which Chrome
