@@ -48,6 +48,17 @@
     attempt(() => endKdf());
   }
 
+  /**
+   * Nothing of the vault stays on the screen: the list is not painted again, and a frame —
+   * the browser's PDF viewer with a file in it — is taken out of the page. (While a PDF is
+   * shown the page has the browser ask before the tab leaves, app.js; a lock is not asked
+   * about, and the reload that follows finds no frame.)
+   */
+  function clearScreen() {
+    attempt(() => { document.body.hidden = true; });
+    attempt(() => { for (const frame of document.querySelectorAll('iframe')) frame.remove(); });
+  }
+
   const MINUTE = 60 * 1000;
   const IDLE_LOCK = 15 * MINUTE; // without input
   const HIDDEN_LOCK = 5 * MINUTE; // in the background
@@ -659,7 +670,7 @@
     unlocked = false;
     dropVault();
     // Nothing of the list is painted after this task.
-    attempt(() => { document.body.hidden = true; });
+    clearScreen();
     attempt(() => history.replaceState(null, '', '/'));
     attempt(() => { if (typeof note === 'string' && note) flags.set('gclone.note', note); });
     location.reload();
@@ -709,7 +720,7 @@
     leaving = true;
     unlocked = false;
     dropVault();
-    attempt(() => { document.body.hidden = true; });
+    clearScreen();
     attempt(() => history.replaceState(null, '', '/'));
     tellTabs('outgoing');
     let failure = null;

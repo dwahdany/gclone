@@ -23,8 +23,8 @@
     unreachable: 'The viewer does not answer. Is `gclone web` still running in its terminal?',
     // true: places live in the page's memory, and history.state holds no name either.
     privateAddress: false,
-    // false: a card with "Open" (a tab of its own) in place of the PDF frame.
-    pdfInline: true,
+    // true: a PDF in the preview's frame is kept from taking the tab along (`guardPdf`).
+    pdfGuard: false,
     // (kind) -> boolean: whether a file of this kind is offered "Open in a new tab".
     openInTab: () => true,
     // false: download links are plain links, which the answer's Content-Disposition turns
@@ -1103,6 +1103,37 @@
     return node;
   }
 
+  // Where a frame does not show a PDF: a browser without a PDF viewer of its own would save
+  // the file, and iPhone and iPad show only the first page of a PDF in a frame. (An iPad
+  // calls itself a Mac — one with a touch screen.)
+  const framesPdf = () => navigator.pdfViewerEnabled !== false
+    && !/\b(iPhone|iPad|iPod)\b/.test(navigator.userAgent)
+    && !(navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  // A PDF is shown by the browser's own viewer, and a link in a framed PDF takes the whole
+  // tab to its address with one click (measured in Chrome and in Firefox). A provider whose
+  // page is worth imitating asks for a guard (`pdfGuard`), which is one of two things:
+  // - Firefox's viewer runs in a sandboxed frame, and a sandboxed frame may not navigate
+  //   the tab: a click on the link does nothing. (A middle click still opens the link's
+  //   address in a new tab; the viewer's tab stays.)
+  // - Chrome's viewer does not load in a sandboxed frame. There — and in every engine that
+  //   was not measured — the browser asks before the tab leaves while a PDF is shown.
+  const GECKO = /\bGecko\/\d/.test(navigator.userAgent); // the others say "like Gecko"
+  const PDF_SANDBOX = 'allow-scripts allow-same-origin allow-downloads allow-modals';
+  let ownLeave = 0; // until then a navigation is the page's own: a download
+  if (provider.pdfGuard && !GECKO) {
+    // Asked of the document, not of a remembered frame: two previews that overlap (the
+    // probe of the first answering after the second's) must not leave the shown one unguarded.
+    window.addEventListener('beforeunload', (event) => {
+      if (!document.querySelector('iframe.v-frame') || Date.now() < ownLeave) return;
+      event.preventDefault();
+      event.returnValue = ''; // what older engines ask for
+    });
+  }
+  function guardPdf(frame) {
+    if (GECKO) frame.setAttribute('sandbox', PDF_SANDBOX);
+  }
+
   // A click on a download control: asked of the store first, so that a file it cannot
   // deliver is an error in the page, not a download that silently fails.
   async function download(control) {
@@ -1113,6 +1144,7 @@
       await probe(control.entry);
       const go = el('a', { href: control.getAttribute('href'), download: provider.downloadAttribute, hidden: true });
       document.body.append(go);
+      ownLeave = Date.now() + 500;
       go.click();
       go.remove();
     } catch (error) {
@@ -1179,10 +1211,8 @@
       media.addEventListener('loadedmetadata', ready, { once: true });
       media.addEventListener('error', fallback, { once: true });
       put(wait, media);
-    } else if (entry.kind === 'pdf' && !provider.pdfInline) {
-      // No frame for a PDF (a browser that shows only its first page in one; a viewer that
-      // keeps PDFs out of its own tab): a tab of its own, which the viewer has no hold on.
-      const box = kindCard(entry, 'A PDF opens in a tab of its own. That tab is not part of the viewer: close it when you are done.');
+    } else if (entry.kind === 'pdf' && !framesPdf()) {
+      const box = kindCard(entry, 'No PDF preview in this browser.');
       box.insertBefore(el('a', { class: 'btn', href: url, target: '_blank', rel: 'noopener' },
         icon('open'), el('span', { text: 'Open' })), box.lastChild);
       put(box);
@@ -1191,7 +1221,9 @@
       put(wait);
       try {
         await probe(entry);
-        const frame = el('iframe', { class: 'v-frame', title: entry.name, src: url });
+        const frame = el('iframe', { class: 'v-frame', title: entry.name });
+        if (provider.pdfGuard) guardPdf(frame);
+        frame.setAttribute('src', url);
         frame.addEventListener('load', ready, { once: true });
         // A browser whose PDF viewer never reports "loaded" must not hide it for good.
         setTimeout(ready, 4000);

@@ -223,7 +223,7 @@ checkout that has the tag:
 
 ```sh
 git fetch --tags
-scripts/release-sign-macos.sh v0.6.0
+scripts/release-sign-macos.sh v0.6.1
 ```
 
 It verifies every file of the draft against its attestation and `SHA256SUMS`, signs a copy of
@@ -234,7 +234,7 @@ with that Mac's Secure Enclave as every Mac's first login does since 0.5.1, then
 a read from the sealed store, and `gclone keystore check` —, adds
 `gclone-aarch64-apple-darwin-signed.tar.gz` and its line in `SHA256SUMS`,
 downloads the whole draft again and checks it once more, and publishes after you type
-`publish v0.6.0`. Then it verifies the published release (`gh release verify`,
+`publish v0.6.1`. Then it verifies the published release (`gh release verify`,
 `gh release verify-asset`, `install.sh --require-attestation`). It refuses to go on as soon as
 anything does not verify, and until it publishes it can simply be run again — also after an
 upload that was cut off (the draft may then be without `SHA256SUMS` or without the signed
@@ -246,7 +246,7 @@ network error, a rate limit, an attestation that is not served yet). That is not
 run
 
 ```sh
-scripts/release-sign-macos.sh --verify-published v0.6.0
+scripts/release-sign-macos.sh --verify-published v0.6.1
 ```
 
 which needs no draft and no signing identity, changes nothing, and can be repeated: it
@@ -300,9 +300,9 @@ before the first signed release:
 **Order on a release day** — the tag first, `main` last:
 
 ```sh
-git push origin v0.6.0                 # the tag ALONE: it carries the commit and starts release.yml
+git push origin v0.6.1                 # the tag ALONE: it carries the commit and starts release.yml
 #   … wait for the workflow: a draft release
-scripts/release-sign-macos.sh v0.6.0   # verify, sign, publish
+scripts/release-sign-macos.sh v0.6.1   # verify, sign, publish
 #   … deploy the viewer (worker/README.md)
 git push origin main                   # only now
 ```

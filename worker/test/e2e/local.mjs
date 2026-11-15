@@ -1,7 +1,7 @@
 // The shared page under its other provider: `gclone web`, the local viewer, in a real browser.
 // The hosted viewer runs the same app.js through a seam (`window.gcloneProvider`); this checks
 // that without one the page behaves as it did: the server's API and file addresses, places in
-// history.state, download links with the `download` attribute, the PDF in a frame.
+// history.state, download links with the `download` attribute, the PDF in a frame without a guard.
 //
 //   node worker/test/e2e/local.mjs [chrome] [webkit] [firefox]      (default: chrome)
 //
@@ -12,9 +12,9 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ENGINES, loadPlaywright } from './harness.mjs';
+import { ENGINES, firefoxWithPdfViewer, loadPlaywright } from './harness.mjs';
 import { MANY, beforePhone, timeMachine, timeMachinePhone } from './timemachine.mjs';
-import { BIDI_DIR, BIDI_NAME, ODD_NAMES, addHistory, buildVault } from './vault.mjs';
+import { BIDI_DIR, BIDI_NAME, ODD_NAMES, PDF_LINK, addHistory, buildVault, magentaShare } from './vault.mjs';
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'gclone-viewer-local-'));
 const vault = buildVault(work, { many: 30 });
@@ -93,13 +93,21 @@ async function run(engine, playwright) {
     await download.saveAs(saved);
     assert.ok(fs.readFileSync(saved).equals(vault.files.get('docs/notes.txt')));
     assert.equal(download.suggestedFilename(), 'notes.txt');
-    // The PDF is in a frame (the hosted viewer keeps it out of its page; this provider does not).
+    // The PDF is in a frame — a card in a browser without a PDF viewer, which Playwright's
+    // Firefox is (`pdfFrame` below has one with its viewer).
     await page.click('#viewer-next');
     await page.waitForFunction(() => document.getElementById('viewer-name').title === 'page.html');
     await page.click('#viewer-next');
     await page.waitForFunction(() => document.getElementById('viewer-name').title === 'report.pdf');
-    await page.waitForSelector('#viewer-body iframe');
-    assert.match(await page.getAttribute('#viewer-body iframe', 'src'), /^file\?id=/);
+    if (engine === 'firefox') {
+      await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
+      assert.equal(await page.textContent('#viewer-body .card p'), 'No PDF preview in this browser.');
+      assert.match(await page.getAttribute('#viewer-body .card a.btn[target="_blank"]', 'href'), /^file\?id=/);
+      assert.equal(await page.$('#viewer-body iframe'), null);
+    } else {
+      await page.waitForSelector('#viewer-body iframe');
+      assert.match(await page.getAttribute('#viewer-body iframe', 'src'), /^file\?id=/);
+    }
     await page.keyboard.press('Escape');
     await page.waitForSelector('#viewer', { state: 'hidden' });
     assert.deepEqual(await page.evaluate(() => history.state), { dir: 'docs', depth: 1, began: false });
@@ -171,12 +179,77 @@ async function run(engine, playwright) {
     await page.click('#h-name button');
     // (Firefox's own PDF viewer, in the frame, remarks on its layout.)
     assert.deepEqual(problems.filter((line) => !/Layout was forced before the page was fully loaded/.test(line)), [], `${label}: console`);
-    console.log(`${label}: the local viewer (gclone web) behaves as before the seam: API and file ids of the server, places in history.state, download and PDF frame`);
+    console.log(`${label}: the local viewer (gclone web) behaves as before the seam: API and file ids of the server, places in history.state, download and PDF preview`);
     await context.close();
+    await pdfFrame(playwright, engine, browser);
     await timeMachineLocal(browser, engine, label);
   } finally {
     await browser.close();
     await viewer.stop();
+  }
+}
+
+/**
+ * The PDF frame of the local viewer: no sandbox and no question — this page asks for no
+ * guard (it holds no secret to ask for again) —, so a link in the PDF takes the tab. And the
+ * card where a frame does not show a PDF, by the rule both viewers share.
+ */
+async function pdfFrame(playwright, engine, usual) {
+  const browser = engine === 'firefox' ? await firefoxWithPdfViewer(playwright) : usual;
+  const label = `${engine} ${browser.version()}`;
+  const viewers = [];
+  try {
+    const open = async (prepare) => {
+      // (A link of `gclone web` is good for one browser: each context gets a viewer of its own.)
+      const viewer = await startViewer();
+      viewers.push(viewer);
+      const { link } = viewer;
+      const context = await browser.newContext({ acceptDownloads: true });
+      if (prepare) await context.addInitScript(prepare);
+      const left = [];
+      await context.route(`${new URL(PDF_LINK).origin}/**`, async (route) => {
+        left.push(route.request().url());
+        await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>elsewhere</title><p>elsewhere</p>' });
+      });
+      const page = await context.newPage();
+      const asked = [];
+      page.on('dialog', (dialog) => { asked.push(dialog.type()); dialog.dismiss().catch(() => {}); });
+      await page.goto(link);
+      await page.waitForSelector('#rows .row');
+      for (const name of ['docs', 'report.pdf']) {
+        await page.waitForFunction((wanted) => [...document.querySelectorAll('#rows .row .name')].some((n) => n.title === wanted), name);
+        await (await page.evaluateHandle((wanted) => [...document.querySelectorAll('#rows .row')].find((r) => r.querySelector('.name').title === wanted), name)).asElement().click();
+      }
+      await page.waitForFunction(() => document.getElementById('viewer-name').title === 'report.pdf' && document.getElementById('viewer-meta').textContent !== '');
+      return { context, page, left, asked };
+    };
+    let { context, page, left, asked } = await open();
+    const frame = await page.waitForSelector('#viewer-body iframe.v-frame');
+    assert.equal(await frame.getAttribute('sandbox'), null, `${label}: the local viewer's PDF frame has no sandbox`);
+    let said = 'the PDF frame is there (this WebKit saves the PDF instead of drawing it)';
+    if (engine !== 'webkit') {
+      let share = 0;
+      for (let i = 0; i < 20 && share < 0.2; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        share = magentaShare(await frame.screenshot());
+      }
+      assert.ok(share > 0.2, `${label}: the PDF is drawn in its frame (${share.toFixed(2)})`);
+      const box = await frame.boundingBox();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      await page.waitForURL(PDF_LINK, { timeout: 10000 });
+      assert.deepEqual([asked, left.length], [[], 1], `${label}: the local viewer asks nothing when a PDF's link takes the tab`);
+      said = 'the PDF is drawn in its frame, and its link takes the tab without a question';
+    }
+    await context.close();
+    ({ context, page, left, asked } = await open(() => Object.defineProperty(Navigator.prototype, 'pdfViewerEnabled', { configurable: true, get: () => false })));
+    await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
+    assert.equal(await page.textContent('#viewer-body .card p'), 'No PDF preview in this browser.');
+    assert.equal(await page.$('#viewer-body iframe'), null);
+    await context.close();
+    console.log(`${label}: ${said}; a card without a PDF viewer`);
+  } finally {
+    if (browser !== usual) await browser.close();
+    for (const viewer of viewers) await viewer.stop();
   }
 }
 

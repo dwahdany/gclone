@@ -417,7 +417,7 @@ a **build-provenance attestation** — a statement by GitHub that these bytes we
 
 **Release-day order.** Since 0.5.0 the release workflow stops at a *draft* release: pushing the tag
 builds, tests and attests the files, and nothing is public yet. The order is: push the tag **alone**
-(`git push origin v0.6.0` — not `main` yet) → wait for the workflow → on the owner's Mac
+(`git push origin v0.6.1` — not `main` yet) → wait for the workflow → on the owner's Mac
 `scripts/release-sign-macos.sh <tag>` (it verifies the draft, adds the signed macOS build and
 publishes; `DEVELOPMENT.md`, "Publishing a release") → deploy the viewer as below → `git push origin
 main`. `fetch-viewer` finds nothing to fetch while the release is still a draft, and `main` waits
@@ -430,32 +430,32 @@ Then [deploy](#deploying-the-viewer), and go through the [checklist](#first-depl
 
 ## Deploying the viewer
 
-From a checkout of the release's tag (`git checkout v0.6.0`: the Worker's code and the header set the scripts
+From a checkout of the release's tag (`git checkout v0.6.1`: the Worker's code and the header set the scripts
 compare against come from the checkout; the viewer's files come from the release):
 
 ```sh
 cd worker
-node scripts/fetch-viewer.mjs v0.6.0                       # 1
+node scripts/fetch-viewer.mjs v0.6.1                       # 1
 npm ci                                                     # 2
 npm run deploy                                             # 3
-node scripts/verify-deployed.mjs https://<host> v0.6.0     # 4
+node scripts/verify-deployed.mjs https://<host> v0.6.1     # 4
 ```
 
-1. **`fetch-viewer`** downloads `gclone-viewer-0.6.0.tar.gz` from the tag's release into a temporary directory,
+1. **`fetch-viewer`** downloads `gclone-viewer-0.6.1.tar.gz` from the tag's release into a temporary directory,
    verifies its attestation and that the release is immutable —
 
    ```sh
-   gh attestation verify gclone-viewer-0.6.0.tar.gz --repo <owner>/<repo> \
+   gh attestation verify gclone-viewer-0.6.1.tar.gz --repo <owner>/<repo> \
      --signer-workflow <owner>/<repo>/.github/workflows/release.yml \
-     --source-ref refs/tags/v0.6.0 --deny-self-hosted-runners \
+     --source-ref refs/tags/v0.6.1 --deny-self-hosted-runners \
      --source-digest <the commit this checkout is at>
-   gh release verify-asset v0.6.0 gclone-viewer-0.6.0.tar.gz --repo <owner>/<repo>
+   gh release verify-asset v0.6.1 gclone-viewer-0.6.1.tar.gz --repo <owner>/<repo>
    ```
 
    — and only then unpacks it, checks it (`scripts/check-dist.mjs`) and replaces `./dist` with it. The first
    command says: built by this repository's release workflow, on this tag, **from the commit you have checked
    out** — the Worker's code is deployed from the checkout and the viewer from the release, and the two belong
-   to one commit (if the checkout is somewhere else, the script says `git checkout v0.6.0`). The second says:
+   to one commit (if the checkout is somewhere else, the script says `git checkout v0.6.1`). The second says:
    this file belongs to a release whose tag and files GitHub has fixed. It prints the version, the build id, the
    commit and the tarball's SHA-256 — **keep those four lines**. It uses Node's built-in modules, `gh` and `git`
    only, which is why it runs **before** `npm ci`: nothing of npm has run when the bundle is verified.
@@ -545,7 +545,7 @@ note what you saw.
       ```
 
       `200` with the policy, `200` with the policy, `404` — and `tail` shows **no** line for any of the three.
-      (`<build>` is printed by `fetch-viewer`.) `node scripts/verify-deployed.mjs https://<host> v0.6.0` passes.
+      (`<build>` is printed by `fetch-viewer`.) `node scripts/verify-deployed.mjs https://<host> v0.6.1` passes.
 - [ ] **4. Cloudflare accepted the deployment** (`npm run deploy` ended without an error about the main module
       `src/entry.ts` or the assets).
 - [ ] **5. The phone** (iOS Safari; see also [the phone test](#the-phone-test-15-minutes)):
@@ -555,7 +555,8 @@ note what you saw.
       - a long video seeks; a 4K recording from the phone's camera plays without stalling;
       - a download of about 2 GB finishes (keep the tab open and in front);
       - "Download" on a `.txt`, a `.jpg` and a `.pdf` saves the file, and the viewer is still unlocked afterwards;
-      - a PDF opens in a new tab ("Open" on its card), and so does an image ("Open in a new tab");
+      - a PDF opens in a new tab ("Open" on its card: a phone shows no PDF inside the page), and so does an
+        image ("Open in a new tab");
       - put the phone away for ten minutes with the vault open: it comes back at the passphrase screen;
       - the password manager you use offers the passphrase on this page.
 - [ ] **6. Desktop Chrome and Firefox:** a download that runs longer than five minutes finishes.
@@ -591,8 +592,9 @@ note what you saw.
 - [ ] **15. Two tabs.** Open the viewer in two tabs and unlock both. "Lock" in one: the other shows the
       passphrase screen too ("The vault was locked in another tab"). Unlock both again, "Sign out" in one: the
       other shows "Sign in with Google".
-- [ ] **16. A PDF.** It is offered as a card with "Open" and opens in a tab of its own, in desktop browsers
-      too. In the browser's history that tab's entry carries no file name (an id instead).
+- [ ] **16. A PDF.** In a desktop browser it is shown in the preview. Click a link in it: Firefox does nothing (a middle click opens a new tab, and the viewer stays);
+      Chrome asks "Leave site?" — "Cancel" keeps the viewer unlocked. "Open in a new tab" shows it in a tab of
+      its own; in the browser's history that tab's entry carries no file name (an id instead).
 - [ ] **17. The answer to a foreign Service Worker** (0.5.0):
 
       ```sh
@@ -1004,8 +1006,8 @@ cannot see or prevent that prompt; the unlock screen says the same in one senten
 
 **On a computer that is not yours.** "Sign out" ends the viewer's session, clears what the page stored and takes
 every other tab of the viewer in that browser to the sign-in screen (the Lock button likewise locks them all).
-What it cannot reach is **a file you opened in a tab of its own** — a PDF, which the viewer never shows inside its
-own page, or an image or text through "Open in a new tab": that tab stays as it is. Close it yourself. It does
+What it cannot reach is **a file you opened in a tab of its own** — an image, a text or a PDF through "Open in a
+new tab": that tab stays as it is. Close it yourself. It does
 **not** sign the browser out of Google: the next person passes Google's page with one click and gets a new viewer
 session — ciphertext, the keyfile, the ability to trash — and your Google account. Sign out of Google there too
 (the signed-out screen links to it), never tick "Stay signed in" there, and never let that browser save the

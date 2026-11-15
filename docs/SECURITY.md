@@ -181,6 +181,32 @@ the page looks wrong, close the tab or the browser instead of pressing Lock, and
 type the passphrase into that tab again.** All of this is a limit on the damage, not a
 defence: use the viewer in a browser profile whose extensions you trust.
 
+**A PDF in the preview can take the tab away.** Files in the vault are not trusted, and the
+viewer shows them so that none can act in its page: markup as text, images as images. A PDF
+is the exception — it is shown by the browser's own PDF viewer, in a frame of the preview,
+and a link in a PDF can send the whole tab to another site with one click. That site can
+look like the viewer and ask for the passphrase. What the viewer does about it, per browser:
+
+- **Firefox**: the frame is sandboxed, and a link in the previewed PDF cannot take the
+  viewer's tab: a click on it does nothing (tested). A middle click still opens the link in
+  a new tab; the viewer's tab stays, unlocked.
+- **Chrome**: its PDF viewer does not run in a sandboxed frame, so the viewer has the
+  browser ask "Leave site?" before the tab goes anywhere while a PDF is shown (tested).
+  That is a question, not a block: it does not say where the tab is going, and "Leave"
+  goes there. While the question is open the page's clock stands still, so the lock after
+  15 minutes waits for your answer.
+- **Safari**: not tested. It gets the same question.
+
+Reading a PDF in the preview does not count as input for the lock after 15 minutes: what
+you do inside the frame — scrolling, clicking — does not reach the page. A long PDF is
+taken off the screen by that lock unless you touch the viewer around it in between.
+
+So: a "Leave site?" that you did not ask for, while a PDF is open, is the PDF. Cancel it. And
+the second habit below is what protects you if the tab did leave — a password manager does
+not fill the passphrase into another site. (Until 0.6.0 the hosted viewer showed a PDF only in a tab
+of its own, where a link could take nothing but that tab; `gclone web` has always shown it
+in the page, where there is no passphrase to ask for.)
+
 **Three habits against phishing.** The viewer gives a web page a reason to ask for the vault
 passphrase, and that is new: a page that only *looks* like the viewer can get a Google token
 out of you with a device code (see "Login phishing" above) and then ask for the passphrase —
