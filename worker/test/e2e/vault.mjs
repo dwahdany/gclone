@@ -64,16 +64,25 @@ export function png(width, height) {
   ]);
 }
 
-/** A one-page PDF that says `text`, with a correct cross-reference table. */
-export function pdf(text) {
-  const stream = `BT /F1 24 Tf 72 720 Td (${text.replace(/[()\\]/g, '\\$&')}) Tj ET`;
+/** Where the link of the fixture PDF points: an address no machine has (the tests answer it themselves). */
+export const PDF_LINK = 'https://left-the-viewer.invalid/landing';
+
+/**
+ * A one-page PDF that says `text`, with a correct cross-reference table. With `link`, the
+ * page is filled with magenta — a colour to find in a picture of the browser's viewer — and
+ * all of it is one link annotation to that address: a click anywhere on the page follows it.
+ */
+export function pdf(text, link) {
+  const says = `BT /F1 24 Tf 72 720 Td (${text.replace(/[()\\]/g, '\\$&')}) Tj ET`;
+  const stream = link ? `1 0 1 rg 0 0 612 792 re f 0 g ${says}` : says;
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>${link ? ' /Annots [6 0 R]' : ''} >>`,
     `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
   ];
+  if (link) objects.push(`<< /Type /Annot /Subtype /Link /Rect [0 0 612 792] /Border [0 0 0] /A << /Type /Action /S /URI /URI (${link}) >> >>`);
   let out = '%PDF-1.4\n';
   const offsets = [];
   objects.forEach((body, i) => {
@@ -85,6 +94,61 @@ export function pdf(text) {
   for (const offset of offsets) out += `${String(offset).padStart(10, '0')} 00000 n \n`;
   out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
   return Buffer.from(out, 'latin1');
+}
+
+/**
+ * The share of magenta — the fixture PDF's page — in a PNG picture (8-bit RGB or RGBA, as the
+ * browsers' screenshots are): whether a browser's PDF viewer drew the page.
+ */
+export function magentaShare(shot) {
+  let at = 8;
+  let width = 0;
+  let height = 0;
+  let bpp = 3;
+  const data = [];
+  while (at < shot.length) {
+    const n = shot.readUInt32BE(at);
+    const kind = shot.toString('latin1', at + 4, at + 8);
+    const body = shot.subarray(at + 8, at + 8 + n);
+    if (kind === 'IHDR') {
+      width = body.readUInt32BE(0);
+      height = body.readUInt32BE(4);
+      assert.ok(body[8] === 8 && (body[9] === 2 || body[9] === 6), 'a picture of 8-bit RGB or RGBA');
+      bpp = body[9] === 6 ? 4 : 3;
+    }
+    if (kind === 'IDAT') data.push(body);
+    at += 12 + n;
+  }
+  const raw = zlib.inflateSync(Buffer.concat(data));
+  const stride = width * bpp;
+  let above = Buffer.alloc(stride);
+  let hits = 0;
+  for (let y = 0; y < height; y += 1) {
+    const filter = raw[y * (stride + 1)];
+    const line = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+    for (let x = 0; x < stride; x += 1) {
+      const a = x >= bpp ? line[x - bpp] : 0;
+      const b = above[x];
+      const c = x >= bpp ? above[x - bpp] : 0;
+      let predicted = 0;
+      if (filter === 1) predicted = a;
+      else if (filter === 2) predicted = b;
+      else if (filter === 3) predicted = (a + b) >> 1;
+      else if (filter === 4) {
+        const pa = Math.abs(b - c);
+        const pb = Math.abs(a - c);
+        const pc = Math.abs(a + b - 2 * c);
+        predicted = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      line[x] = (line[x] + predicted) & 255;
+    }
+    for (let x = 0; x < width; x += 1) {
+      // (Not exactly ff00ff: an engine may convert the colour for the screen it draws on.)
+      if (line[x * bpp] > 200 && line[x * bpp + 1] < 110 && line[x * bpp + 2] > 160) hits += 1;
+    }
+    above = line;
+  }
+  return hits / (width * height);
 }
 
 // A page and a drawing that would act if a browser ran them in the viewer's origin: each
@@ -125,7 +189,7 @@ export function makeSource(dir, { big, many = 250 } = {}) {
   put('docs/long.txt', Array.from({ length: 16000 }, (_, i) => `line ${String(i).padStart(5, '0')} of a long text file that is cut in the preview`).join('\n'));
   put('docs/page.html', HOSTILE_HTML);
   put('docs/empty.txt', '');
-  put('docs/report.pdf', pdf('gclone fixture, page one'));
+  put('docs/report.pdf', pdf('gclone fixture, page one', PDF_LINK));
   put('pics/photo.png', png(480, 320));
   put('pics/drawing.svg', PLAIN_SVG);
   put('pics/scripted.svg', HOSTILE_SVG);

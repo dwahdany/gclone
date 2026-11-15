@@ -172,13 +172,14 @@
       fileUrl: (id, download) => `/v/${id}${download ? '?dl=1' : ''}`,
       unreachable: 'The file could not be fetched. Check the connection, or reload the page.',
       privateAddress: true,
-      // A PDF is never shown in a frame of this page: in a tab of its own, behind "Open".
-      // A PDF is the one kind of vault content that is shown without `sandbox` (a browser's
-      // PDF viewer does not run in a sandboxed frame), and a link in it takes the whole tab
-      // to wherever it points with one click (Chrome) — the unlocked viewer, to a page of the
-      // file's choosing. In a tab of its own (`rel=noopener`) it can only take itself. (iPhone
-      // and iPad show only the first page of a PDF in a frame anyway.)
-      pdfInline: false,
+      // A PDF is shown in a frame of the preview, as every other kind is shown in the page
+      // (0.6.1). It is the one kind of vault content without `sandbox` on its answer (Chrome's
+      // PDF viewer does not load under it), and a link in a framed PDF takes the whole tab —
+      // the unlocked viewer — to an address of the file's choosing. The page guards the
+      // frame (app.js, `guardPdf`): a sandboxed frame in Firefox, where a click on the link
+      // then does nothing; elsewhere the browser's question before the tab leaves. What that leaves
+      // open is in SPEC §15.
+      pdfGuard: true,
       // No "Open in a new tab" for audio and video: the answer's `sandbox` policy gives the
       // browser's own media document an origin the Service Worker does not control, so its
       // player would ask the network for `/v/<id>` — where nothing answers.

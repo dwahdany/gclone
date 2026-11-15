@@ -22,9 +22,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
-import { ENGINES, loadPlaywright, startStack } from './harness.mjs';
+import { ENGINES, firefoxWithPdfViewer, loadPlaywright, startStack } from './harness.mjs';
 import { MANY, beforePhone, timeMachine, timeMachinePhone } from './timemachine.mjs';
-import { BIDI_DIR, BIDI_NAME, HOSTILE_HTML, ODD_NAMES, PASS, addHistory, foreignKeyfile, tree } from './vault.mjs';
+import { BIDI_DIR, BIDI_NAME, HOSTILE_HTML, ODD_NAMES, PASS, PDF_LINK, addHistory, foreignKeyfile, magentaShare, tree } from './vault.mjs';
 
 const BIG = process.env.GCLONE_E2E_BIG || null;
 const ONLY = process.env.GCLONE_E2E_ONLY ? process.env.GCLONE_E2E_ONLY.split(',') : null;
@@ -49,13 +49,26 @@ const ENGINE_NOISE = [
   // Firefox, now and then, about its own document for a vault file that is opened in a tab of its own (the file is
   // answered as text or as an image under `sandbox`; no script of the viewer runs there). Depends on timing.
   /Layout was forced before the page was fully loaded/,
+  // Firefox's PDF viewer about itself, in the frame that shows a PDF.
+  /resource:\/\/pdf\.js\//,
+  /The execution of microtasks on this page was reordered/,
 ];
+// Playwright's WebKit saves a framed PDF instead of drawing it (Safari draws it), under the
+// id of its address, and now and then asks for the rest of a file it already has.
+const SAVED_FRAME = /^[A-Za-z0-9_-]{22}\.pdf$/;
+const WEBKIT_NOISE = [/status of 416 \(\) \(\S+\/v\/[A-Za-z0-9_-]{22}\)$/];
+
+// The `sandbox` attribute of the PDF frame where the engine's viewer runs under one (Firefox).
+const PDF_SANDBOX = 'allow-scripts allow-same-origin allow-downloads allow-modals';
 
 /** Runs in every document before its scripts: what the page says and is told, and what its policy refused. */
 function instrument() {
   // Once per document: an engine may run this again when a navigation ends as a download.
   if (window.__instrumented) return;
   window.__instrumented = true;
+  // The viewer's page only: a frame holds the browser's own PDF viewer (Firefox's is script,
+  // and takes a `Worker` that is not the engine's for a mistake).
+  if (window.top !== window) return;
   const flagged = ['key', 'bundle', 'ticket', 'header', 'keys', 'master'];
   const describe = (value, depth = 0) => {
     if (value instanceof Uint8Array || value instanceof ArrayBuffer) return { bytes: value.byteLength };
@@ -154,6 +167,10 @@ class Session {
     /** Patterns a step expects for all of its parts (it removes them when it ends). */
     this.tolerated = [];
     this.notes = [];
+    /** The browser's own questions (`beforeunload`, …) that were asked: a step that expects one takes it out. */
+    this.dialogs = [];
+    /** How the next question is answered: 'dismiss' (stay) or 'accept'. */
+    this.answer = 'dismiss';
   }
 
   note(text) {
@@ -209,6 +226,10 @@ class Session {
       if (['error', 'warning'].includes(message.type())) this.problems.push(`console ${message.type()}: ${message.text()} (${message.location().url || ''})`);
     });
     page.on('pageerror', (error) => this.problems.push(`pageerror: ${error}`));
+    page.on('dialog', (dialog) => {
+      this.dialogs.push(dialog.type());
+      (this.answer === 'accept' ? dialog.accept() : dialog.dismiss()).catch(() => {});
+    });
   }
 
   /** Console lines that match are expected from here on (until `settle`). */
@@ -219,10 +240,13 @@ class Session {
   /** Fails on console errors and policy violations that no step announced; then starts over. */
   async settle(page, what) {
     const violations = page && !page.isClosed() ? await page.evaluate(() => window.__violations.splice(0)).catch(() => []) : [];
-    const unexpected = this.problems.filter((line) => ![...ENGINE_NOISE, ...this.tolerated, ...this.expected].some((pattern) => pattern.test(line)));
+    const noise = this.engine === 'webkit' ? [...ENGINE_NOISE, ...WEBKIT_NOISE] : ENGINE_NOISE;
+    const unexpected = this.problems.filter((line) => ![...noise, ...this.tolerated, ...this.expected].some((pattern) => pattern.test(line)));
     const stray = violations.filter((line) => !this.expected.some((pattern) => pattern.test(line)));
+    const asked = this.dialogs.splice(0);
     this.problems = [];
     this.expected = [];
+    assert.deepEqual(asked, [], `${this.label}, ${what}: the browser asked a question nobody expected`);
     assert.deepEqual(unexpected, [], `${this.label}, ${what}: console`);
     assert.deepEqual(stray, [], `${this.label}, ${what}: policy violations`);
   }
@@ -335,6 +359,27 @@ class Session {
     await page.waitForSelector('#viewer', { state: 'hidden' });
   }
 
+  /**
+   * Opens the fixture PDF of the folder that is shown and waits for its frame. Resolves to
+   * the share of the frame that is the PDF's page (magenta): 0 where the engine did not draw it.
+   */
+  async showPdf(page, name = 'report.pdf') {
+    await this.openFile(page, name);
+    const frame = await page.waitForSelector('#viewer-body iframe.v-frame');
+    // Playwright's WebKit saves a framed PDF: nothing to take a picture of. (And its driver
+    // adds a style sheet for a picture, which the page's policy refuses.)
+    if (this.engine === 'webkit') {
+      await sleep(1500);
+      return 0;
+    }
+    let share = 0;
+    for (let i = 0; i < 20 && share < 0.2; i += 1) {
+      await sleep(250);
+      share = magentaShare(await frame.screenshot());
+    }
+    return share;
+  }
+
   /** The address of the file in the viewer (`/v/<id>`), as the page uses it. */
   fileUrl(page) {
     return page.evaluate(() => document.getElementById('viewer-download').getAttribute('href').replace(/\?dl=1$/, ''));
@@ -355,7 +400,7 @@ class Session {
 
   /** Clicks a download control and returns `{ name, bytes }` of what the browser saved. */
   async download(page, click) {
-    const [download] = await Promise.all([page.waitForEvent('download', { timeout: 120000 }), click()]);
+    const [download] = await Promise.all([page.waitForEvent('download', { predicate: (d) => !SAVED_FRAME.test(d.suggestedFilename()), timeout: 120000 }), click()]);
     const file = path.join(this.stack.work, `download-${this.engine}-${crypto.randomBytes(4).toString('hex')}`);
     await download.saveAs(file);
     const bytes = fs.readFileSync(file);
@@ -608,14 +653,26 @@ steps.previews = async (s, page) => {
   assert.deepEqual(headers, ['text/plain; charset=utf-8', "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"]);
   await s.closeFile(page);
 
-  // --- PDF: never in a frame of the viewer's page (a link in a PDF takes the whole tab along) —
-  //     a card with "Open", a tab of its own on the Service Worker's address ---
-  await s.openFile(page, 'report.pdf');
-  await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
-  assert.equal(await page.$('#viewer-body iframe'), null, `${s.label}: no frame for a PDF`);
-  assert.match(await page.textContent('#viewer-body .card'), /A PDF opens in a tab of its own\. That tab is not part of the viewer: close it when you are done\./);
-  assert.match(await page.getAttribute('#viewer-body .card a.btn[target="_blank"]', 'href'), /^\/v\/[A-Za-z0-9_-]{22}$/);
-  assert.equal(await page.getAttribute('#viewer-body .card a.btn[target="_blank"]', 'rel'), 'noopener');
+  // --- PDF: in a frame of the preview, on the Service Worker's address; what keeps a link in
+  //     it from taking the tab along is the step `pdf` ---
+  // (Playwright's WebKit saves a framed PDF instead of showing it; Safari shows it. Its
+  // Firefox has no PDF viewer: the card that a browser without one gets.)
+  let pdfShare = 0;
+  if (s.engine === 'firefox') {
+    await s.openFile(page, 'report.pdf');
+    await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
+    assert.equal(await page.textContent('#viewer-body .card p'), 'No PDF preview in this browser.');
+    assert.equal(await page.$('#viewer-body iframe'), null);
+  } else {
+    pdfShare = await s.showPdf(page);
+    if (s.engine === 'chrome') assert.ok(pdfShare > 0.2, `${s.label}: the PDF is drawn in its frame (${pdfShare.toFixed(2)} of it)`);
+    assert.equal(await page.$('#viewer-body .card'), null, `${s.label}: no card for a PDF`);
+    assert.match(await page.getAttribute('#viewer-body iframe', 'src'), /^\/v\/[A-Za-z0-9_-]{22}$/);
+    assert.equal(await page.getAttribute('#viewer-body iframe', 'sandbox'), null);
+    assert.equal(await page.getAttribute('#viewer-body iframe', 'title'), 'report.pdf');
+    await page.waitForSelector('#viewer-body .loading', { state: 'detached' });
+  }
+  assert.equal(await page.isVisible('#viewer-open'), true);
   const pdf = await page.evaluate(async (u) => {
     const res = await fetch(u);
     const body = new Uint8Array(await res.arrayBuffer());
@@ -646,7 +703,7 @@ steps.previews = async (s, page) => {
     if (shown) assert.match(new URL(seen.url).pathname, /^\/v\/[A-Za-z0-9_-]{22}$/);
     return seen;
   };
-  const pdfTab = await ownTab(() => page.click('#viewer-body .card a.btn[target="_blank"]'), 'report.pdf');
+  const pdfTab = await ownTab(() => page.click('#viewer-open'), 'report.pdf');
   if (s.engine === 'chrome') assert.ok(pdfTab.shown && pdfTab.history.length >= 1, `${s.label}: the PDF is shown in its tab`);
   await s.closeFile(page);
   await s.goDir(page, 'pics');
@@ -699,7 +756,7 @@ steps.previews = async (s, page) => {
   // Trusted Types: markup cannot be assigned as a string anywhere in the page.
   assert.equal(await page.evaluate(() => { try { document.createElement('div').innerHTML = '<b>x</b>'; return 'set'; } catch (error) { return error.name; } }), 'TypeError');
   await s.goDir(page, '');
-  s.note(`previews: image, SVG, text, long text, HTML as text, PDF behind "Open"; a file in a tab of its own is titled ${JSON.stringify(imageTab.title)} / ${JSON.stringify(pdfTab.title)} (image / PDF), never by its name; the hostile HTML and SVG ran nothing; eval and blob: frames are refused`);
+  s.note(`previews: image, SVG, text, long text, HTML as text, PDF ${{ chrome: `in a frame (${Math.round(pdfShare * 100)}% of it the page)`, webkit: 'in a frame (which this WebKit saves instead of drawing)', firefox: 'as a card (this Firefox has no PDF viewer)' }[s.engine]}; a file in a tab of its own is titled ${JSON.stringify(imageTab.title)} / ${JSON.stringify(pdfTab.title)} (image / PDF), never by its name; the hostile HTML and SVG ran nothing; eval and blob: frames are refused`);
 };
 
 steps.media = async (s, page) => {
@@ -1879,6 +1936,222 @@ steps.tabs = async (s) => {
   s.note(`tabs: the Lock button and Sign out reach every tab of the viewer; a tab that is taken away leaves no ticket; "reload" goes to the page of the other build only; vault workers started by two tabs that reloaded together: ${starts.join(' and ')}`);
 };
 
+steps.pdf = async (s) => {
+  // A PDF is shown by the browser's own viewer in a frame of the preview, and its answer is
+  // the one kind without `sandbox`. The fixture's page is one link to another site: what a
+  // click on it does to the unlocked viewer's tab, per engine.
+  const { vault } = s.stack;
+  // Firefox says what it refused.
+  s.expect(/Blocked attempt to navigate another window from a sandboxed frame/);
+  // The suite's Firefox is Playwright's, without a PDF viewer; this step is about the viewer.
+  const usual = s.browser;
+  if (s.engine === 'firefox') s.browser = await firefoxWithPdfViewer(s.playwright);
+  try {
+    await framed();
+  } finally {
+    if (s.browser !== usual) await s.browser.close();
+    s.browser = usual;
+  }
+
+  async function framed() {
+    const start = async (prepare) => {
+      const { context, page } = await s.open();
+      if (prepare) await context.addInitScript(prepare);
+      // "Another site": the address of the link, answered here. What asked for it is kept.
+      const left = [];
+      await context.route(`${new URL(PDF_LINK).origin}/**`, async (route) => {
+        let by = 'a subresource';
+        try { if (route.request().isNavigationRequest()) by = route.request().frame().parentFrame() ? 'a frame' : 'the tab'; } catch (_) { by = 'the tab'; }
+        left.push(by);
+        await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>elsewhere</title><p>elsewhere</p>' });
+      });
+      await s.signedIn(context, page);
+      await s.unlock(page);
+      await s.goDir(page, 'docs');
+      return { context, page, left };
+    };
+    const clickPdf = async (page) => {
+      const box = await (await page.$('#viewer-body iframe')).boundingBox();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    };
+    const unlockedStill = async (page, what) => {
+      assert.equal(page.url(), `${s.stack.origin}/`, what);
+      assert.ok(await page.$('#rows .row'), `${what}: the list is there`);
+      assert.ok(await page.$('#viewer-body iframe'), `${what}: the PDF's frame is there`);
+      assert.equal((await s.api(page, 'info')).head, vault.device.head(), `${what}: the vault answers`);
+      assert.ok((await s.ping(page)).tickets >= 1, `${what}: the Service Worker has the file's ticket`);
+    };
+
+    // 1. The link in the framed PDF.
+    let { context, page, left } = await start();
+    const share = await s.showPdf(page);
+    let verdict;
+    if (s.engine === 'firefox') {
+      // The frame is sandboxed, and the viewer runs in it: the link does nothing.
+      assert.ok(share > 0.2, `${s.label}: the PDF is drawn in its sandboxed frame (${share.toFixed(2)})`);
+      assert.equal(await page.getAttribute('#viewer-body iframe', 'sandbox'), PDF_SANDBOX);
+      await clickPdf(page);
+      await sleep(2500);
+      assert.deepEqual([left, s.dialogs.splice(0)], [[], []], `${s.label}: a link in the sandboxed PDF frame went somewhere`);
+      await unlockedStill(page, `${s.label}, after a click on the PDF's link`);
+      // A middle click is the browser's "open in a new tab", which the sandbox does not
+      // stop: whatever opens, the viewer's tab stays where it is, unlocked.
+      const opened = [];
+      const note = (tab) => opened.push(tab);
+      context.on('page', note);
+      const box = await (await page.$('#viewer-body iframe')).boundingBox();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: 'middle' });
+      await sleep(2500);
+      context.off('page', note);
+      for (const tab of opened) await tab.close();
+      assert.ok(!left.includes('a frame'), `${s.label}: a middle click filled the frame`);
+      assert.deepEqual(s.dialogs.splice(0), []);
+      await unlockedStill(page, `${s.label}, after a middle click on the PDF's link`);
+      verdict = `the frame is sandboxed, the PDF is drawn, and a click on its link does nothing (a middle click ${opened.length ? 'opens the link in a new tab' : 'opens nothing'}; the viewer's tab stays)`;
+    } else if (s.engine === 'chrome') {
+      // No sandbox (the viewer would not load): the browser asks, and "stay" keeps the viewer.
+      assert.ok(share > 0.2, `${s.label}: the PDF is drawn in its frame (${share.toFixed(2)})`);
+      assert.equal(await page.getAttribute('#viewer-body iframe', 'sandbox'), null);
+      await clickPdf(page);
+      for (let i = 0; i < 50 && !s.dialogs.length; i += 1) await sleep(100);
+      assert.deepEqual(s.dialogs.splice(0), ['beforeunload'], `${s.label}: the browser asks before the tab follows a PDF's link`);
+      await sleep(500);
+      assert.deepEqual(left, [], `${s.label}: the tab left although the question was answered with "stay"`);
+      await unlockedStill(page, `${s.label}, after "stay"`);
+      // The same question for a reload and for closing the tab beside a PDF: its price.
+      await page.evaluate(() => { location.reload(); });
+      for (let i = 0; i < 50 && !s.dialogs.length; i += 1) await sleep(100);
+      assert.deepEqual(s.dialogs.splice(0), ['beforeunload'], `${s.label}: a reload beside a PDF is asked about`);
+      await page.close({ runBeforeUnload: true });
+      for (let i = 0; i < 50 && !s.dialogs.length; i += 1) await sleep(100);
+      assert.deepEqual(s.dialogs.splice(0), ['beforeunload'], `${s.label}: closing the tab beside a PDF is asked about`);
+      await sleep(300);
+      await unlockedStill(page, `${s.label}, after "stay" for a reload and for closing the tab`);
+      // "Leave": the tab goes where the link points, and the Service Worker forgets what it held.
+      const other = await context.newPage();
+      s.watch(other);
+      await other.goto(`${s.stack.origin}/`);
+      await s.screen(other, 'unlock');
+      s.answer = 'accept';
+      try {
+        await clickPdf(page);
+        await page.waitForURL(PDF_LINK, { timeout: 10000 });
+      } finally {
+        s.answer = 'dismiss';
+      }
+      assert.deepEqual([s.dialogs.splice(0), left], [['beforeunload'], ['the tab']]);
+      await sleep(300);
+      assert.deepEqual([(await s.ping(other)).tickets, (await s.ping(other)).port], [0, false], `${s.label}: the tab that followed a PDF's link left tickets behind`);
+      // Back: the viewer loads anew, at the passphrase.
+      await page.goBack();
+      await s.screen(page, 'unlock');
+      assert.equal(await page.$('#rows'), null);
+      verdict = 'no sandbox (the viewer does not load in one); the browser asks before the tab follows the link, "stay" keeps the unlocked viewer, "leave" takes the tab and the Service Worker forgets';
+    } else {
+      // Playwright's WebKit saves a framed PDF: there is no link to click. Safari shows it.
+      assert.equal(await page.getAttribute('#viewer-body iframe', 'sandbox'), null);
+      await clickPdf(page);
+      await sleep(1500);
+      assert.deepEqual([left, s.dialogs.splice(0)], [[], []]);
+      await unlockedStill(page, `${s.label}, after a click on the frame`);
+      verdict = `the frame is there without a sandbox; this WebKit saves the PDF instead of drawing it, so a link in it was not measured`;
+    }
+    await context.close();
+
+    // 1b. Two previews that overlap: the first one's probe answers after the second one's
+    //     frame is shown. The frame on the screen is asked about all the same.
+    if (s.engine === 'chrome') {
+      ({ context, page, left } = await start());
+      await page.evaluate(() => {
+        const real = window.fetch;
+        let first = true;
+        window.fetch = function (url, options) {
+          const range = options && options.headers && options.headers.Range;
+          if (range !== 'bytes=0-0' || !first) return real.call(this, url, options);
+          first = false;
+          return new Promise((resolve) => { setTimeout(resolve, 3000); }).then(() => real.call(this, url, options));
+        };
+      });
+      await s.openFile(page, 'report.pdf');
+      await page.click('#viewer-prev');
+      await page.waitForFunction(() => document.getElementById('viewer-name').title !== 'report.pdf');
+      await page.click('#viewer-next');
+      await page.waitForSelector('#viewer-body iframe.v-frame');
+      await sleep(4000); // the late probe has answered
+      assert.equal(await page.$$eval('#viewer-body iframe', (frames) => frames.length), 1);
+      await clickPdf(page);
+      for (let i = 0; i < 50 && !s.dialogs.length; i += 1) await sleep(100);
+      assert.deepEqual(s.dialogs.splice(0), ['beforeunload'], `${s.label}: a PDF shown after an overlapping preview is not asked about`);
+      await sleep(500);
+      assert.deepEqual(left, [], `${s.label}: the tab left after overlapping previews`);
+      await unlockedStill(page, `${s.label}, after overlapping previews and "stay"`);
+      await context.close();
+    }
+
+    // 2. "Download" while the PDF is shown is the page's own leave: nobody is asked, the file
+    //    is saved, the viewer stays. So is a step to the next file and back.
+    //    (A Firefox with its PDF viewer opens a saved PDF in a tab, and the driver sees no
+    //    download: its download is the step `download`, beside the card.)
+    ({ context, page, left } = await start());
+    await s.showPdf(page);
+    if (s.engine !== 'firefox') {
+      const saved = await s.download(page, () => page.click('#viewer-download'));
+      assert.equal(saved.name, 'report.pdf');
+      assert.ok(saved.bytes.equals(vault.files.get('docs/report.pdf')));
+      await unlockedStill(page, `${s.label}, after a download beside the PDF`);
+    }
+    await page.click('#viewer-prev');
+    await page.waitForFunction(() => document.getElementById('viewer-name').title !== 'report.pdf');
+    assert.equal(await page.$('#viewer-body iframe'), null, 'the frame goes with its file');
+    await page.click('#viewer-next');
+    await page.waitForSelector('#viewer-body iframe.v-frame');
+
+    // 3. Lock — here from another tab of the viewer — takes the frame away: out of the
+    //    document before the page loads again, with no question, and the file's address is void.
+    const url = await s.fileUrl(page);
+    await page.evaluate(() => {
+      window.addEventListener('pagehide', () => sessionStorage.setItem('test.frames', String(document.querySelectorAll('iframe').length)));
+    });
+    const second = await context.newPage();
+    s.watch(second);
+    await second.goto(`${s.stack.origin}/`);
+    await s.screen(second, 'unlock');
+    await s.unlock(second);
+    await second.click('#lock-btn');
+    await s.screen(page, 'unlock');
+    assert.equal(await page.textContent('#unlock-killed'), 'The vault was locked in another tab.');
+    assert.deepEqual(await page.evaluate(() => [sessionStorage.getItem('test.frames'), document.querySelectorAll('iframe').length, document.getElementById('rows')]), ['0', 0, null], `${s.label}: a lock left the PDF's frame in the page`);
+    assert.deepEqual([(await s.ping(page)).tickets, (await s.ping(page)).port], [0, false]);
+    s.expect(/410/, /Failed to load resource/);
+    assert.equal(await page.evaluate(async (u) => (await fetch(u)).status, url), 410, 'the PDF\'s address answers nothing after the lock');
+    assert.deepEqual(s.dialogs, [], `${s.label}: a lock was asked about`);
+    await context.close();
+
+    // 4. Where a frame does not show a PDF — a browser without a PDF viewer (it would save the
+    //    file), an iPhone, an iPad (the first page only) — a card: "Open" and "Download".
+    const without = {
+      'no PDF viewer': () => Object.defineProperty(Navigator.prototype, 'pdfViewerEnabled', { configurable: true, get: () => false }),
+      'an iPhone': () => Object.defineProperty(Navigator.prototype, 'userAgent', { configurable: true, get: () => 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' }),
+      'an iPad': () => {
+        Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'MacIntel' });
+        Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 5 });
+      },
+    };
+    for (const [what, prepare] of Object.entries(without)) {
+      ({ context, page, left } = await start(prepare));
+      await s.openFile(page, 'report.pdf');
+      await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
+      assert.equal(await page.$('#viewer-body iframe'), null, `${s.label}, ${what}: no frame`);
+      assert.equal(await page.textContent('#viewer-body .card p'), 'No PDF preview in this browser.', what);
+      assert.deepEqual(await page.$$eval('#viewer-body .card a.btn', (links) => links.map((a) => a.textContent.trim())), ['Open', 'Download'], what);
+      assert.match(await page.getAttribute('#viewer-body .card a.btn[target="_blank"]', 'href'), /^\/v\/[A-Za-z0-9_-]{22}$/);
+      assert.equal(await page.getAttribute('#viewer-body .card a.btn[target="_blank"]', 'rel'), 'noopener');
+      await context.close();
+    }
+    s.note(`pdf: ${verdict};${s.engine === 'firefox' ? '' : ' a download beside the PDF asks nobody;'} a lock takes the frame out of the page; a card with "Open" and "Download" without a PDF viewer, on an iPhone and on an iPad`);
+  }
+};
+
 steps.hardening = async (s) => {
   // The page when its own files do not arrive (a deployment in progress, a bad connection, a
   // content blocker). These pages are not watched: failed requests are what they are about.
@@ -2281,15 +2554,7 @@ steps.states = async (s) => {
     drive.planted.length = 0;
   }
 
-  // A phone's Safari, like every browser here, shows a PDF in a tab of its own: a card with "Open".
-  ({ context, page } = await s.fresh({ userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' }));
-  await s.goDir(page, 'docs');
-  await s.openFile(page, 'report.pdf');
-  await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
-  assert.equal(await page.$('#viewer-body iframe'), null);
-  assert.match(await page.getAttribute('#viewer-body .card a.btn[target="_blank"]', 'href'), /^\/v\/[A-Za-z0-9_-]{22}$/);
-  await context.close();
-  s.note('states: an ended sign-in locks and says so (found by a refresh, and by opening a file); an address off the allowlist; an unreachable Google; a killed tab; no vault; a newer format; two vaults; a 70 MiB planted index object asked about and skipped; four planted keyfile names, and four foreign keyfiles; a planted sentence and a 300 MiB segment at refresh; the PDF card of iOS');
+  s.note('states: an ended sign-in locks and says so (found by a refresh, and by opening a file); an address off the allowlist; an unreachable Google; a killed tab; no vault; a newer format; two vaults; a 70 MiB planted index object asked about and skipped; four planted keyfile names, and four foreign keyfiles; a planted sentence and a 300 MiB segment at refresh');
 };
 
 steps.big = async (s) => {
@@ -2532,7 +2797,7 @@ steps.timemachine = async (s) => {
 };
 
 const SHARED = ['listing', 'sort', 'search', 'names', 'previews', 'media', 'download', 'recovery', 'refresh', 'history', 'keys'];
-const OWN = ['signin', 'lock', 'tabs', 'seal', 'planted', 'unskippable', 'second', 'recover', 'signout', 'hardening', 'unreachable', 'states', 'timemachine', 'big'];
+const OWN = ['signin', 'lock', 'tabs', 'pdf', 'seal', 'planted', 'unskippable', 'second', 'recover', 'signout', 'hardening', 'unreachable', 'states', 'timemachine', 'big'];
 
 async function runEngine(engine, playwright) {
   const stack = await startStack({ big: BIG || undefined });

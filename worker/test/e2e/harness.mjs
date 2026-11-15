@@ -29,6 +29,14 @@ export const ENGINES = {
 };
 
 /**
+ * Firefox as people use it: with its PDF viewer. Playwright turns the viewer off (a PDF is
+ * then saved, and `navigator.pdfViewerEnabled` is false), which is what the suites run in —
+ * with the viewer on, Firefox opens a saved PDF in a tab and the driver sees no download.
+ * This one is for what a framed PDF does.
+ */
+export const firefoxWithPdfViewer = (playwright) => ENGINES.firefox(playwright, { firefoxUserPrefs: { 'pdfjs.disabled': false } });
+
+/**
  * Chrome for a picture, British. The page's dates follow the context's `locale`; the
  * browser's own controls (a date field) follow the browser's language, which `--lang` sets
  * — on Linux and Windows. On a Mac Chrome takes language and region from the system's

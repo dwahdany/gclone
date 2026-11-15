@@ -83,7 +83,7 @@ whoever controls the repository controls the script.
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.6.0` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.6.1` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`), `--require-attestation` (install nothing that `gh` did
 not verify), `--no-attestation` (checksum only: releases before 0.5.0 carry no attestation
@@ -112,8 +112,8 @@ this order: the argument (`gclone login https://<host>`), the environment variab
 and the compiled-in URL:
 
 ```
-gclone 0.6.0 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
-gclone 0.6.0 (aarch64-apple-darwin, no auth URL built in)
+gclone 0.6.1 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.6.1 (aarch64-apple-darwin, no auth URL built in)
 ```
 
 The release workflow compiles in the repository variable `GCLONE_DEFAULT_AUTH_URL`, so this
@@ -459,8 +459,7 @@ it offers versions whose data may be gone, and those end in a message, not in wr
 browser: a read-only page at your Worker's address, `https://<host>/`, for a phone or a
 computer without gclone. You sign in with Google, the password manager fills in the vault
 passphrase, and you get the same file browser as `gclone web` — folders, sorting, search over
-every name, previews (images, audio and video with seeking, text; a PDF opens in a tab of its
-own) and downloads of any size.
+every name, previews (images, PDF, audio and video with seeking, text) and downloads of any size.
 
 It is optional and off until you set it up:
 [`worker/README.md`, "The hosted viewer: setup"](../worker/README.md#the-hosted-viewer-setup).
@@ -490,7 +489,7 @@ in" — tick that on your own devices only. "Sign out" ends the viewer's session
 the page kept and takes every other tab of the viewer to the sign-in screen; it does **not**
 sign the browser out of Google, so on a computer that is not yours sign out of Google as
 well (the signed-out screen links to it). **A file that you opened in a tab of its own** —
-a PDF (the only way the viewer shows one), or an image or text through "Open in a new tab" —
+an image, a text or a PDF through "Open in a new tab" —
 **has left the viewer: it stays on the screen after Lock and after Sign out. Close that tab
 yourself.** To end
 every browser session at once — a lost phone — put a new `SEAL_KEY` on the Worker
@@ -516,9 +515,17 @@ every browser session at once — a lost phone — put a new `SEAL_KEY` on the W
   in the foreground. Whole-file hashes are not checked for streamed downloads; every chunk
   is authenticated, so a wrong, missing or reordered byte still fails the download (as with
   `gclone cat` into a pipe).
-- A PDF is not shown inside the viewer's page but in a tab of its own, behind an "Open"
-  button: a link in a PDF would otherwise take the unlocked viewer's tab to an address of the
-  file's choosing with one click. Audio and video have no "Open in a new tab".
+- A PDF is shown in the preview by the browser's own PDF viewer, and a link in a PDF can take
+  the whole tab — the unlocked viewer — to another site. In Firefox the viewer stops that: a
+  click on a link in the previewed PDF does nothing (a middle click opens it in a new tab;
+  "Open in a new tab" shows the PDF with working links). In Chrome it cannot be stopped, so the browser asks "Leave site?" first — also
+  when you close or reload the tab while a PDF is shown. Answer "Cancel" unless you meant
+  to leave; and if a page then asks for the vault passphrase, it is not the viewer
+  ([three habits](SECURITY.md#the-hosted-viewer-what-you-trust)). Safari was not tested.
+  Scrolling inside a previewed PDF is not input for the 15-minute lock: the viewer locks
+  while you read a long one unless you touch the page around it.
+  On an iPhone or iPad, and in a browser without a PDF viewer, a PDF has an "Open" button
+  instead of a preview. Audio and video have no "Open in a new tab".
 - No file name goes into the browser's history: the address and the title never carry one,
   and a file in a tab of its own is titled by a random id. A file you **download** is in the
   browser's download list under its name, as any download.

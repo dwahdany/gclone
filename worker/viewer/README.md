@@ -11,8 +11,8 @@ script that attaches to `self.gclone`.
 | File | Runs in | Job |
 |---|---|---|
 | `index.html` | — | The page: the sign-in, unlock, progress and signed-out screens as static markup, the status marker, and `<template id="app">`, which the build fills with the body of `gclone web`'s page. |
-| `shell.js`, `shell.css`, `noscript.css` | page | Sign-in, Service Worker start (registrations of this origin that are not `/sw.js` for `/` are removed first), vault discovery, unlock, index load, Lock (wall clock; a lock is a reload; the Lock button and Sign out reach every tab of the viewer over a `BroadcastChannel`), sign-out. A lock does what cannot be undone first — the Service Worker is told to forget, the vault and KDF workers are ended — each step on its own and with `ServiceWorker.prototype.postMessage` / `Worker.prototype.terminate` taken when the script loaded: a script that arrives later cannot make a step throw and skip the rest. (It can still keep a lock from being asked for: SPEC §1.3.) |
-| `provider.js` | page | The page's Trusted Types policy, the vault worker's client, the ticket channel (what crosses it is sealed: the page hands the ports out, and a script in the page could keep one) and `window.gcloneProvider` — the seam of `src/web/assets/app.js`. The hosted provider shows no PDF in a frame of the page (`pdfInline: false`: a tab of its own) and offers no "Open in a new tab" for audio and video. |
+| `shell.js`, `shell.css`, `noscript.css` | page | Sign-in, Service Worker start (registrations of this origin that are not `/sw.js` for `/` are removed first), vault discovery, unlock, index load, Lock (wall clock; a lock is a reload, before which every frame — a PDF in the browser's viewer — is taken out of the page; the Lock button and Sign out reach every tab of the viewer over a `BroadcastChannel`), sign-out. A lock does what cannot be undone first — the Service Worker is told to forget, the vault and KDF workers are ended — each step on its own and with `ServiceWorker.prototype.postMessage` / `Worker.prototype.terminate` taken when the script loaded: a script that arrives later cannot make a step throw and skip the rest. (It can still keep a lock from being asked for: SPEC §1.3.) |
+| `provider.js` | page | The page's Trusted Types policy, the vault worker's client, the ticket channel (what crosses it is sealed: the page hands the ports out, and a script in the page could keep one) and `window.gcloneProvider` — the seam of `src/web/assets/app.js`. The hosted provider asks for a guard on the PDF frame of the preview (`pdfGuard: true`; `guardPdf` in `app.js`: a sandboxed frame in Firefox, elsewhere the browser's question before the tab leaves — SPEC §7.5, §17.33) and offers no "Open in a new tab" for audio and video. |
 | `token.js` | page, vault worker, Service Worker | Access tokens from `POST /web/refresh`: kept in memory, single flight. |
 | `drive.js` | vault worker, Service Worker | Google Drive, read-only: `files.list`, `files.get`, content with `Range`; the CLI's retry rules, with a patience the caller sets (the index load: the CLI's schedule; a read someone is looking at: ten seconds). The Drive host is named here once. |
 | `loader.js` | vault worker | Finding the vault, the keyfile candidates (what is no keyfile takes no place among them), loading and refreshing the index, with bounds on what a listing can make the tab download — a refresh never more than 64 MiB — and on what of a listing is shown (no name that is not of gclone's form). |
@@ -67,6 +67,13 @@ cd worker/test/e2e && npm ci --ignore-scripts && node node_modules/playwright-co
 (`GCLONE_PLAYWRIGHT_CORE` names another copy of the package, `PLAYWRIGHT_BROWSERS_PATH` another place
 for its browsers.) macOS only: Playwright's Linux WebKit has another media stack than Safari, and the
 byte budgets in the tests were measured on the macOS build.
+
+A PDF in these browsers: Chrome shows it in the preview's frame. Playwright's Firefox has its PDF
+viewer turned off, so the suites see the card of a browser without one there; what a framed PDF
+does in Firefox runs in a second Firefox with the viewer on (`firefoxWithPdfViewer` in
+`test/e2e/harness.mjs`; step `pdf` of `run.mjs`, `pdfFrame` of `local.mjs`). Playwright's WebKit
+saves a framed PDF instead of drawing it, which Safari does not: Safari's PDF frame is untested.
+The fixture PDF is one magenta page that is a link to another site (`test/e2e/vault.mjs`).
 
 ```sh
 node worker/test/e2e/run.mjs [chrome] [webkit] [firefox]   # the viewer end to end

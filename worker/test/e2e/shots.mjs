@@ -107,13 +107,14 @@ try {
       await page.waitForSelector('#viewer-body .card');
       await shot('4-preview-card');
       await page.click('#viewer-close');
-      // A PDF: a card with "Open" (a tab of its own).
+      // A PDF: in a frame of the preview.
       await page.click('#brand');
       await page.waitForTimeout(300);
       await clickRow(page, 'docs');
       await listed(page, 'docs');
       await clickRow(page, 'report.pdf');
-      await page.waitForSelector('#viewer-body .card a.btn[target="_blank"]');
+      await page.waitForSelector('#viewer-body iframe.v-frame');
+      await page.waitForTimeout(1500);
       await shot('4-preview-pdf');
       await page.click('#viewer-close');
       // A name that turns its own end around: the row and the card.
