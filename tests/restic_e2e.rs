@@ -2078,6 +2078,8 @@ async fn restic_and_gclone_are_signalled_together() {
         .unwrap();
     signal(gclone, libc::SIGTERM);
     signal(held.child.id(), libc::SIGTERM);
+    // restic, interrupted while it reads its input, stays until that input ends.
+    drop(held.input.take());
     let ended = wait(&mut held.child, Duration::from_secs(90));
     assert!(
         ended.is_some(),
