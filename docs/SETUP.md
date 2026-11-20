@@ -174,7 +174,8 @@ It opens a `google.com` address only: should the auth Worker ever name another o
 prints it with a warning and leaves the decision to you.
 
 gclone finds the existing vault and asks for the passphrase — once; the device caches the key
-afterwards. (If the vault was created with gclone before 0.2.0, first run `gclone login` on a
+afterwards. It then reads the vault's index, which takes a while on a large vault and shows its
+progress ([USAGE.md](USAGE.md#commands), "Connecting a device to a large vault"). (If the vault was created with gclone before 0.2.0, first run `gclone login` on a
 device that is already attached and wait for `Vault unchanged.`: it is not yet verified that a
 new sign-in sees such a vault, and a new device that sees none would offer to create a second
 one. Do not run `gclone logout` on a device from before 0.2.0 until then — its old login cannot

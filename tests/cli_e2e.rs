@@ -411,6 +411,93 @@ impl World {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A new device's first refresh says what it is doing (0.6.2, §17.34)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_new_device_shows_its_first_refresh_on_stderr_and_only_there() {
+    let w = world();
+    // Enough commands for the vault to have a snapshot (one is due after 64 segments), and
+    // a few more that no snapshot covers.
+    for i in 0..70 {
+        w.a.run(&["mkdir", &format!(":made/{i}")]).ok();
+    }
+    let vault_state = w.a.vault_state();
+    let snapshots = || {
+        std::fs::read_dir(Path::new(&w.vault).join("gclone").join("index"))
+            .expect("the index folder")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("c-"))
+            .count()
+    };
+    assert!(vault_state.exists() && snapshots() == 1);
+
+    let login = |name: &str, env: &[(&str, &str)], more: &[&str]| {
+        let mut device = w.lab.device(name);
+        device.env = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut args = vec![
+            "login",
+            "--vault-dir",
+            &w.vault,
+            "--passphrase-file",
+            &w.pass,
+            "--device-name",
+            "new",
+        ];
+        args.extend(more);
+        device.run(&args).ok()
+    };
+    let phases = |stderr: &str| -> Vec<String> {
+        stderr
+            .lines()
+            .filter_map(|l| l.split_once(": ").map(|(label, _)| label.to_string()))
+            .filter(|label| label.ends_with(" index") || label.ends_with(" changes"))
+            .collect()
+    };
+
+    // Each phase's line comes at once here (in a release build: after a second, so that a
+    // vault of this size prints none). Stderr is a pipe: lines, no bar.
+    let shown = login("b", &[("GCLONE_TEST_PROGRESS", "1")], &[]);
+    assert_eq!(
+        phases(&shown.stderr),
+        [
+            "Downloading index",
+            "Loading index",
+            "Downloading changes",
+            "Applying changes"
+        ],
+        "{}",
+        shown.stderr
+    );
+    let loading = shown
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("Loading index: "))
+        .expect("the load");
+    assert!(loading.ends_with(" entries"), "{loading}");
+    assert!(!shown.stderr.contains('\r'));
+    // No snapshot of its own on the way in. (None was due here; the join of a vault whose
+    // next snapshot is due is in `tests/index_props.rs`.)
+    assert_eq!(snapshots(), 1);
+
+    // As fast as this vault loads, nothing is said …
+    let plain = login("c", &[], &[]);
+    assert_eq!(phases(&plain.stderr), [""; 0], "{}", plain.stderr);
+    // … `-q` says nothing in any case, and stdout is the same three lines every time.
+    let quiet = login("d", &[("GCLONE_TEST_PROGRESS", "1")], &["-q"]);
+    assert_eq!(quiet.stderr, "");
+    assert!(shown.stdout.starts_with("Connected to vault \"gclone\" ("));
+    assert_eq!(shown.stdout.lines().count(), 3);
+    // (Every login publishes a segment, so each prints another head value.)
+    let but_head = |out: &Out| out.stdout.replace(&login_head(&out.stdout), "HEAD");
+    assert_eq!(but_head(&shown), but_head(&plain));
+    assert_eq!(but_head(&shown), but_head(&quiet));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Directory mode: two devices, every command
 // ---------------------------------------------------------------------------------------------
 

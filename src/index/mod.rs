@@ -120,6 +120,29 @@ impl RefreshReport {
     }
 }
 
+/// What a refresh is doing, for whoever shows it ([`Vault::set_progress`]). Reported only for
+/// the work whose length grows with the vault; a refresh that finds nothing new reports
+/// nothing. Totals are what the listing or the object itself says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshProgress {
+    /// A snapshot is being downloaded: `bytes` of the `total` the listing shows.
+    Snapshot { bytes: u64, total: u64 },
+    /// A snapshot's content goes into the replica: `entries` of its `total` heads.
+    Load { entries: u64, total: u64 },
+    /// Segments are being fetched: `done` of `total` objects, `bytes` of `total_bytes`.
+    Segments {
+        done: u64,
+        total: u64,
+        bytes: u64,
+        total_bytes: u64,
+    },
+    /// Fetched segments are being applied: `changes` of their `total` ops.
+    Apply { changes: u64, total: u64 },
+}
+
+/// The listener of [`Vault::set_progress`]; called from whatever thread does the work.
+pub type ProgressFn = Arc<dyn Fn(RefreshProgress) + Send + Sync>;
+
 /// What became of the keyfiles a `passwd` retired (§2.7).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetiredKeyfiles {
@@ -231,6 +254,11 @@ pub struct Vault<B: Backend> {
     /// state — an error, or `RefreshReport::incomplete` (§5.9). `None`: no refresh yet, or a
     /// clean one.
     incomplete: Mutex<Option<String>>,
+    /// Told what a refresh is doing (`login` shows it); `None`: nobody watches.
+    progress: Option<ProgressFn>,
+    /// A replica that knows nothing starts from the newest snapshot instead of the first
+    /// segment (§5.3, §17.34). Tests switch it off to compare the two ways.
+    snapshot_first: bool,
 }
 
 /// A message-only error (exit 1), shown as written.
@@ -559,6 +587,8 @@ impl<B: Backend> Vault<B> {
             object_max: INDEX_OBJECT_MAX,
             listed_snaps: Mutex::new(None),
             incomplete: Mutex::new(None),
+            progress: None,
+            snapshot_first: true,
         };
         // A copied or restored state directory changes its identity before it seals anything.
         if locked && vault.check_machine()? {
@@ -764,7 +794,26 @@ impl<B: Backend> Vault<B> {
         self.object_max = max;
     }
 
+    /// `listener` is told what a refresh is doing while its work grows with the vault: the
+    /// download of a snapshot, its load, the fetch of segments and their application.
+    pub fn set_progress(&mut self, listener: ProgressFn) {
+        self.progress = Some(listener);
+    }
+
+    /// Tests: `false` makes an empty replica replay the journal from its first segment, as
+    /// every gclone before 0.6.2 did.
+    #[doc(hidden)]
+    pub fn set_snapshot_first(&mut self, on: bool) {
+        self.snapshot_first = on;
+    }
+
     // --- shared helpers of the journal files
+
+    fn tell(&self, what: RefreshProgress) {
+        if let Some(listener) = &self.progress {
+            listener(what);
+        }
+    }
 
     fn now(&self) -> u64 {
         (self.clock)()
@@ -984,6 +1033,8 @@ impl<B: Backend> Vault<B> {
 /// `Vault` around it.
 #[doc(hidden)]
 pub mod testing {
+    use std::collections::BTreeMap;
+
     use super::{ApplyStats, MemIndex, apply_segment, query, refresh};
     use crate::error::{IndexError, StateError};
     use crate::format::{SegmentV1, SnapshotV1};
@@ -1008,6 +1059,42 @@ pub mod testing {
     /// Replaces the replica's content with `snap`, as a rebuild does.
     pub fn load_snapshot(db: &Db, snap: &SnapshotV1) -> Result<(), IndexError> {
         db.txn(|c| refresh::load_snapshot(c, snap))
+    }
+
+    /// Every row of every table of `state.db`, as text and sorted: `table → rows`, a row
+    /// being its columns joined by `|` (blobs in hex). For tests that compare two replicas.
+    pub fn tables(db: &Db) -> Result<BTreeMap<String, Vec<String>>, IndexError> {
+        use rusqlite::types::ValueRef;
+        Ok(db.read(|c| {
+            let names: Vec<String> = c
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let mut out = BTreeMap::new();
+            for table in names {
+                let mut stmt = c.prepare(&format!("SELECT * FROM {table}"))?;
+                let columns = stmt.column_count();
+                let mut rows = stmt.query([])?;
+                let mut lines = Vec::new();
+                while let Some(r) = rows.next()? {
+                    let cells: Vec<String> = (0..columns)
+                        .map(|i| {
+                            Ok(match r.get_ref(i)? {
+                                ValueRef::Null => "NULL".to_owned(),
+                                ValueRef::Integer(n) => n.to_string(),
+                                ValueRef::Real(x) => x.to_string(),
+                                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                                ValueRef::Blob(b) => format!("x{}", crate::util::hex(b)),
+                            })
+                        })
+                        .collect::<Result<_, rusqlite::Error>>()?;
+                    lines.push(cells.join("|"));
+                }
+                lines.sort();
+                out.insert(table, lines);
+            }
+            Ok::<_, StateError>(out)
+        })?)
     }
 
     /// Failure injection: drops a table so that the next statement touching it fails.

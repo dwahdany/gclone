@@ -986,6 +986,21 @@ impl<B: Backend> Vault<B> {
             other => other,
         }
     }
+
+    /// [`Vault::finish_mutation`] for the command that only announces this device (`login`):
+    /// commit → resolve_conflicts, and no compaction or cleanup. A device that has just read
+    /// the whole index would otherwise write the vault's next snapshot whenever one is due —
+    /// read every head back, seal them and upload as much as it downloaded a moment ago
+    /// (§17.34). Nothing is lost by waiting: the next command that changes the vault ends
+    /// with `finish_mutation`, on this device or another.
+    pub async fn finish_join(&self) -> Result<(), IndexError> {
+        let _journal = self.journal.lock().await;
+        if self.db.read(tables::outbox_exists)? {
+            return Ok(());
+        }
+        self.commit_locked().await?;
+        self.resolve_locked().await.map(drop)
+    }
 }
 
 /// Records which snapshot the replica is based on (§5.3).

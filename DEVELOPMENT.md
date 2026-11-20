@@ -120,6 +120,15 @@ so.)
   `worker/test/e2e/timemachine.mjs` holds the checks that both viewers get: `run.mjs` runs
   them as its step `timemachine` (`GCLONE_E2E_ONLY=timemachine` for that step alone),
   `local.mjs` after its own. `shots.mjs <dir> chrome time` shoots only the time machine.
+- A new device's first refresh starts from the newest snapshot (SPEC §5.3, §17.34).
+  `tests/index_props.rs` compares it with a replay of the whole journal, table by table
+  (`index::testing::tables`; `Vault::set_snapshot_first(false)` is the replay), on a hand-made
+  history and on random ones, interrupts it at each of its three steps, and joins a vault
+  whose next snapshot is due (the joining device must not write it). Whatever changes how a
+  replica is loaded or applied belongs in front of those tests. `tests/cli_e2e.rs`
+  reads the progress lines of `login` with `GCLONE_TEST_PROGRESS=1`, which prints a phase's
+  first line at once; `state::tests::binding_values_never_recompiles_a_statement` fails when
+  SQLite compiles a cached statement again while ops are applied.
 - The hosted core has a size limit (`WASM_MAX` in `web-core/test/check-module.mjs`), and
   `build.sh` fails above it. Generic code that is instantiated once more per type — a sort, a
   map — is what grows it: see `rules::listing_order` and `past::order_by` before adding one.
@@ -223,7 +232,7 @@ checkout that has the tag:
 
 ```sh
 git fetch --tags
-scripts/release-sign-macos.sh v0.6.1
+scripts/release-sign-macos.sh v0.6.2
 ```
 
 It verifies every file of the draft against its attestation and `SHA256SUMS`, signs a copy of
@@ -234,7 +243,7 @@ with that Mac's Secure Enclave as every Mac's first login does since 0.5.1, then
 a read from the sealed store, and `gclone keystore check` —, adds
 `gclone-aarch64-apple-darwin-signed.tar.gz` and its line in `SHA256SUMS`,
 downloads the whole draft again and checks it once more, and publishes after you type
-`publish v0.6.1`. Then it verifies the published release (`gh release verify`,
+`publish v0.6.2`. Then it verifies the published release (`gh release verify`,
 `gh release verify-asset`, `install.sh --require-attestation`). It refuses to go on as soon as
 anything does not verify, and until it publishes it can simply be run again — also after an
 upload that was cut off (the draft may then be without `SHA256SUMS` or without the signed
@@ -246,7 +255,7 @@ network error, a rate limit, an attestation that is not served yet). That is not
 run
 
 ```sh
-scripts/release-sign-macos.sh --verify-published v0.6.1
+scripts/release-sign-macos.sh --verify-published v0.6.2
 ```
 
 which needs no draft and no signing identity, changes nothing, and can be repeated: it
@@ -300,9 +309,9 @@ before the first signed release:
 **Order on a release day** — the tag first, `main` last:
 
 ```sh
-git push origin v0.6.1                 # the tag ALONE: it carries the commit and starts release.yml
+git push origin v0.6.2                 # the tag ALONE: it carries the commit and starts release.yml
 #   … wait for the workflow: a draft release
-scripts/release-sign-macos.sh v0.6.1   # verify, sign, publish
+scripts/release-sign-macos.sh v0.6.2   # verify, sign, publish
 #   … deploy the viewer (worker/README.md)
 git push origin main                   # only now
 ```

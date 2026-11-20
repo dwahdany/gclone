@@ -206,14 +206,26 @@ pub async fn get_bounded<B: Backend>(
     h: &Handle,
     max: u64,
 ) -> Result<Option<bytes::Bytes>, BackendError> {
+    get_bounded_counted(b, h, max, &|_| {}).await
+}
+
+/// [`get_bounded`] that tells `arrived` the length of every chunk as it comes in — for
+/// whoever shows the progress of a large download.
+pub async fn get_bounded_counted<B: Backend>(
+    b: &B,
+    h: &Handle,
+    max: u64,
+    arrived: &(dyn Fn(u64) + Sync),
+) -> Result<Option<bytes::Bytes>, BackendError> {
     let stream = b.get(h, Some(0..max.saturating_add(1))).await?;
-    collect_bounded(stream, max).await
+    collect_bounded(stream, max, arrived).await
 }
 
 /// Collects `stream` unless it delivers more than `max` bytes (`Ok(None)`; the rest is not read).
 async fn collect_bounded(
     mut stream: ByteStream,
     max: u64,
+    arrived: &(dyn Fn(u64) + Sync),
 ) -> Result<Option<bytes::Bytes>, BackendError> {
     use futures_util::StreamExt;
     let fits = |held: usize, more: usize| (held as u64).saturating_add(more as u64) <= max;
@@ -223,12 +235,14 @@ async fn collect_bounded(
     if !fits(0, first.len()) {
         return Ok(None);
     }
+    arrived(first.len() as u64);
     let Some(second) = stream.next().await.transpose()? else {
         return Ok(Some(first));
     };
     if !fits(first.len(), second.len()) {
         return Ok(None);
     }
+    arrived(second.len() as u64);
     let mut buf = Vec::with_capacity(first.len() + second.len());
     buf.extend_from_slice(&first);
     buf.extend_from_slice(&second);
@@ -236,6 +250,7 @@ async fn collect_bounded(
         if !fits(buf.len(), chunk.len()) {
             return Ok(None);
         }
+        arrived(chunk.len() as u64);
         buf.extend_from_slice(&chunk);
     }
     Ok(Some(buf.into()))
@@ -388,7 +403,12 @@ mod tests {
         // A server that ignores the range and keeps sending: the read stops at the bound.
         let polled = Arc::new(AtomicUsize::new(0));
         let endless = pieces(usize::MAX, 1000, &polled);
-        assert!(collect_bounded(endless, 4500).await.unwrap().is_none());
+        assert!(
+            collect_bounded(endless, 4500, &|_| {})
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             polled.load(Ordering::SeqCst),
             5,
@@ -398,7 +418,9 @@ mod tests {
         // Too long in the first or in the second piece.
         for (len, max) in [(1000, 999), (1000, 1999)] {
             let polled = Arc::new(AtomicUsize::new(0));
-            let got = collect_bounded(pieces(9, len, &polled), max).await.unwrap();
+            let got = collect_bounded(pieces(9, len, &polled), max, &|_| {})
+                .await
+                .unwrap();
             assert!(got.is_none());
             assert!(polled.load(Ordering::SeqCst) <= 2);
         }
@@ -406,7 +428,7 @@ mod tests {
         // Exactly the bound, and anything shorter, is returned whole.
         for (chunks, max) in [(0, 0), (1, 1000), (2, 2000), (5, 5000), (5, u64::MAX)] {
             let polled = Arc::new(AtomicUsize::new(0));
-            let got = collect_bounded(pieces(chunks, 1000, &polled), max)
+            let got = collect_bounded(pieces(chunks, 1000, &polled), max, &|_| {})
                 .await
                 .unwrap()
                 .expect("fits");
@@ -419,7 +441,7 @@ mod tests {
             Err(BackendError::RateLimited),
         ]));
         assert!(matches!(
-            collect_bounded(failing, 100).await,
+            collect_bounded(failing, 100, &|_| {}).await,
             Err(BackendError::RateLimited)
         ));
     }

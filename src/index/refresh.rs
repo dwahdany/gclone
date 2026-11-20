@@ -3,28 +3,35 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::{StreamExt, TryStreamExt};
 use rusqlite::Connection;
 
 use super::commit::{apply_and_record, raise_lamport, set_base_meta};
 use super::{
-    RefreshReport, Vault, blocking, cache_store, causal_order, check_snapshot_format, not_visible,
-    query,
+    RefreshProgress, RefreshReport, Vault, blocking, cache_store, causal_order,
+    check_snapshot_format, not_visible, query,
 };
-use crate::backend::{Backend, Handle, ObjMeta, get_bounded, md5_of};
+use crate::backend::{Backend, Handle, ObjMeta, get_bounded_counted, md5_of};
 use crate::consts::{GAP_GRACE_MS, INDEX_PARALLEL_MAX};
 use crate::crypto::Keyring;
 use crate::error::{BackendError, FormatError, IndexError, StateError};
 use crate::format::{
-    IndexName, SegmentV1, SnapshotV1, open_segment, open_snapshot, parse_index_name, segment_name,
+    HeadRec, IndexName, SegmentV1, SnapshotV1, open_segment, open_snapshot, parse_index_name,
+    segment_name,
 };
 use crate::state::tables::{self, AppliedRow, Version};
 use crate::types::{CoveredSeg, DeviceId, SegRef};
 
 /// `open_segment` / `open_snapshot`: the acceptance rules of §4.6 over a whole object.
 type Open<T> = fn(&Keyring, &str, &[u8]) -> Result<(T, [u8; 32]), FormatError>;
+
+/// Told the length of every chunk of a download as it arrives.
+type Arrived<'a> = &'a (dyn Fn(u64) + Sync);
+
+/// For a download nobody watches.
+fn unwatched(_: u64) {}
 
 /// Full identity of a segment: `(device, seq, BLAKE3(object))`.
 pub(super) type SegKey = (DeviceId, u64, [u8; 32]);
@@ -398,7 +405,7 @@ impl<B: Backend> Vault<B> {
             return Ok(same_bytes(meta, size, md5));
         }
         Ok(self
-            .download(name, &meta.handle, Some(size))
+            .download(name, &meta.handle, Some(size), &unwatched)
             .await?
             .is_some_and(|bytes| bytes.len() as u64 == size && md5_of(&bytes)[..] == md5[..]))
     }
@@ -431,13 +438,14 @@ impl<B: Backend> Vault<B> {
         name: &str,
         handle: &Handle,
         listed_size: Option<u64>,
+        arrived: Arrived<'_>,
     ) -> Result<Option<Vec<u8>>, IndexError> {
         let max = self.object_max;
         if listed_size.is_some_and(|size| size > max) {
             tracing::warn!("corrupt index object {name}: larger than the {max} bytes allowed");
             return Ok(None);
         }
-        match get_bounded(&*self.backend, handle, max).await {
+        match get_bounded_counted(&*self.backend, handle, max, arrived).await {
             Ok(Some(bytes)) => Ok(Some(bytes.into())),
             Ok(None) => {
                 tracing::warn!("corrupt index object {name}: larger than the {max} bytes allowed");
@@ -455,6 +463,7 @@ impl<B: Backend> Vault<B> {
         name: &str,
         metas: &[ObjMeta],
         open: Open<T>,
+        arrived: Arrived<'_>,
     ) -> Result<Option<Fetched<T>>, IndexError> {
         if let Some(bytes) = self.cache_read(name) {
             let (size, md5) = (bytes.len() as u64, md5_of(&bytes));
@@ -473,7 +482,12 @@ impl<B: Backend> Vault<B> {
             let _ = std::fs::remove_file(self.cache_path(name));
         }
         for meta in metas {
-            let Some(bytes) = self.download(name, &meta.handle, Some(meta.size)).await? else {
+            // A download begins: whoever watches learns of it before the first byte.
+            arrived(0);
+            let Some(bytes) = self
+                .download(name, &meta.handle, Some(meta.size), arrived)
+                .await?
+            else {
                 continue;
             };
             let accepted = self.accept(name, bytes, open, Origin::Listed).await?;
@@ -496,7 +510,8 @@ impl<B: Backend> Vault<B> {
         name: &str,
         metas: &[ObjMeta],
     ) -> Result<Option<Fetched<SegmentV1>>, IndexError> {
-        self.fetch_object(name, metas, open_segment).await
+        self.fetch_object(name, metas, open_segment, &unwatched)
+            .await
     }
 
     pub(super) async fn fetch_snapshot(
@@ -507,7 +522,18 @@ impl<B: Backend> Vault<B> {
         let open = |keys: &Keyring, name: &str, bytes: &[u8]| {
             open_snapshot(keys, name, bytes).map(|(snap, hash)| (Arc::new(snap), hash))
         };
-        self.fetch_object(name, metas, open).await
+        // What is shown is the object the listing puts first; another one under the same
+        // name (a plant, a duplicate) is read without moving the count past the total.
+        let total = metas.first().map_or(0, |m| m.size);
+        let got = AtomicU64::new(0);
+        let arrived = |n: u64| {
+            let bytes = got.fetch_add(n, Ordering::Relaxed).saturating_add(n);
+            self.tell(RefreshProgress::Snapshot {
+                bytes: bytes.min(total),
+                total,
+            });
+        };
+        self.fetch_object(name, metas, open, &arrived).await
     }
 
     /// The object `file_id`, if the store shows it un-trashed and still under `name` (list
@@ -602,6 +628,9 @@ impl<B: Backend> Vault<B> {
             accepted: HashMap::new(),
         };
         known = self.db.read(Known::load)?;
+        if self.snapshot_first && known.is_empty() && p.start_from_snapshot(&known).await? {
+            known = self.db.read(Known::load)?;
+        }
         p.gather(&known).await?;
         p.check_clone()?;
 
@@ -778,23 +807,46 @@ impl<B: Backend> Pull<'_, B> {
             jobs.extend(cached.map(|name| (name, Vec::new())));
         }
 
+        // What the listing says there is to fetch (a cached copy counts when it has been read).
+        let listed_size = |metas: &[ObjMeta]| metas.first().map_or(0, |m| m.size);
+        let total = jobs.len() as u64;
+        let total_bytes: u64 = jobs.iter().map(|(_, metas)| listed_size(metas)).sum();
+
         // Eight at a time — but an object listed as large is fetched alone: what is in flight
         // is not authenticated yet, and eight objects of `INDEX_OBJECT_MAX` are not a bound.
         let (large, small): (Vec<_>, Vec<_>) = jobs
             .into_iter()
             .partition(|(_, metas)| metas.iter().any(|m| m.size > INDEX_PARALLEL_MAX));
         let v = self.v;
+        let (done, bytes) = (&AtomicU64::new(0), &AtomicU64::new(0));
+        let segments = |done, bytes| RefreshProgress::Segments {
+            done,
+            total,
+            bytes,
+            total_bytes,
+        };
+        // Nothing to show for a refresh that reads its segments from the cache.
+        if total_bytes > 0 {
+            v.tell(segments(0, 0));
+        }
         let fetch = |(name, metas): (String, Vec<ObjMeta>)| async move {
             let found = v.fetch_segment(&name, &metas).await?;
+            if total_bytes > 0 {
+                let size = listed_size(&metas);
+                v.tell(segments(
+                    done.fetch_add(1, Ordering::Relaxed) + 1,
+                    bytes.fetch_add(size, Ordering::Relaxed) + size,
+                ));
+            }
             Ok::<_, IndexError>((name, !metas.is_empty(), found))
         };
         let fetched: Vec<(String, bool, Option<Fetched<SegmentV1>>)> =
             futures_util::stream::iter(small)
-                .map(fetch)
+                .map(&fetch)
                 .buffer_unordered(8)
                 .chain(
                     futures_util::stream::iter(large)
-                        .map(fetch)
+                        .map(&fetch)
                         .buffer_unordered(1),
                 )
                 .try_collect()
@@ -959,9 +1011,19 @@ impl<B: Backend> Pull<'_, B> {
         self.info = info.into_iter().flatten().collect();
 
         let db = self.v.db.clone();
+        let total: u64 = batch.iter().map(|((seg, _), _)| seg.ops.len() as u64).sum();
+        let listener = self.v.progress.clone();
         let (applied, forks) = blocking(move || {
-            db.txn(|c| {
-                let mut forks = 0u64;
+            // A long batch — the journal of a vault without a snapshot, or what a device
+            // missed in a month — gets room to work in; a short one runs as it always did.
+            let tell = |changes| {
+                if let Some(listener) = &listener {
+                    listener(RefreshProgress::Apply { changes, total });
+                }
+            };
+            tell(0);
+            db.txn_sized(total >= BULK_OPS, |c| {
+                let (mut forks, mut changes) = (0u64, 0u64);
                 for ((seg, hash), info) in &batch {
                     if tables::is_fork(c, seg.device, seg.seq, hash)? {
                         forks += 1;
@@ -983,6 +1045,8 @@ impl<B: Backend> Pull<'_, B> {
                         size: info.size,
                     };
                     apply_and_record(c, seg, &row)?;
+                    changes += seg.ops.len() as u64;
+                    tell(changes);
                 }
                 Ok::<_, IndexError>((batch.len() as u64, forks))
             })
@@ -1030,6 +1094,29 @@ impl<B: Backend> Pull<'_, B> {
     /// Listed snapshot names, newest first (the name starts with the lamport in fixed-width hex).
     fn snapshot_names(&self) -> Vec<String> {
         self.listed.snaps.keys().rev().cloned().collect()
+    }
+
+    /// A replica that knows nothing — a new device — starts from the newest accepted snapshot
+    /// and fetches only what that does not cover (§17.34). The loop of §5.3 would get to the
+    /// same base the long way: fetch and apply every listed segment from the vault's first,
+    /// then download that snapshot only to adopt it.
+    ///
+    /// This is no new rule: it is §5.3 run on a listing that shows nothing but that snapshot
+    /// (an empty replica rebuilds from it: useful, and nothing known is lost), followed by
+    /// §5.3 on the whole listing — and a refresh has to be right for every listing it is
+    /// shown, in any order. A snapshot that covers nothing gives nothing to start from.
+    async fn start_from_snapshot(&mut self, known: &Known) -> Result<bool, IndexError> {
+        for name in self.snapshot_names() {
+            let Some(snap) = self.snapshot(&name).await? else {
+                continue;
+            };
+            if snap.body.covered.is_empty() {
+                continue;
+            }
+            self.rebuild(&name, known).await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// The accepted snapshot in L with the greatest inner lamport — unless it is the one checked
@@ -1165,9 +1252,15 @@ impl<B: Backend> Pull<'_, B> {
         let (db, body, name_owned) = (self.v.db.clone(), snap.body.clone(), name.to_owned());
         let (size, md5, file_id) = (snap.size, snap.md5, snap.file_id.clone());
         let remembered = self.remembered.clone();
+        let listener = self.v.progress.clone();
+        let total = body.heads.len() as u64;
         blocking(move || {
-            db.txn(|c| {
-                load_snapshot(c, &body)?;
+            db.txn_bulk(|c| {
+                load_snapshot_watched(c, &body, &mut |entries| {
+                    if let Some(listener) = &listener {
+                        listener(RefreshProgress::Load { entries, total });
+                    }
+                })?;
                 c.execute("DELETE FROM applied", [])
                     .map_err(StateError::from)?;
                 set_base(c, &body, &name_owned, size, &md5, &file_id)?;
@@ -1198,7 +1291,7 @@ impl<B: Backend> Pull<'_, B> {
             let mut found: Option<(SegmentV1, CandInfo)> = None;
             if !r.file_id.is_empty() {
                 let handle = Handle(r.file_id.clone());
-                if let Some(bytes) = self.v.download(&name, &handle, None).await? {
+                if let Some(bytes) = self.v.download(&name, &handle, None, &unwatched).await? {
                     let opened = self
                         .v
                         .accept(&name, bytes, open_segment, Origin::ById)
@@ -1317,7 +1410,11 @@ impl<B: Backend> Pull<'_, B> {
             None => size.is_none_or(|s| s == m.size),
         };
         for meta in metas.iter().filter(unread) {
-            let Some(bytes) = self.v.download(name, &meta.handle, Some(meta.size)).await? else {
+            let Some(bytes) = self
+                .v
+                .download(name, &meta.handle, Some(meta.size), &unwatched)
+                .await?
+            else {
                 continue;
             };
             if blake3::hash(&bytes).as_bytes() == hash {
@@ -1495,25 +1592,69 @@ fn set_base(
     Ok(())
 }
 
+/// A batch of at least this many ops is applied with [`Db::txn_bulk`].
+const BULK_OPS: u64 = 20_000;
+
+/// How many heads a load reports at a time.
+const LOAD_REPORT_EVERY: usize = 8_192;
+
 /// Replaces heads, removed versions, devices and the blob rows without `trashed_ms` by the
 /// content of `snap` (§5.3 rebuild_from). `applied`, the base tables and `hw` are the caller's.
 pub(super) fn load_snapshot(c: &Connection, snap: &SnapshotV1) -> Result<(), IndexError> {
+    load_snapshot_watched(c, snap, &mut |_| {})
+}
+
+/// The stamp and hash that decide a path's winner, in the order SQLite compares the columns
+/// `(st_l, st_d, st_i, hash)`: integers by value, blobs byte by byte.
+fn winner_key(h: &HeadRec) -> (u64, [u8; 8], u32, [u8; 32]) {
+    (h.stamp.lamport, h.stamp.device.0, h.stamp.idx, h.entry.hash)
+}
+
+/// [`load_snapshot`]; `loaded` is told how many heads are in, every few thousand.
+fn load_snapshot_watched(
+    c: &Connection,
+    snap: &SnapshotV1,
+    loaded: &mut dyn FnMut(u64),
+) -> Result<(), IndexError> {
     check_snapshot_format(snap)?;
     c.execute_batch(
         "DELETE FROM heads; DELETE FROM removed; DELETE FROM devices; \
          DELETE FROM blobs WHERE trashed_ms IS NULL;",
     )
     .map_err(StateError::from)?;
-    for h in &snap.heads {
-        tables::head_insert(c, &h.path, &h.stamp, &h.entry, h.origin.as_ref(), false)?;
+    // The winner of a path is its greatest (stamp, hash). A snapshot lists its heads by
+    // path, so the heads of one path stand together and the winner is known when the row is
+    // written: one pass, where a second statement would rewrite every row of the table. The
+    // order is checked, not trusted — heads in any other order are flagged by that statement.
+    let heads = &snap.heads;
+    loaded(0);
+    let by_path = heads.windows(2).all(|w| w[0].path <= w[1].path);
+    let mut at = 0;
+    while at < heads.len() {
+        let path = &heads[at].path;
+        let end = if by_path {
+            at + heads[at..].iter().take_while(|h| h.path == *path).count()
+        } else {
+            at + 1
+        };
+        let best = heads[at..end].iter().map(winner_key).max();
+        for h in &heads[at..end] {
+            let winner = by_path && Some(winner_key(h)) == best;
+            tables::head_insert(c, &h.path, &h.stamp, &h.entry, h.origin.as_ref(), winner)?;
+        }
+        if end / LOAD_REPORT_EVERY != at / LOAD_REPORT_EVERY || end == heads.len() {
+            loaded(end as u64);
+        }
+        at = end;
     }
-    // The winner of a path is its greatest (stamp, hash); the snapshot's order is not trusted.
-    c.execute(
-        "UPDATE heads SET winner = NOT EXISTS (SELECT 1 FROM heads g WHERE g.path = heads.path \
-           AND (g.st_l, g.st_d, g.st_i, g.hash) > (heads.st_l, heads.st_d, heads.st_i, heads.hash))",
-        [],
-    )
-    .map_err(StateError::from)?;
+    if !by_path {
+        c.execute(
+            "UPDATE heads SET winner = NOT EXISTS (SELECT 1 FROM heads g WHERE g.path = heads.path \
+               AND (g.st_l, g.st_d, g.st_i, g.hash) > (heads.st_l, heads.st_d, heads.st_i, heads.hash))",
+            [],
+        )
+        .map_err(StateError::from)?;
+    }
     for r in &snap.removed {
         let version = Version {
             path: r.path.clone(),

@@ -19,6 +19,9 @@ use crate::util;
 mod schema;
 pub(crate) mod tables;
 
+/// Page cache of [`Db::txn_bulk`], in KiB.
+const BULK_CACHE_KIB: i64 = 64 * 1024;
+
 /// `Arc<Mutex<rusqlite::Connection>>` — cheap to clone, `Send + Sync`.
 #[derive(Clone)]
 pub struct Db {
@@ -87,7 +90,7 @@ impl Db {
         if !schema::init_shared(&conn)? {
             return Err(StateError::Locked);
         }
-        conn.set_prepared_statement_cache_capacity(128);
+        Self::tune(&conn)?;
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -99,10 +102,26 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Db, StateError> {
         schema::init(&conn)?;
-        conn.set_prepared_statement_cache_capacity(128);
+        Self::tune(&conn)?;
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// What every connection gets besides the pragmas: the statement cache, and the query
+    /// planner's stability guarantee. Without the latter SQLite looks at the value bound to a
+    /// parameter where a partial index might apply (`heads_size`, `heads_losers`) and then
+    /// compiles the statement again on every later bind: two statements of every applied
+    /// `Put` were compiled once per op, more than half the time of a large replay (§17.34).
+    /// No statement here depends on that look: the conditions that select a partial index
+    /// are written as literals.
+    fn tune(conn: &Connection) -> Result<(), StateError> {
+        conn.set_prepared_statement_cache_capacity(128);
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+            true,
+        )?;
+        Ok(())
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -142,6 +161,42 @@ impl Db {
         let out = f(&tx)?;
         tx.commit().map_err(StateError::from)?;
         Ok(out)
+    }
+
+    /// [`Db::txn`] for a transaction that writes a large part of the replica — a snapshot's
+    /// content, a long batch of segments: SQLite gets [`BULK_CACHE_KIB`] of page cache while
+    /// it runs. With the 2 MiB a connection has otherwise, the pages of such a transaction
+    /// are written to the WAL as soon as they leave the cache and read back when the next
+    /// row needs them — the indexes of `heads` are not written in order. What is committed,
+    /// and when, is the same.
+    pub(crate) fn txn_bulk<T, E: From<StateError>>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.txn_sized(true, f)
+    }
+
+    /// [`Db::txn`], or [`Db::txn_bulk`] when `bulk`.
+    pub(crate) fn txn_sized<T, E: From<StateError>>(
+        &self,
+        bulk: bool,
+        f: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        if !bulk {
+            return self.txn(f);
+        }
+        let usual: i64 = self
+            .read(|c| c.pragma_query_value(None, "cache_size", |r| r.get(0)))
+            .map_err(StateError::from)?;
+        self.read(|c| c.pragma_update(None, "cache_size", -BULK_CACHE_KIB))
+            .map_err(StateError::from)?;
+        let out = self.txn(f);
+        // Back to the usual size, and the memory back to the system — whatever `f` returned.
+        let _ = self.read(|c| {
+            c.pragma_update(None, "cache_size", usual)?;
+            c.execute_batch("PRAGMA shrink_memory")
+        });
+        out
     }
 
     pub fn meta_get(&self, k: &str) -> Result<Option<Vec<u8>>, StateError> {
@@ -591,5 +646,75 @@ mod tests {
         assert!(again.is_some());
         drop(again);
         lock_exclusive(&state, Duration::ZERO).unwrap();
+    }
+
+    /// `(sql, times SQLite compiled it again)` for every statement the connection holds.
+    fn reprepared(c: &Connection) -> Vec<(String, i32)> {
+        use rusqlite::ffi;
+        let mut out = Vec::new();
+        // SAFETY: the connection is borrowed for the whole walk; the statements it lists are
+        // the ones in rusqlite's cache, which nothing finalizes meanwhile.
+        unsafe {
+            let db = c.handle();
+            let mut stmt = ffi::sqlite3_next_stmt(db, std::ptr::null_mut());
+            while !stmt.is_null() {
+                let sql = std::ffi::CStr::from_ptr(ffi::sqlite3_sql(stmt))
+                    .to_string_lossy()
+                    .into_owned();
+                let n = ffi::sqlite3_stmt_status(stmt, ffi::SQLITE_STMTSTATUS_REPREPARE, 0);
+                out.push((sql, n));
+                stmt = ffi::sqlite3_next_stmt(db, stmt);
+            }
+        }
+        out
+    }
+
+    /// Applying an op binds new values to the same few statements again and again. SQLite
+    /// compiles a statement anew when a bound value might change its plan (it looks at the
+    /// value where a partial index could apply); with the planner's stability guarantee
+    /// switched on it never does. Without it two statements of every `Put` were compiled
+    /// hundreds of thousands of times in the first refresh of a large vault.
+    #[test]
+    fn binding_values_never_recompiles_a_statement() {
+        use crate::index::apply::HeadStore;
+        use crate::types::Entry;
+        let db = Db::open_in_memory().unwrap();
+        db.txn(|c| {
+            let mut store = tables::SqlStore(c);
+            for i in 0..200u32 {
+                let entry = Entry {
+                    kind: EntryKind::File,
+                    size: u64::from(i),
+                    mtime_ns: 1,
+                    exec: false,
+                    hash: [i as u8; 32],
+                    loc: None,
+                };
+                let path = format!("dir/file-{}", i % 150);
+                let stamp = Stamp {
+                    lamport: u64::from(i) + 1,
+                    device: DeviceId([1; 8]),
+                    idx: 0,
+                };
+                if i % 3 == 0 {
+                    let base = Stamp {
+                        lamport: u64::from(i),
+                        ..stamp
+                    };
+                    store.supersede(&path, &base, 5, stamp)?;
+                }
+                store.insert_head(&path, stamp, &entry, None)?;
+                assert!(!store.heads(&path)?.is_empty());
+            }
+            Ok::<_, StateError>(())
+        })
+        .unwrap();
+        let again: Vec<(String, i32)> = db
+            .read(|c| Ok::<_, StateError>(reprepared(c)))
+            .unwrap()
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        assert!(again.is_empty(), "compiled again: {again:#?}");
     }
 }

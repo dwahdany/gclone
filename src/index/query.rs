@@ -427,6 +427,19 @@ impl<B: Backend> Vault<B> {
         Ok(format!("{}-{}", &code[..4], &code[4..]))
     }
 
+    /// The number of files in the vault — `stats().files` without the rest, which scans the
+    /// heads several times more (`login` prints this one number).
+    pub fn file_count(&self) -> Result<u64, IndexError> {
+        Ok(self.db.read(|c| {
+            let n: i64 = c.query_row(
+                "SELECT count(*) FROM heads WHERE winner = 1 AND kind = 0",
+                [],
+                |r| r.get(0),
+            )?;
+            to_u(n)
+        })?)
+    }
+
     /// `dead_blob_bytes` counts what `gclone gc` would trash at `now_ms`.
     pub fn stats(&self, now_ms: u64) -> Result<VaultStats, IndexError> {
         let staged = self.staged_blob_ids()?;
