@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -21,11 +22,11 @@ use crate::consts::{
 use crate::crypto::{Keyring, MasterKey, Passphrase};
 use crate::error::{AuthError, BackendError, ConfigError, CryptoError, FormatError, IndexError};
 use crate::format::{KeyfilePayload, check_keyfile, open_keyfile, seal_keyfile};
-use crate::index::{CreateParams, FoundVault, OpenParams, Vault, creation_winner};
+use crate::index::{CreateParams, FoundVault, OpenParams, RefreshProgress, Vault, creation_winner};
 use crate::keystore;
 use crate::state::Db;
 use crate::types::OpDraft;
-use crate::ui::Ui;
+use crate::ui::{PhaseUnit, Phases, Ui};
 use crate::util;
 
 #[derive(clap::Args, Clone, Debug, Default)]
@@ -1220,7 +1221,7 @@ async fn attach(s: &Session, found: &FoundVault) -> anyhow::Result<()> {
     })
     .await?;
     let device = device_name(&s.args, Some(stored_name));
-    let vault = Vault::open(
+    let mut vault = Vault::open(
         s.backend.clone(),
         db,
         keys.clone(),
@@ -1233,7 +1234,16 @@ async fn attach(s: &Session, found: &FoundVault) -> anyhow::Result<()> {
         },
     )
     .await?;
-    let verdict = register(&vault, &device).await.context(
+    // A new device reads the whole index once: on a large vault that is a download of a
+    // hundred megabytes and a load of a million rows, and the terminal says so.
+    let phases = Arc::new(index_phases(&s.ui));
+    vault.set_progress({
+        let phases = phases.clone();
+        Arc::new(move |step| show_refresh(&phases, step))
+    });
+    let registered = register(&vault, &device).await;
+    phases.finish();
+    let verdict = registered.context(
         "this device could not be registered in the vault; nothing was saved — run `gclone \
          login` again",
     )?;
@@ -1245,7 +1255,7 @@ async fn attach(s: &Session, found: &FoundVault) -> anyhow::Result<()> {
     };
     s.save_connected(found, &vault_name, &keys)?;
 
-    let files = util::group_thousands(vault.stats(vault.backend().now_ms())?.files);
+    let files = util::group_thousands(vault.file_count()?);
     s.ui.out(&format!(
         "Connected to vault {vault_name:?} ({files} files). This device: {device:?}."
     ));
@@ -1269,6 +1279,34 @@ async fn attach(s: &Session, found: &FoundVault) -> anyhow::Result<()> {
          agreement, not that either device is up to date.",
     );
     Ok(())
+}
+
+/// The progress of the first refresh on this device. Debug builds honour
+/// `GCLONE_TEST_PROGRESS=1` (§7.1): a phase's first line comes at once instead of after a
+/// second, so that a test sees it on a vault of five files.
+fn index_phases(ui: &Arc<Ui>) -> Phases {
+    if super::test_env("GCLONE_TEST_PROGRESS").as_deref() == Some("1") {
+        return Phases::with_timing(ui.clone(), Duration::ZERO, Duration::from_secs(3600));
+    }
+    Phases::new(ui.clone())
+}
+
+/// One step of a refresh as a phase on the terminal.
+fn show_refresh(phases: &Phases, step: RefreshProgress) {
+    match step {
+        RefreshProgress::Snapshot { bytes, total } => {
+            phases.update("Downloading index", PhaseUnit::Bytes, bytes, total);
+        }
+        RefreshProgress::Load { entries, total } => {
+            phases.update("Loading index", PhaseUnit::Count("entries"), entries, total);
+        }
+        RefreshProgress::Segments {
+            bytes, total_bytes, ..
+        } => phases.update("Downloading changes", PhaseUnit::Bytes, bytes, total_bytes),
+        RefreshProgress::Apply { changes, total } => {
+            phases.update("Applying changes", PhaseUnit::Count(""), changes, total);
+        }
+    }
 }
 
 /// Makes the other devices see this one — before any key is saved (§2.6).
@@ -1304,7 +1342,10 @@ async fn register(
             }])
             .await?;
     }
-    vault.finish_mutation().await?;
+    // Not `finish_mutation`: a device that has just read the index does not write the
+    // vault's next snapshot — on a large vault an upload as large as what it downloaded,
+    // built in memory. The next command that changes the vault does, on whichever device.
+    vault.finish_join().await?;
     Ok(None)
 }
 

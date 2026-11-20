@@ -83,7 +83,7 @@ whoever controls the repository controls the script.
 For a private fork, `install.sh` reads `GITHUB_TOKEN` / `GH_TOKEN` or uses a signed-in
 [GitHub CLI](https://cli.github.com); point it at the fork with `--repo OWNER/NAME`.
 
-Options go after `sh -s --`, or into the environment: `--version v0.6.1` (`GCLONE_VERSION`;
+Options go after `sh -s --`, or into the environment: `--version v0.6.2` (`GCLONE_VERSION`;
 default: the latest release), `--dir DIR` (`GCLONE_INSTALL_DIR`; default `~/.local/bin`),
 `--repo OWNER/NAME` (`GCLONE_REPO`), `--require-attestation` (install nothing that `gh` did
 not verify), `--no-attestation` (checksum only: releases before 0.5.0 carry no attestation
@@ -112,8 +112,8 @@ this order: the argument (`gclone login https://<host>`), the environment variab
 and the compiled-in URL:
 
 ```
-gclone 0.6.1 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
-gclone 0.6.1 (aarch64-apple-darwin, no auth URL built in)
+gclone 0.6.2 (aarch64-unknown-linux-musl, auth URL https://auth.example.org)
+gclone 0.6.2 (aarch64-apple-darwin, no auth URL built in)
 ```
 
 The release workflow compiles in the repository variable `GCLONE_DEFAULT_AUTH_URL`, so this
@@ -190,6 +190,26 @@ gclone logout                               # remove this device's login and cac
 [SECURITY.md](SECURITY.md#lost-or-stolen-device) and under [Local files](#local-files),
 `gclone serve restic` under [Back up with restic](#back-up-with-restic).
 `gclone <command> --help` prints every option of a command.
+
+**Connecting a device to a large vault.** After the passphrase, a new device reads the
+vault's index once: the newest snapshot of it, then the changes made since. On a vault of
+several hundred thousand files that is a download of 100–200 MB and takes from some seconds
+to a minute or more, depending on the connection — and longer on a vault so new that it has
+no snapshot yet, whose changes are fetched one by one. The terminal shows where it is:
+
+```
+Downloading index   [=========>      ] 92.10 MiB/139.43 MiB  19.40 MiB/s  eta 2s
+Loading index       [=====>          ] 311,296/860,000 entries  eta 2s
+```
+
+then `Downloading changes` and `Applying changes` for what the snapshot does not cover, and
+`Connected to vault …` at the end. Where stderr is not a terminal (a script, a log file) there
+is no bar: each phase prints a line when it begins (`Loading index: 860,000 entries`) and one
+every ten seconds while it lasts (`Loading index: 311,296 of 860,000 entries`). A small vault
+shows none of this — it is connected before there is anything to report — and `-q` prints
+neither bar nor lines. If the login is interrupted, run it again: an index object that
+arrived whole is kept and not downloaded twice, and a load that did not finish is undone as
+a whole. Later commands read only what changed since.
 
 ### How `copy` and `sync` behave
 

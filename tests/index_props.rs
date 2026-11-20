@@ -695,6 +695,16 @@ fn merge_is_independent_of_causal_order_and_grouping() {
             testing::load_snapshot(&db, &partial).unwrap();
             assert_eq!(testing::dump(&db).unwrap(), who.state);
             assert_eq!(testing::winners(&db).unwrap(), who.state.winners());
+            // The winners do not depend on the order a snapshot lists its heads in: in path
+            // order they are flagged as the rows are written, in any other by a statement.
+            let mut reversed = partial.clone();
+            reversed.heads.reverse();
+            let other = Db::open_in_memory().unwrap();
+            testing::load_snapshot(&other, &reversed).unwrap();
+            assert_eq!(
+                testing::tables(&other).unwrap(),
+                testing::tables(&db).unwrap()
+            );
             for &i in &tail {
                 testing::apply(&db, &h.segs[i].0, h.ms[i]).unwrap();
             }
@@ -4107,4 +4117,507 @@ async fn a_reader_without_the_lock_is_not_blocked_by_a_writer() {
         refused,
         Err(IndexError::State(StateError::Corrupt(_)))
     ));
+}
+
+// =============================================================================================
+// The first refresh of a new device: from the newest snapshot (0.6.2, §17.34)
+// =============================================================================================
+
+type Tables = BTreeMap<String, Vec<String>>;
+
+/// `state.db` of `v`, table by table, without the two rows that name the device itself.
+fn replica(v: &V) -> Tables {
+    let mut tables = testing::tables(v.db()).unwrap();
+    tables
+        .get_mut("meta")
+        .unwrap()
+        .retain(|row| !row.starts_with("device_id|") && !row.starts_with("device_name|"));
+    tables
+}
+
+/// The columns of a `|`-joined row without those at `drop`.
+fn without_columns(row: &str, drop: std::ops::Range<usize>) -> String {
+    let cells: Vec<&str> = row.split('|').collect();
+    let kept: Vec<&str> = cells
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(i))
+        .map(|(_, c)| *c)
+        .collect();
+    kept.join("|")
+}
+
+/// `short` started from a snapshot, `long` replayed the journal from the vault's first
+/// segment (what every gclone before 0.6.2 did while that segment was still listed). The two
+/// replicas are the same in every table — but for what a snapshot does not carry, which is
+/// checked here to be exactly that and nothing else:
+/// - `devices.last_ms`: a snapshot has the time a device joined, not when it last wrote;
+/// - `blobs`: a snapshot has the blobs its heads and removed versions point into;
+/// - `removed`: a snapshot has no origin stamp for a removed version (nothing reads it),
+///   and no version removed more than `HISTORY_KEEP` before it was written;
+/// - `touched` / `meta.resolve_all`: which paths the next resolution looks at — after a load,
+///   all of them.
+///
+/// A replica rebuilt from a snapshot — any device once a cleanup has trashed the vault's first
+/// segments — has always differed from a replayed one in these.
+fn assert_same_but_for_what_a_snapshot_leaves_out(long: &V, short: &V, store_now: u64, what: &str) {
+    let (mut l, mut s) = (replica(long), replica(short));
+    assert_eq!(
+        l.keys().collect::<Vec<_>>(),
+        s.keys().collect::<Vec<_>>(),
+        "{what}"
+    );
+
+    // devices: id, name, first_ms — and a last_ms that is never later.
+    let (dl, ds) = (l.remove("devices").unwrap(), s.remove("devices").unwrap());
+    assert_eq!(dl.len(), ds.len(), "{what}: devices");
+    for (a, b) in dl.iter().zip(&ds) {
+        assert_eq!(
+            without_columns(a, 3..4),
+            without_columns(b, 3..4),
+            "{what}: devices"
+        );
+        let last = |row: &str| row.rsplit('|').next().unwrap().parse::<u64>().unwrap();
+        assert!(last(b) <= last(a), "{what}: last_ms {b} > {a}");
+    }
+
+    // removed: the same versions with the same removal, origin aside; what is missing aged out.
+    let strip = |rows: Vec<String>| -> BTreeSet<String> {
+        rows.iter().map(|r| without_columns(r, 17..20)).collect()
+    };
+    let (rl, rs) = (
+        strip(l.remove("removed").unwrap()),
+        strip(s.remove("removed").unwrap()),
+    );
+    assert!(rs.is_subset(&rl), "{what}: removed");
+    for gone in rl.difference(&rs) {
+        let removed_ms: u64 = gone.split('|').nth(17).unwrap().parse().unwrap();
+        assert!(
+            removed_ms + gclone::consts::HISTORY_KEEP_MS <= store_now,
+            "{what}: a removed version that has not aged out is missing: {gone}"
+        );
+    }
+
+    // blobs: a subset; what is missing is referenced by nothing the short replica holds.
+    let (bl, bs): (BTreeSet<String>, BTreeSet<String>) = (
+        l.remove("blobs").unwrap().into_iter().collect(),
+        s.remove("blobs").unwrap().into_iter().collect(),
+    );
+    assert!(bs.is_subset(&bl), "{what}: blobs");
+    let short_rows = replica(short);
+    for gone in bl.difference(&bs) {
+        let id = format!("|{}|", gone.split('|').next().unwrap());
+        for table in ["heads", "removed"] {
+            assert!(
+                !short_rows[table].iter().any(|row| row.contains(&id)),
+                "{what}: blob {id} is referenced in {table} and missing"
+            );
+        }
+    }
+
+    // What the next resolution looks at.
+    for t in [&mut l, &mut s] {
+        t.remove("touched");
+        t.get_mut("meta")
+            .unwrap()
+            .retain(|row| !row.starts_with("resolve_all|"));
+    }
+
+    // Everything else, to the byte: heads (winners included), applied, the base, the rollback
+    // marks, the clock, the vault's name and format.
+    for (table, rows) in &l {
+        assert_eq!(rows, &s[table], "{what}: table {table}");
+    }
+    assert_eq!(view(long), view(short), "{what}");
+    assert_eq!(
+        long.head_fingerprint().unwrap(),
+        short.head_fingerprint().unwrap(),
+        "{what}"
+    );
+    assert_eq!(
+        long.file_count().unwrap(),
+        short.file_count().unwrap(),
+        "{what}"
+    );
+    assert_eq!(
+        long.file_count().unwrap(),
+        long.stats(0).unwrap().files,
+        "{what}"
+    );
+}
+
+/// A new device named `name`; `long`: it replays the journal as gclone did before 0.6.2.
+async fn first_refresh(w: &World, name: &str, long: bool) -> (V, gclone::index::RefreshReport) {
+    let mut v = w.device(name).await;
+    v.set_snapshot_first(!long);
+    let report = v.refresh().await.unwrap();
+    (v, report)
+}
+
+/// A vault with a history: three devices, overwritten and deleted files, a resolved conflict,
+/// a blob nothing points to, two snapshots by different devices, and segments after the
+/// newer one. Returns the devices and the newer snapshot's name.
+async fn vault_with_history() -> (World, [V; 3], String) {
+    let (w, a) = world().await;
+    let hour = 3_600_000;
+    let mut devices = vec![a];
+    for name in ["b", "c"] {
+        let v = w.join(name).await;
+        let id = v.device_id();
+        v.commit_ops(vec![OpDraft::Device {
+            id,
+            name: name.into(),
+        }])
+        .await
+        .unwrap();
+        w.mem.advance_ms(hour);
+        devices.push(v);
+    }
+    let [a, b, c]: [V; 3] = devices.try_into().ok().unwrap();
+    let all = [&a, &b, &c];
+    let sync = async |devices: &[&V]| {
+        for v in devices {
+            v.refresh().await.unwrap();
+        }
+    };
+
+    // a uploads; a blob that no file ever points to is recorded as well.
+    for (tag, path) in [(1, "docs/one"), (2, "docs/two"), (3, "pics/three")] {
+        let rec = upload_blob(&w, &a, tag).await;
+        a.commit_ops(vec![OpDraft::Blob(rec), put(path, tag)])
+            .await
+            .unwrap();
+        w.mem.advance_ms(hour);
+    }
+    let unused = upload_blob(&w, &a, 90).await;
+    a.commit_ops(vec![OpDraft::Blob(unused)]).await.unwrap();
+    sync(&all).await;
+
+    // b overwrites and deletes: removed versions.
+    b.commit_ops(vec![put_over(&b, "docs/one", 4), del(&b, "pics/three")])
+        .await
+        .unwrap();
+    w.mem.advance_ms(hour);
+    // a and c write one path without seeing each other; a resolves.
+    a.commit_ops(vec![put("notes", 5)]).await.unwrap();
+    c.commit_ops(vec![put("notes", 6)]).await.unwrap();
+    w.mem.advance_ms(hour);
+    sync(&all).await;
+    assert_eq!(a.conflicts().unwrap().len(), 1);
+    a.resolve_conflicts().await.unwrap();
+    sync(&all).await;
+    assert!(c.conflicts().unwrap().is_empty());
+    a.write_snapshot().await.unwrap();
+    w.mem.advance_ms(hour);
+
+    // More history, then c's snapshot — the newest.
+    sync(&all).await;
+    b.commit_ops(vec![put_over(&b, "docs/two", 7)])
+        .await
+        .unwrap();
+    c.commit_ops(vec![put("late/x", 8), put("late/dir/y", 9)])
+        .await
+        .unwrap();
+    w.mem.advance_ms(hour);
+    sync(&all).await;
+    let newest = c.write_snapshot().await.unwrap();
+    w.mem.advance_ms(hour);
+
+    // What no snapshot covers: two devices write again, one of them a blob without a file.
+    sync(&all).await;
+    a.commit_ops(vec![put_over(&a, "docs/one", 10), del(&a, "late/x")])
+        .await
+        .unwrap();
+    let unused = upload_blob(&w, &b, 91).await;
+    b.commit_ops(vec![OpDraft::Blob(unused), put("tail", 11)])
+        .await
+        .unwrap();
+    w.mem.advance_ms(hour);
+    sync(&all).await;
+    assert!(a.conflicts().unwrap().is_empty());
+    (w, [a, b, c], newest)
+}
+
+#[tokio::test]
+async fn a_new_device_starts_from_the_newest_snapshot_and_holds_what_a_replay_holds() {
+    let (w, [a, _b, c], newest) = vault_with_history().await;
+    let segments = w.listed("s-").len() as u64;
+    assert_eq!(w.listed("c-").len(), 2);
+
+    // The long way: every segment, then the snapshot — to adopt it.
+    let gets = w.net.calls(OpKind::Get);
+    let (long, report) = first_refresh(&w, "long", true).await;
+    assert_eq!(report.adopted.as_deref(), Some(newest.as_str()));
+    assert_eq!((report.applied, report.rebuilt_from), (segments, None));
+    assert_eq!(w.net.calls(OpKind::Get) - gets, segments + 1);
+
+    // The short way: the snapshot, then the two segments it does not cover. What it does
+    // is reported on the way.
+    let seen: Arc<std::sync::Mutex<Vec<gclone::index::RefreshProgress>>> = Arc::default();
+    let gets = w.net.calls(OpKind::Get);
+    let mut short = w.device("short").await;
+    short.set_progress({
+        let seen = seen.clone();
+        Arc::new(move |step| seen.lock().unwrap().push(step))
+    });
+    let report = short.refresh().await.unwrap();
+    assert_eq!(report.rebuilt_from.as_deref(), Some(newest.as_str()));
+    assert_eq!((report.applied, report.adopted), (2, None));
+    assert_eq!(w.net.calls(OpKind::Get) - gets, 3);
+    {
+        use gclone::index::RefreshProgress as P;
+        let seen = seen.lock().unwrap();
+        let size = w.listed("c-").last().unwrap().size;
+        let stage = |p: &P| match p {
+            P::Snapshot { .. } => 0,
+            P::Load { .. } => 1,
+            P::Segments { .. } => 2,
+            P::Apply { .. } => 3,
+        };
+        let stages: Vec<u8> = seen.iter().map(stage).collect();
+        assert!(stages.is_sorted(), "{seen:?}");
+        let last = |n: u8| *seen.iter().rfind(|p| stage(p) == n).unwrap();
+        assert_eq!(
+            last(0),
+            P::Snapshot {
+                bytes: size,
+                total: size
+            }
+        );
+        assert!(matches!(last(1), P::Load { entries, total } if entries == total && total > 0));
+        assert!(matches!(
+            last(2),
+            P::Segments { done: 2, total: 2, bytes, total_bytes } if bytes == total_bytes
+        ));
+        assert!(matches!(
+            last(3),
+            P::Apply {
+                changes: 4,
+                total: 4
+            }
+        ));
+    }
+
+    let now = w.mem.now_ms();
+    assert_same_but_for_what_a_snapshot_leaves_out(&long, &short, now, "after the first refresh");
+    // Exactly these: the two blobs without a file that the snapshot's writer knew, and no
+    // removed version.
+    let (l, s) = (replica(&long), replica(&short));
+    assert_eq!(l["blobs"].len(), s["blobs"].len() + 1);
+    assert_eq!(l["removed"].len(), s["removed"].len());
+    assert!(!s["removed"].is_empty() && !s["applied"].is_empty());
+    assert_eq!(view(&short), view(&a));
+    assert_eq!(
+        short.head_fingerprint().unwrap(),
+        a.head_fingerprint().unwrap()
+    );
+
+    // Nothing is left to resolve on either: after the resolution every table but the three
+    // above is the same, `touched` included.
+    for v in [&long, &short] {
+        v.finish_join().await.unwrap();
+    }
+    assert_eq!(w.listed("s-").len() as u64, segments);
+    for table in ["touched", "meta", "heads", "applied", "hw", "base_covered"] {
+        assert_eq!(
+            replica(&long)[table],
+            replica(&short)[table],
+            "table {table}"
+        );
+    }
+
+    // The same code serves every later refresh: both follow the vault alike.
+    a.commit_ops(vec![put_over(&a, "tail", 12), put("more", 13)])
+        .await
+        .unwrap();
+    c.refresh().await.unwrap();
+    c.commit_ops(vec![del(&c, "docs/two")]).await.unwrap();
+    for v in [&long, &short] {
+        let r = v.refresh().await.unwrap();
+        assert_eq!((r.applied, r.rebuilt_from, r.adopted), (2, None, None));
+    }
+    assert_same_but_for_what_a_snapshot_leaves_out(&long, &short, now, "after a later refresh");
+
+    // Once a cleanup has trashed the segments the newest snapshot covers — what every vault
+    // looks like after its first weeks — both ways are one: the same tables, to the byte.
+    w.mem.advance_ms(INDEX_TRASH_DELAY_MS + DAY_MS);
+    c.refresh().await.unwrap();
+    assert!(c.cleanup_index().await.unwrap() > 0);
+    let gets = w.net.calls(OpKind::Get);
+    let (old, r_old) = first_refresh(&w, "old-way", true).await;
+    let long_gets = w.net.calls(OpKind::Get) - gets;
+    let (new, r_new) = first_refresh(&w, "new-way", false).await;
+    let short_gets = w.net.calls(OpKind::Get) - gets - long_gets;
+    assert_eq!(r_old.rebuilt_from.as_deref(), Some(newest.as_str()));
+    assert_eq!(r_new.rebuilt_from.as_deref(), Some(newest.as_str()));
+    assert_eq!(replica(&old), replica(&new));
+    assert!(short_gets <= long_gets, "{short_gets} > {long_gets}");
+    a.refresh().await.unwrap();
+    assert_eq!(view(&new), view(&a));
+}
+
+/// `login` ends with `finish_join`: the device that joins does not write the vault's next
+/// snapshot, however due one is — neither on a vault that has none yet nor behind a snapshot
+/// with a long tail. All it uploads is the segment that announces it. (`finish_mutation` on
+/// the same replica writes that snapshot at once: it was due.)
+#[tokio::test]
+async fn a_joining_device_leaves_the_next_snapshot_to_a_later_command() {
+    let (w, a) = world().await;
+    let join = async |name: &str| {
+        let v = w.join(name).await;
+        assert!(
+            v.stats(0).unwrap().segments >= COMPACT_MIN_SEGMENTS,
+            "{name}: a snapshot is due"
+        );
+        let (puts, objects) = (w.net.calls(OpKind::Put), w.mem.all_objects().len());
+        v.commit_ops(vec![OpDraft::Device {
+            id: v.device_id(),
+            name: name.into(),
+        }])
+        .await
+        .unwrap();
+        v.finish_join().await.unwrap();
+        assert_eq!(w.net.calls(OpKind::Put) - puts, 1, "{name}: one upload");
+        assert_eq!(w.mem.all_objects().len() - objects, 1, "{name}: one object");
+        v
+    };
+
+    // A vault without a snapshot, and more segments than a snapshot waits for.
+    for i in 0..=COMPACT_MIN_SEGMENTS {
+        a.commit_ops(vec![put(&format!("early/{i}"), i as u8)])
+            .await
+            .unwrap();
+    }
+    assert!(w.listed("c-").is_empty());
+    let first = join("first").await;
+    assert!(w.listed("c-").is_empty());
+    first.finish_mutation().await.unwrap();
+    assert_eq!(w.listed("c-").len(), 1);
+
+    // Behind that snapshot, as many segments again: the next one is due.
+    a.refresh().await.unwrap();
+    for i in 0..=COMPACT_MIN_SEGMENTS {
+        a.commit_ops(vec![put(&format!("late/{i}"), i as u8)])
+            .await
+            .unwrap();
+    }
+    let second = join("second").await;
+    assert_eq!(w.listed("c-").len(), 1);
+    assert_eq!(view(&second), view(&a));
+    second.finish_mutation().await.unwrap();
+    assert_eq!(w.listed("c-").len(), 2);
+}
+
+/// Any history: a device that starts from the newest snapshot ends where a device that
+/// replays the journal ends.
+#[tokio::test]
+async fn random_journals_load_the_same_from_a_snapshot_as_from_the_first_segment() {
+    const PATHS: [&str; 6] = ["x", "y", "dir/z", "dir/w", "dir", "v.txt"];
+    let mut seeds = Prng::from_env();
+    for case in 0..8 {
+        let mut rng = seeds.fork();
+        let (w, a) = world().await;
+        let mut devices = vec![a, w.join("b").await, w.join("c").await];
+        let mut snapshots = 0;
+        for step in 0..60u8 {
+            let d = rng.index(devices.len());
+            let v = &devices[d];
+            match rng.below(20) {
+                0..=8 => {
+                    let path = *rng.pick(&PATHS);
+                    let op = match v.head(path).unwrap() {
+                        Some(_) if rng.chance(1, 4) => del(v, path),
+                        _ => put_over(v, path, step),
+                    };
+                    v.commit_ops(vec![op]).await.unwrap();
+                }
+                9..=13 => drop(v.refresh().await.unwrap()),
+                14 | 15 => drop(v.resolve_conflicts().await.unwrap()),
+                16 | 17 => {
+                    v.write_snapshot().await.unwrap();
+                    snapshots += 1;
+                }
+                18 => {
+                    w.mem.advance_ms(rng.range(1, 6) * DAY_MS);
+                    v.cleanup_index().await.unwrap();
+                }
+                _ => {
+                    if devices.len() < 5 {
+                        devices.push(w.join(&format!("late-{step}")).await);
+                    }
+                }
+            }
+        }
+        let what = format!("case {case} ({snapshots} snapshots)");
+        let (long, _) = first_refresh(&w, "long", true).await;
+        let (short, r) = first_refresh(&w, "short", false).await;
+        assert_eq!(r.rebuilt_from.is_some(), snapshots > 0, "{what}");
+        assert_same_but_for_what_a_snapshot_leaves_out(&long, &short, w.mem.now_ms(), &what);
+    }
+}
+
+/// A first load that is interrupted: nothing half-loaded is ever in the replica, nothing is
+/// downloaded twice, and the device ends where an undisturbed one ends.
+#[tokio::test]
+async fn an_interrupted_first_load_is_taken_up_where_it_stopped() {
+    let (w, [a, ..], newest) = vault_with_history().await;
+    let (reference, _) = first_refresh(&w, "reference", false).await;
+    let expect = replica(&reference);
+    let empty = |v: &V| {
+        let t = replica(v);
+        t["heads"].is_empty() && t["base_covered"].is_empty() && t["applied"].is_empty()
+    };
+
+    // 1. The snapshot's download breaks off: the replica is as empty as before, nothing is
+    //    cached, and the next run starts over.
+    let one = w.device("one").await;
+    w.net.cut_next_get(1000);
+    assert!(matches!(
+        one.refresh().await,
+        Err(IndexError::Backend(BackendError::Transient(_)))
+    ));
+    assert!(empty(&one));
+    assert_eq!(std::fs::read_dir(w.cache("one")).unwrap().count(), 0);
+    let r = one.refresh().await.unwrap();
+    assert_eq!(r.rebuilt_from.as_deref(), Some(newest.as_str()));
+    assert_eq!(replica(&one), expect);
+
+    // 2. The process dies between the snapshot's arrival and the end of its load — the
+    //    load is one transaction, so `state.db` is empty and the snapshot is in the index
+    //    cache. (Made here by handing a new device that cache.) The next run loads it from
+    //    there: no request but the listing.
+    let two = w.device("two").await;
+    std::fs::copy(
+        w.cache("reference").join(&newest),
+        w.cache("two").join(&newest),
+    )
+    .unwrap();
+    let gets = w.net.calls(OpKind::Get);
+    w.net.fail_nth(OpKind::Get, 1, transient);
+    assert!(two.refresh().await.is_err());
+    // The snapshot was loaded and committed before the first segment was asked for.
+    assert!(!empty(&two));
+    assert!(w.net.calls(OpKind::Get) - gets <= 2);
+
+    // 3. … and that is the third way to stop: after the load, before the segments the
+    //    snapshot does not cover. The replica is the snapshot — a consistent, older state of
+    //    the vault. A new process (a new `Vault` on the same `state.db`) fetches the two
+    //    segments and nothing else.
+    let t = replica(&two);
+    let before_the_tail = paths(&two);
+    assert!(before_the_tail.contains(&"late/x".to_owned()));
+    assert!(!before_the_tail.contains(&"tail".to_owned()));
+    assert!(t["applied"].is_empty());
+    assert!(
+        t["meta"]
+            .iter()
+            .any(|row| row.starts_with("base_snapshot_name|"))
+    );
+    let again = w.open(two.db().clone(), "two", 1).await;
+    let gets = w.net.calls(OpKind::Get);
+    let r = again.refresh().await.unwrap();
+    assert_eq!((r.applied, r.rebuilt_from, r.adopted), (2, None, None));
+    assert_eq!(w.net.calls(OpKind::Get) - gets, 2);
+    assert_eq!(replica(&again), expect);
+    assert_eq!(view(&again), view(&a));
 }

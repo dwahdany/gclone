@@ -13,6 +13,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::{self, BufRead as _, IsTerminal as _, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::util;
 
@@ -460,6 +461,173 @@ impl Progress {
     }
 }
 
+/// What a phase of [`Phases`] counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseUnit {
+    Bytes,
+    /// Things with a name in the plural ("entries"); empty when the label says it.
+    Count(&'static str),
+}
+
+impl PhaseUnit {
+    /// A phase of this much work is shown from its start: it will not be over in a moment.
+    fn is_long(self, total: u64) -> bool {
+        match self {
+            PhaseUnit::Bytes => total >= 8 << 20,
+            PhaseUnit::Count(_) => total >= 100_000,
+        }
+    }
+}
+
+/// A phase that is not long by its size and ends sooner than this shows no bar: nothing
+/// flashes by on a small vault.
+const PHASE_BAR_AFTER: Duration = Duration::from_millis(300);
+/// Without a terminal, such a phase says nothing until it has taken this long …
+const PHASE_LINE_AFTER: Duration = Duration::from_secs(1);
+/// … and every phase that was shown repeats its line at this interval.
+const PHASE_LINE_EVERY: Duration = Duration::from_secs(10);
+
+struct Phase {
+    label: &'static str,
+    started: Instant,
+    bar: Option<ProgressBar>,
+    last_line: Option<Instant>,
+}
+
+/// Progress of work that passes through named phases, one after the other — `gclone login`
+/// reading the index of a vault. All of it goes to stderr, none of it with `-q`:
+/// - on a terminal one bar per phase, `Loading index      [=====>     ] 412,000/860,000
+///   entries  eta 3s`, replaced by the next phase's and gone when the work is done;
+/// - anywhere else (a pipe, a log file, `--json`) one line when a phase begins,
+///   `Loading index: 860,000 entries`, and one every ten seconds while it lasts,
+///   `Loading index: 412,000 of 860,000 entries`.
+///
+/// A phase with little to do (a few megabytes, fewer than 100,000 things) is shown only
+/// once it has taken a moment: a small vault prints nothing.
+///
+/// `Send + Sync`: the work reports from whatever thread it runs on.
+pub struct Phases {
+    ui: Arc<Ui>,
+    line_after: Duration,
+    line_every: Duration,
+    phase: Mutex<Option<Phase>>,
+}
+
+impl Phases {
+    pub fn new(ui: Arc<Ui>) -> Self {
+        Self::with_timing(ui, PHASE_LINE_AFTER, PHASE_LINE_EVERY)
+    }
+
+    /// [`Phases::new`] with other waits before a phase's first line and between its lines
+    /// (tests: no wait).
+    #[doc(hidden)]
+    pub fn with_timing(ui: Arc<Ui>, line_after: Duration, line_every: Duration) -> Self {
+        Phases {
+            ui,
+            line_after,
+            line_every,
+            phase: Mutex::new(None),
+        }
+    }
+
+    /// The phase `label` has done `done` of `total`. Another label than the last call's
+    /// starts the next phase.
+    pub fn update(&self, label: &'static str, unit: PhaseUnit, done: u64, total: u64) {
+        if self.ui.silent || self.ui.opts.quiet {
+            return;
+        }
+        let done = done.min(total);
+        let now = Instant::now();
+        let mut slot = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|p| p.label != label)
+            && let Some(bar) = slot.take().and_then(|p| p.bar)
+        {
+            bar.finish_and_clear();
+        }
+        let phase = slot.get_or_insert_with(|| Phase {
+            label,
+            started: now,
+            bar: None,
+            last_line: None,
+        });
+        if self.ui.mp.is_hidden() {
+            let due = match phase.last_line {
+                None => unit.is_long(total) || now.duration_since(phase.started) >= self.line_after,
+                Some(last) => now.duration_since(last) >= self.line_every,
+            };
+            if due {
+                phase.last_line = Some(now);
+                self.ui.info(&phase_line(label, unit, done, total));
+            }
+            return;
+        }
+        if phase.bar.is_none()
+            && (unit.is_long(total) || now.duration_since(phase.started) >= PHASE_BAR_AFTER)
+        {
+            // Style, prefix and unit first, and the bar onto the screen last: its first frame
+            // is a whole one. An empty unit has no place in the line.
+            let template = match unit {
+                PhaseUnit::Bytes => {
+                    "{prefix:<19} [{bar:16}] {binary_bytes}/{binary_total_bytes}  {binary_bytes_per_sec}  eta {eta}"
+                }
+                PhaseUnit::Count("") => {
+                    "{prefix:<19} [{bar:16}] {human_pos}/{human_len}  eta {eta}"
+                }
+                PhaseUnit::Count(_) => {
+                    "{prefix:<19} [{bar:16}] {human_pos}/{human_len} {msg}  eta {eta}"
+                }
+            };
+            let mut bar = ProgressBar::hidden().with_prefix(label);
+            if let Ok(style) = ProgressStyle::with_template(template) {
+                bar = bar.with_style(style.progress_chars("=> "));
+            }
+            if let PhaseUnit::Count(what) = unit {
+                bar = bar.with_message(what);
+            }
+            bar.set_length(total);
+            bar.set_position(done);
+            phase.bar = Some(self.ui.mp.add(bar));
+        }
+        if let Some(bar) = &phase.bar {
+            // One draw per report: the length only when it changed.
+            if bar.length() != Some(total) {
+                bar.set_length(total);
+            }
+            bar.set_position(done);
+        }
+    }
+
+    /// The work is over (or has failed): the bar leaves the screen.
+    pub fn finish(&self) {
+        let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(bar) = phase.and_then(|p| p.bar) {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+/// `Downloading index: 146 MiB` at the start of a phase, then `Downloading index: 61 MiB of
+/// 146 MiB`; `Loading index: 860,000 entries`, then `Loading index: 412,000 of 860,000 entries`.
+fn phase_line(label: &str, unit: PhaseUnit, done: u64, total: u64) -> String {
+    let (done, total, what) = match unit {
+        PhaseUnit::Bytes => (util::human_size(done), util::human_size(total), ""),
+        PhaseUnit::Count(what) => (
+            util::group_thousands(done),
+            util::group_thousands(total),
+            what,
+        ),
+    };
+    let what = match what {
+        "" => String::new(),
+        what => format!(" {what}"),
+    };
+    if done == "0" || done == "0 B" {
+        format!("{label}: {total}{what}")
+    } else {
+        format!("{label}: {done} of {total}{what}")
+    }
+}
+
 /// tracing-subscriber to stderr. `GCLONE_LOG` (an `EnvFilter` directive string such as
 /// `debug` or `gclone::index=trace`) wins; otherwise `-v` = info, `-vv` = debug for gclone,
 /// `-vvv` = trace for everything, default = warnings only. Calling it twice is harmless.
@@ -825,5 +993,172 @@ Would upload 1 (4.2 MiB), reuse 1, delete 1, skip 1, conflict 1. Nothing changed
         init_logging(0);
         init_logging(2);
         tracing::warn!("logging initialised");
+    }
+
+    #[test]
+    fn phases_without_a_terminal_are_lines_on_stderr() {
+        let (ui, out, err) = ui(false, false, 0);
+        // No wait before a phase's first line; then none for a long while.
+        let phases = Phases::with_timing(Arc::new(ui), Duration::ZERO, Duration::from_secs(3600));
+        phases.update("Downloading index", PhaseUnit::Bytes, 0, 153_092_096);
+        phases.update("Downloading index", PhaseUnit::Bytes, 64 << 20, 153_092_096);
+        phases.update("Loading index", PhaseUnit::Count("entries"), 8_192, 860_000);
+        phases.update(
+            "Loading index",
+            PhaseUnit::Count("entries"),
+            860_000,
+            860_000,
+        );
+        // More than the total is never shown (a download that was started again).
+        phases.update("Applying changes", PhaseUnit::Count(""), 9_000, 4_096);
+        phases.finish();
+        assert_eq!(
+            err.text(),
+            "Downloading index: 146 MiB\n\
+             Loading index: 8,192 of 860,000 entries\n\
+             Applying changes: 4,096 of 4,096\n"
+        );
+        assert_eq!(out.text(), "");
+    }
+
+    #[test]
+    fn a_phase_repeats_its_line_at_the_interval_and_a_short_one_says_nothing() {
+        let (ui, out, err) = ui(true, false, 0);
+        let phases = Phases::with_timing(Arc::new(ui), Duration::ZERO, Duration::ZERO);
+        for done in [1, 2, 3] {
+            phases.update("Applying changes", PhaseUnit::Count(""), done, 3);
+        }
+        assert_eq!(err.text().lines().count(), 3);
+        // `--json`: stdout is for events, and stays empty.
+        assert_eq!(out.text(), "");
+
+        // The real timing: a phase with much to do is announced when it begins, and says no
+        // more for ten seconds; one with little to do says nothing unless it lasts.
+        let (ui, out, err) = self::ui(false, false, 0);
+        let phases = Phases::new(Arc::new(ui));
+        phases.update("Downloading index", PhaseUnit::Bytes, 0, 64 << 20);
+        phases.update("Downloading index", PhaseUnit::Bytes, 32 << 20, 64 << 20);
+        phases.update("Loading index", PhaseUnit::Count("entries"), 0, 860_000);
+        phases.update(
+            "Loading index",
+            PhaseUnit::Count("entries"),
+            860_000,
+            860_000,
+        );
+        phases.update("Downloading changes", PhaseUnit::Bytes, 0, 7 << 20);
+        phases.update("Applying changes", PhaseUnit::Count(""), 5, 5);
+        phases.finish();
+        assert_eq!(
+            err.text(),
+            "Downloading index: 64 MiB\nLoading index: 860,000 entries\n"
+        );
+        assert_eq!(out.text(), "");
+
+        let (ui, out, err) = self::ui(false, true, 0);
+        let phases = Phases::with_timing(Arc::new(ui), Duration::ZERO, Duration::ZERO);
+        phases.update("Loading index", PhaseUnit::Count("entries"), 5, 5);
+        assert_eq!((out.text(), err.text()), (String::new(), String::new()));
+    }
+
+    /// A terminal that keeps what was written to it; `<clear>` stands for an erased line.
+    #[derive(Clone, Debug, Default)]
+    struct Screen(Arc<Mutex<String>>);
+    impl Screen {
+        fn push(&self, text: &str) -> io::Result<()> {
+            self.0.lock().unwrap().push_str(text);
+            Ok(())
+        }
+        fn take(&self) -> String {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
+    impl indicatif::TermLike for Screen {
+        fn width(&self) -> u16 {
+            120
+        }
+        fn move_cursor_up(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, s: &str) -> io::Result<()> {
+            self.push(&format!("{s}\n"))
+        }
+        fn write_str(&self, s: &str) -> io::Result<()> {
+            self.push(s)
+        }
+        fn clear_line(&self) -> io::Result<()> {
+            self.push("<clear>")
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn phases_on_a_terminal_are_one_bar_that_leaves() {
+        let screen = Screen::default();
+        let (out, err) = (Buf::default(), Buf::default());
+        let draw = ProgressDrawTarget::term_like_with_hz(Box::new(screen.clone()), 255);
+        let ui = Ui {
+            opts: UiOpts::default(),
+            silent: false,
+            tty: true,
+            mp: MultiProgress::with_draw_target(draw),
+            out: Mutex::new(Box::new(out.clone())),
+            err: Mutex::new(Box::new(err.clone())),
+        };
+        let phases = Phases::new(Arc::new(ui));
+        let wait = || std::thread::sleep(Duration::from_millis(30));
+        phases.update("Loading index", PhaseUnit::Count("entries"), 0, 860_000);
+        // The first frame is a whole one: it names what is counted.
+        let first = screen.take();
+        assert!(first.contains("] 0/860,000 entries  eta "), "{first:?}");
+        assert!(!first.contains("0/860,000   eta"), "{first:?}");
+        wait();
+        phases.update(
+            "Loading index",
+            PhaseUnit::Count("entries"),
+            311_296,
+            860_000,
+        );
+        let shown = screen.take();
+        assert!(
+            shown.contains("Loading index       [")
+                && shown.contains("] 311,296/860,000 entries  eta "),
+            "{shown:?}"
+        );
+        // The next phase takes the bar's place.
+        phases.update("Downloading changes", PhaseUnit::Bytes, 0, 16 << 20);
+        wait();
+        phases.update("Downloading changes", PhaseUnit::Bytes, 4 << 20, 16 << 20);
+        let shown = screen.take();
+        assert!(shown.starts_with("<clear>"), "{shown:?}");
+        assert!(
+            shown.contains("Downloading changes [") && shown.contains("] 4.00 MiB/16.00 MiB  "),
+            "{shown:?}"
+        );
+        assert!(!shown.contains("Loading index"), "{shown:?}");
+        // A count without a unit leaves no gap where the unit would stand.
+        phases.update("Applying changes", PhaseUnit::Count(""), 0, 200_000);
+        wait();
+        phases.update("Applying changes", PhaseUnit::Count(""), 50_000, 200_000);
+        let shown = screen.take();
+        assert!(shown.contains("] 50,000/200,000  eta "), "{shown:?}");
+        // A phase with little to do draws nothing in its first moments, and at the end the
+        // screen is as it was.
+        phases.update("Downloading changes", PhaseUnit::Bytes, 3, 9);
+        phases.finish();
+        let shown = screen.take();
+        assert_eq!(shown.replace("<clear>", "").trim(), "", "{shown:?}");
+        assert!(shown.contains("<clear>"), "{shown:?}");
+        assert_eq!((out.text(), err.text()), (String::new(), String::new()));
     }
 }
