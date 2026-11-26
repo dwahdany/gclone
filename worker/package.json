@@ -18,9 +18,9 @@
     "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "^1.0.0",
+    "@cloudflare/vitest-plugin": "^1.8.1",
     "typescript": "^7.0.0",
-    "vitest": "^4.1.0",
+    "vitest": "^5.1.0",
     "wrangler": "^4.160.1"
   },
   "engines": {
